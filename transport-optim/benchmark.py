@@ -26,7 +26,7 @@ def _client_loop(iters: int, port: int, stop_event: threading.Event):
     try:
         cli = Client(b"127.0.0.1", port)            # returns once connect() ok
         while received < target_bytes:
-            chunk = cli._tp.recv(4096)              # bulk read
+            chunk = cli._tp.recv(82)              # bulk read
             if chunk:
                 received += len(chunk)
             else:
