@@ -1,15 +1,16 @@
 # cython: language_level=3
 # distutils: language = c
 
-# ─── C headers ────────────────────────────────────────────────────────────────
-from libc.stdint  cimport uint16_t, uint32_t, uint64_t
+# ─── C / POSIX headers ────────────────────────────────────────────────────────
+from libc.stdint  cimport uint16_t, uint32_t
 from libc.stddef  cimport size_t
 from libc.stdlib  cimport malloc, free
-from libc.string  cimport memset
+from libc.string  cimport memset, memcpy
 from posix.unistd cimport read, write, close
 from posix.fcntl  cimport fcntl, F_SETFL, O_NONBLOCK
 from libc.errno   cimport errno, EINPROGRESS, EAGAIN
 from cpython.ref  cimport PyObject, Py_INCREF, Py_DECREF
+from cpython.bytes cimport PyBytes_FromStringAndSize
 
 ctypedef long ssize_t
 
@@ -17,11 +18,9 @@ cdef extern from "errno.h":
     int EWOULDBLOCK
 
 cdef extern from "arpa/inet.h":
-    int inet_aton(const char*, void*)
     uint32_t inet_addr(const char*)
 
 cdef extern from "sys/socket.h":
-    ctypedef struct sockaddr
     int socket(int, int, int)
     int bind(int, void*, uint32_t)
     int listen(int, int)
@@ -40,22 +39,17 @@ cdef extern from "netinet/in.h":
         in_addr   sin_addr
         char      sin_zero[8]
 
-# ─── Compile-time flags ───────────────────────────────────────────────────────
-DEF CY_HAVE_VPP = 0
-DEF CY_HAVE_XDP = 0
-HAVE_VPP = CY_HAVE_VPP != 0
-HAVE_XDP = CY_HAVE_XDP != 0
-
-import threading, time
+# ─── Python std-lib imports ───────────────────────────────────────────────────
+import threading, time, selectors
 from enum import IntEnum
+from select import select
 
-# ─── Lock-free single-producer/single-consumer ring ───────────────────────────
+# ─── Lock-free single-producer / single-consumer ring (PyObject*) ─────────────
 cdef class Ring:
     cdef PyObject **slots
     cdef int size, head, tail
 
     def __cinit__(self, int size):
-        #print(f"[Ring] Initializing with size {size}")
         if size & (size - 1):
             raise ValueError("size must be power-of-2")
         self.size  = size
@@ -65,12 +59,11 @@ cdef class Ring:
 
     def __dealloc__(self):
         if self.slots != NULL:
-            #print("[Ring] Deallocating")
             free(self.slots)
 
     cdef inline bint _push(self, PyObject* obj):
         cdef int nxt = (self.head + 1) & (self.size - 1)
-        if nxt == self.tail:
+        if nxt == self.tail:            # full
             return False
         Py_INCREF(<object> obj)
         self.slots[self.head] = obj
@@ -78,7 +71,7 @@ cdef class Ring:
         return True
 
     cdef inline PyObject* _pop(self):
-        if self.tail == self.head:
+        if self.tail == self.head:      # empty
             return <PyObject*> 0
         cdef PyObject* obj = self.slots[self.tail]
         self.tail = (self.tail + 1) & (self.size - 1)
@@ -88,26 +81,19 @@ cdef class Ring:
         return self._push(<PyObject*> item)
 
     cpdef object pop(self):
-        cdef PyObject* obj = self._pop()
-        if obj == <PyObject*> 0:
+        cdef PyObject* raw = self._pop()
+        if raw == <PyObject*> 0:
             return None
-        pyobj = <object> obj
-        Py_DECREF(<object> obj)
+        pyobj = <object> raw
+        Py_DECREF(<object> raw)
         return pyobj
 
-# ─── Transport abstraction ────────────────────────────────────────────────────
-ctypedef enum:
-    KERNEL = 0
-    VPP    = 1
-    RAW    = 2
-
+# ─── Transport base / kernel (non-blocking TCP) ───────────────────────────────
 cdef class _BaseTransport:
     cdef public int fd
 
     def __cinit__(self):
-        #print("[BaseTransport] Initializing")
         self.fd = -1
-        #print(f"[BaseTransport] fd initialized to {self.fd}")
 
     cdef ssize_t _send(self, const char* buf, size_t n) nogil:
         return write(self.fd, buf, n)
@@ -116,195 +102,161 @@ cdef class _BaseTransport:
         return read(self.fd, buf, n)
 
     cpdef int send(self, bytes data):
-        #print(f"[BaseTransport] Sending {len(data)} bytes")
         cdef const char* p = data
         return self._send(p, len(data))
 
     cpdef bytes recv(self, size_t n):
-        #print(f"[BaseTransport] Receiving up to {n} bytes")
         cdef char[::1] buf = bytearray(n)
         cdef ssize_t r = self._recv(&buf[0], n)
         if r <= 0:
-            #print(f"[BaseTransport] Received {r} bytes (empty or error)")
             return b""
-        #print(f"[BaseTransport] Received {r} bytes")
         return bytes(buf[:r])
 
     cpdef void close(self):
         if self.fd >= 0:
-            #print("[BaseTransport] Closing socket")
             close(self.fd)
             self.fd = -1
 
 cdef class _KernelTransport(_BaseTransport):
     cpdef int connect(self, const char* ip, uint16_t port):
-        #print(f"[KernelTransport] Connecting to {ip.decode()}:{port}")
         self.fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0)
         if self.fd < 0:
-            #print("[KernelTransport] Socket creation failed")
             raise OSError("socket")
-        #print(f"[KernelTransport] Socket created (fd={self.fd})")
         cdef sockaddr_in addr
         memset(&addr, 0, sizeof(sockaddr_in))
         addr.sin_family = AF_INET
-        addr.sin_port = htons(port)
+        addr.sin_port   = htons(port)
         addr.sin_addr.s_addr = inet_addr(ip)
         if connect(self.fd, <sockaddr_in*> &addr, sizeof(sockaddr_in)) == -1 \
            and errno != EINPROGRESS:
-            #print(f"[KernelTransport] Connect failed with errno {errno}")
             close(self.fd)
             self.fd = -1
             raise OSError("connect")
-        #print(f"[KernelTransport] Connect initiated (fd={self.fd})")
         return 0
 
 # ─── Server ───────────────────────────────────────────────────────────────────
 cdef class Server:
-    cdef public Ring _rx
+    cdef Ring           _rx
     cdef public _KernelTransport _tp
-    cdef public object _thr
-    cdef public bint _stop
+    cdef object         _thr
+    cdef bint           _stop
 
     def __init__(self, bytes ip, int port, int kind=0):
-        #print(f"[Server] Initializing with ip={ip.decode()}, port={port}, kind={kind}")
-        self._rx = Ring(1024)
-        #print("[Server] Ring initialized")
-        self._tp = _KernelTransport()
-        #print(f"[Server] Transport initialized (fd={self._tp.fd})")
+        self._rx   = Ring(1024)
+        self._tp   = _KernelTransport()
         self._stop = False
-        #print(f"[Server] Stop flag initialized to {self._stop}")
 
+        # build listening socket
         lsock = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0)
-        #print(f"[Server] Listening socket created (fd={lsock})")
         cdef int one = 1
         setsockopt(lsock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(int))
+
         cdef sockaddr_in addr
         memset(&addr, 0, sizeof(addr))
         addr.sin_family = AF_INET
-        addr.sin_port = htons(port)
+        addr.sin_port   = htons(port)
         addr.sin_addr.s_addr = inet_addr(<const char*> ip)
+
         if bind(lsock, <sockaddr_in*> &addr, sizeof(addr)) == -1:
-            #print(f"[Server] Bind failed with errno {errno}")
             close(lsock)
             raise OSError("bind")
-        #print("[Server] Socket bound")
         if listen(lsock, 16) == -1:
-            #print(f"[Server] Listen failed with errno {errno}")
             close(lsock)
             raise OSError("listen")
-        #print("[Server] Listening started")
-        
-        # Non-blocking accept loop with timeout
-        cdef int conn = -1
-        cdef double start_time = time.time()
-        while conn == -1 and (time.time() - start_time) < 5.0:  # 5-second timeout
+
+        # wait (blocking with select) for a single connection
+        sel = selectors.DefaultSelector()
+        sel.register(lsock, selectors.EVENT_READ)
+        while True:
+            events = sel.select(timeout=5.0)
+            if not events:
+                raise TimeoutError("accept timed out")
             conn = accept(lsock, NULL, NULL)
-            if conn == -1 and errno != EAGAIN and errno != EWOULDBLOCK:
-                #print(f"[Server] Accept failed with errno {errno}")
-                close(lsock)
-                raise OSError(f"accept failed with errno {errno}")
-            #print("[Server] Waiting for client connection...")
-            time.sleep(0.001)
-        if conn == -1:
-            #print("[Server] Accept timed out")
-            close(lsock)
-            raise TimeoutError("accept timed out waiting for client")
-        
-        #print(f"[Server] Client connected (fd={conn})")
+            if conn != -1:
+                break
+        sel.unregister(lsock)
         close(lsock)
-        self._tp.fd = conn
-        #print(f"[Server] Connection set to non-blocking (fd={self._tp.fd})")
+
+        # make conn non-blocking
         fcntl(conn, F_SETFL, O_NONBLOCK)
+        self._tp.fd = conn
+
+        # start reader thread
         self._thr = threading.Thread(target=self._reader, daemon=True)
-        #print("[Server] Starting reader thread")
         self._thr.start()
 
     def _reader(self):
-        #print("[Server] Reader thread started")
         cdef char[4096] buf
+        poller = selectors.DefaultSelector()
+        poller.register(self._tp.fd, selectors.EVENT_READ)
         while not self._stop:
+            events = poller.select(timeout=1.0)
+            if not events:
+                continue
             n = self._tp._recv(&buf[0], 4096)
             if n <= 0:
-                if n == -1 and (errno == EAGAIN or errno == EWOULDBLOCK):
-                    time.sleep(0.0001)
-                    continue
-                #print(f"[Server] Reader stopped: n={n}")
-                break
-            pkt = bytes(buf[:n])
-            #print(f"[Server] Reader received {n} bytes")
+                continue
+            # fast zero-copy PyBytes from existing buffer
+            pkt = <object> PyBytes_FromStringAndSize(<char*> &buf[0], n)
             while not self._rx.push(pkt):
-                time.sleep(0.0001)
-        #print("[Server] Reader thread exiting")
+                # back-off very briefly; no full 100 µs delay
+                time.sleep(0.000005)
 
     def run(self, handler):
-        #print("[Server] Starting run loop")
         try:
             while True:
                 msg = self._rx.pop()
                 if msg is not None:
-                    #print(f"[Server] Processing message: {len(msg)} bytes")
                     handler(msg)
                 else:
-                    time.sleep(0.0001)
+                    # light sleep to yield CPU when idle
+                    time.sleep(0.00002)
         except KeyboardInterrupt:
-            #print("[Server] KeyboardInterrupt received")
-            self._stop = True
-            self._thr.join()
-            self._tp.close()
-            #print("[Server] Run loop stopped")
+            self.stop()
 
     cpdef void stop(self):
-        #print("[Server] Stopping via method")
         self._stop = True
-        self._thr.join()
+        if self._thr is not None:
+            self._thr.join()
         self._tp.close()
 
 # ─── Client ───────────────────────────────────────────────────────────────────
 cdef class Client:
-    cdef public Ring _tx
+    cdef Ring           _tx
     cdef public _KernelTransport _tp
-    cdef public object _thr
-    cdef public bint _stop
+    cdef object         _thr
+    cdef bint           _stop
 
     def __init__(self, bytes ip, int port):
-        #print(f"[Client] Initializing with ip={ip.decode()}, port={port}")
-        self._tp = _KernelTransport()
-        #print(f"[Client] Transport initialized (fd={self._tp.fd})")
+        self._tp   = _KernelTransport()
         self._tp.connect(<const char*> ip, port)
-        #print(f"[Client] Connect completed (fd={self._tp.fd})")
-        self._tx = Ring(1024)
-        #print("[Client] Ring initialized")
+        self._tx   = Ring(1024)
         self._stop = False
-        #print(f"[Client] Stop flag initialized to {self._stop}")
-        self._thr = threading.Thread(target=self._flusher, daemon=True)
-        #print("[Client] Starting flusher thread")
+        self._thr  = threading.Thread(target=self._flusher, daemon=True)
         self._thr.start()
 
     def _flusher(self):
-        #print("[Client] Flusher thread started")
+        poller = selectors.DefaultSelector()
+        poller.register(self._tp.fd, selectors.EVENT_WRITE)
+        cdef object msg
         while not self._stop:
             msg = self._tx.pop()
             if msg is None:
-                time.sleep(0.0001)
+                time.sleep(0.00002)
                 continue
+            # wait until socket is writable; no blanket sleep
+            while True:
+                ev = poller.select(timeout=1.0)
+                if ev:
+                    break
             self._tp.send(msg)
-            #print(f"[Client] Flushed message: {len(msg)} bytes")
-        #print("[Client] Flusher thread exiting")
 
     def send(self, bytes data):
-        #print(f"[Client] Pushing {len(data)} bytes to send")
         while not self._tx.push(data):
-            time.sleep(0.0001)
-
-    def close(self):
-        #print("[Client] Closing")
-        self._stop = True
-        self._thr.join()
-        self._tp.close()
-        #print("[Client] Closed")
+            time.sleep(0.000005)
 
     cpdef void stop(self):
-        #print("[Client] Stopping via method")
         self._stop = True
-        self._thr.join()
+        if self._thr is not None:
+            self._thr.join()
         self._tp.close()

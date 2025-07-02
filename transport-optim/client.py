@@ -8,5 +8,5 @@ for i in range(5):
     time.sleep(0.1)
 
 cli.send(b"quit")
-cli.close()
+cli.stop()
 
