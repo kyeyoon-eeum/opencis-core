@@ -12,7 +12,14 @@ def _server_loop(iters: int, port: int, stop_event: threading.Event):
         srv = Server(b"0.0.0.0", port, kind=0)      # blocks until accept()
         frame = b"x" * FRAME_SIZE
         for _ in range(iters):
-            srv._tp.send(frame)                     # one fire-and-forget write
+            # Ensure complete send with backpressure handling
+            remaining = frame
+            while remaining:
+                sent = srv._tp.send(remaining)
+                if sent <= 0:  # Send buffer full, wait a bit
+                    time.sleep(0.00001)  # 10 microseconds
+                else:
+                    remaining = remaining[sent:]
         srv.stop()
     finally:
         stop_event.set()
