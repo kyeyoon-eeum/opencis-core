@@ -7,6 +7,7 @@ See LICENSE for details.
 
 import asyncio
 from dataclasses import dataclass
+import time
 
 from opencis.cxl.component.fabric_manager.socketio_server import HostFMMsg
 from opencis.cxl.component.short_msg_conn import ShortMsgConn
@@ -313,11 +314,28 @@ async def sample_app(keepalive: bool, **kwargs):
 
     cpu = kwargs["cpu"]
     logger.info("[USER-APP] Starting...")
-    await cpu.store(0x100000000000, 0x40, 0xDEADBEEF)
-    val = await cpu.load(0x100000000000, 0x40)
-    logger.info(f"0x{val:X}")
-    val = await cpu.load(0x100000000040, 0x40)
-    logger.info(f"0x{val:X}")
+    # await cpu.store(0x100000000000, 0x40, 0xDEADBEEF)
+    # val = await cpu.load(0x100000000000, 0x40)
+    # logger.info(f"0x{val:X}")
+    # val = await cpu.load(0x100000000040, 0x40)
+    # logger.info(f"0x{val:X}")
+
+    BYTE_COUNT = 0x80000
+    start = time.time()
+    for offset in range(0, BYTE_COUNT, 0x40):
+        await cpu.store(0x100000000000 + offset, 0x40, 0xDEADBEEF)
+    end = time.time()
+    wr_time = end - start
+    wr_throughput = (BYTE_COUNT / (1024*1024)) / wr_time
+    logger.info(f"Write RESULTS: {wr_throughput} MB/s")
+
+    start = time.time()
+    for offset in range(0, BYTE_COUNT, 0x40):
+        await cpu.load(0x100000000000 + offset, 0x40)
+    end = time.time()
+    rd_time = end - start
+    rd_throughput = (BYTE_COUNT / (1024*1024)) / rd_time
+    logger.info(f"Read RESULTS: {rd_throughput} MB/s")
 
     if keepalive:
         await asyncio.Event().wait()
