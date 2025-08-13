@@ -69,6 +69,12 @@ class CxlMemDriver(LabeledComponent):
         iw: INTERLEAVE_WAYS = INTERLEAVE_WAYS.WAY_1,
     ) -> bool:
         device.log_prefix = "CxlMemDriver"
+        bdf_str = device.pci_device_info.get_bdf_string()
+        logger.info(
+            self._create_message(
+                f"config_cxl_mem_device ENTER bdf={bdf_str} base=0x{hpa_base:x} size=0x{size:x} ig={ig.name} iw={iw.name}"
+            )
+        )
         successful = await device.configure_hdm_decoder_device(
             hpa_base=hpa_base,
             hpa_size=size,
@@ -76,9 +82,9 @@ class CxlMemDriver(LabeledComponent):
             interleaving_way=iw.value,
         )
         if not successful:
-            bdf_str = device.pci_device_info.get_bdf_string()
             logger.warning(self._create_message(f"Failed to configure HDM decoder of {bdf_str}"))
             return False
+        logger.info(self._create_message(f"config_cxl_mem_device EXIT bdf={bdf_str} OK"))
 
         port_number = self.get_port_number(device)
         if port_number < 0:
@@ -100,6 +106,12 @@ class CxlMemDriver(LabeledComponent):
             logger.warning(self._create_message(f"{bdf_str} is not upstream port"))
             return False
 
+        bdf_str = upstream_port.pci_device_info.get_bdf_string()
+        logger.info(
+            self._create_message(
+                f"config_usp ENTER bdf={bdf_str} base=0x{hpa_base:x} size=0x{size:x} targets={target_list} ig={ig.name} iw={iw.name}"
+            )
+        )
         successful = await upstream_port.configure_hdm_decoder_switch(
             hpa_base=hpa_base,
             hpa_size=size,
@@ -108,7 +120,7 @@ class CxlMemDriver(LabeledComponent):
             interleaving_way=iw.value,
         )
         if not successful:
-            bdf_str = upstream_port.pci_device_info.get_bdf_string()
             logger.warning(self._create_message(f"Failed to configure HDM decoder of {bdf_str}"))
             return False
+        logger.info(self._create_message(f"config_usp EXIT bdf={bdf_str} OK"))
         return True

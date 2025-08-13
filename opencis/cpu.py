@@ -26,7 +26,6 @@ class CPU(RunnableComponent):
         self._user_app = user_app
         self._fut = None
         self._app_task = None
-        self._sys_task = None
 
     async def _run_sys_sw_app(self, *args, **kwargs):
         kwargs["cxl_memory_hub"] = self._cxl_memory_hub
@@ -100,11 +99,7 @@ class CPU(RunnableComponent):
         return await self._user_app(_cpu=self, _mem_hub=self._cxl_memory_hub)
 
     async def _run(self):
-        from opencis.util.logger import logger
-
-        logger.info(self._create_message("CPU starting sys_sw_app"))
-        self._sys_task = asyncio.create_task(self._run_sys_sw_app())
-        logger.info(self._create_message("CPU starting user_app"))
+        await self._run_sys_sw_app()
         self._app_task = asyncio.create_task(self._run_user_app())
         await self._change_status_to_running()
         self._fut = asyncio.Future()
@@ -112,7 +107,5 @@ class CPU(RunnableComponent):
         await self._fut
 
     async def _stop(self):
-        if self._sys_task and not self._sys_task.done():
-            self._sys_task.cancel()
         self._app_task.cancel()
         self._fut.set_result("CPU Done")

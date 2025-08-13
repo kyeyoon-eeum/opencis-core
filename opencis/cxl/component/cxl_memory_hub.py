@@ -39,6 +39,7 @@ from opencis.cxl.transport.memory_fifo import (
     MEMORY_RESPONSE_STATUS,
 )
 from opencis.util.pci import create_bdf
+from opencis.util.logger import logger
 
 
 @dataclass
@@ -149,6 +150,11 @@ class CxlMemoryHub(RunnableComponent):
         )
 
     def add_mem_range(self, addr: int, size: int, addr_type: MEM_ADDR_TYPE):
+        logger.info(
+            self._create_message(
+                f"Add mem range type={addr_type.name} base=0x{addr:x} size=0x{size:x}"
+            )
+        )
         self._cache_controller.add_mem_range(addr, size, addr_type)
 
     def remove_mem_range(self, addr: int, size: int, addr_type: MEM_ADDR_TYPE):
@@ -233,8 +239,6 @@ class CxlMemoryHub(RunnableComponent):
             asyncio.create_task(self._cache_controller.run()),
         ]
         # Wait and log each subcomponent readiness for visibility
-        from opencis.util.logger import logger
-
         logger.info(self._create_message("Waiting for RootPortClientManager READY"))
         try:
             await asyncio.wait_for(self._root_port_client_manager.wait_for_ready(), timeout=5.0)
