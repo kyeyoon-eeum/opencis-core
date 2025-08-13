@@ -17,6 +17,14 @@ from typing import List
 import click
 import pyshark
 
+# Use uvloop if available
+try:
+    import uvloop  # type: ignore
+
+    uvloop.install()
+except Exception:
+    pass
+
 from opencis.util.logger import logger
 from opencis.bin import (
     cxl_host,
@@ -267,6 +275,7 @@ def start(
         launcher = component_map.get(name)
         if launcher:
             spawn_process(launcher)
+        time.sleep(1)
 
     # Keep main process alive and wait for all child processes
     try:
@@ -283,6 +292,20 @@ def child_process_wrapper(target):
     # Create a new process group for this child process
     os.setpgrp()
     setup_child_signal_handlers()
+    # Enable per-process file logging for comprehensive tracing
+    try:
+        from opencis.util.logger import logger as _logger
+
+        _logger.create_log_file(
+            filename=f"logs/proc-{os.getpid()}.log",
+            loglevel="DEBUG",
+            show_timestamp=True,
+            show_loglevel=True,
+            show_linenumber=False,
+        )
+        _logger.info(f"Child logger initialized for pid {os.getpid()}")
+    except Exception:
+        pass
 
     target()
 

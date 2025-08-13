@@ -52,6 +52,13 @@ class VirtualSwitchManager(RunnableComponent):
                 allocated_ld=allocated_ld,
             )
             self._virtual_switches.append(virtual_switch)
+            from opencis.util.logger import logger
+
+            logger.info(
+                self._create_message(
+                    f"Initialized VirtualSwitch id={vs_index}, usp={switch_config.upstream_port_index}"
+                )
+            )
 
     def get_virtual_switch(self, switch_index: str) -> CxlVirtualSwitch:
         if switch_index >= len(self._virtual_switches) or switch_index < 0:
@@ -89,6 +96,9 @@ class VirtualSwitchManager(RunnableComponent):
             wait_tasks.append(create_task(virtual_switch.wait_for_ready()))
         await gather(*wait_tasks)
         await self._change_status_to_running()
+        from opencis.util.logger import logger
+
+        logger.info(self._create_message("VirtualSwitchManager RUNNING"))
         await gather(*run_tasks)
 
     async def _stop(self):

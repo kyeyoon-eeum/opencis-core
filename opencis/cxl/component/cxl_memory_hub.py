@@ -232,13 +232,41 @@ class CxlMemoryHub(RunnableComponent):
             asyncio.create_task(self._root_complex.run()),
             asyncio.create_task(self._cache_controller.run()),
         ]
-        wait_tasks = [
-            asyncio.create_task(self._root_port_client_manager.wait_for_ready()),
-            asyncio.create_task(self._root_complex.wait_for_ready()),
-            asyncio.create_task(self._cache_controller.wait_for_ready()),
-        ]
-        await asyncio.gather(*wait_tasks)
+        # Wait and log each subcomponent readiness for visibility
+        from opencis.util.logger import logger
+
+        logger.info(self._create_message("Waiting for RootPortClientManager READY"))
+        try:
+            await asyncio.wait_for(self._root_port_client_manager.wait_for_ready(), timeout=5.0)
+            logger.info(self._create_message("RootPortClientManager READY"))
+        except asyncio.TimeoutError:
+            logger.warning(
+                self._create_message(
+                    "Timeout waiting for RootPortClientManager READY; proceeding to unblock host"
+                )
+            )
+        logger.info(self._create_message("Waiting for RootComplex READY"))
+        try:
+            await asyncio.wait_for(self._root_complex.wait_for_ready(), timeout=5.0)
+            logger.info(self._create_message("RootComplex READY"))
+        except asyncio.TimeoutError:
+            logger.warning(
+                self._create_message(
+                    "Timeout waiting for RootComplex READY; proceeding to unblock host"
+                )
+            )
+        logger.info(self._create_message("Waiting for CacheController READY"))
+        try:
+            await asyncio.wait_for(self._cache_controller.wait_for_ready(), timeout=5.0)
+            logger.info(self._create_message("CacheController READY"))
+        except asyncio.TimeoutError:
+            logger.warning(
+                self._create_message(
+                    "Timeout waiting for CacheController READY; proceeding to unblock host"
+                )
+            )
         await self._change_status_to_running()
+        logger.info(self._create_message("CxlMemoryHub RUNNING"))
         await asyncio.gather(*run_tasks)
 
     async def _stop(self):

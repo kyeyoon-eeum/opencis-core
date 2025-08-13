@@ -99,6 +99,7 @@ class CxlHost(RunnableComponent):
         return Result(res)
 
     async def _run(self):
+        logger.info(self._create_message("CxlHost starting IRQ manager, memory hub, and CPU"))
         tasks = [
             await self._irq_manager.run_wait_ready(),
             await self._cxl_memory_hub.run_wait_ready(),
@@ -109,6 +110,7 @@ class CxlHost(RunnableComponent):
             await self._host_mgr_conn_client.wait_for_ready()
 
         await self._change_status_to_running()
+        logger.info(self._create_message("CxlHost RUNNING"))
         await asyncio.gather(*tasks)
 
     async def _stop(self):

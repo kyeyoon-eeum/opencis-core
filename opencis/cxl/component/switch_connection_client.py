@@ -22,6 +22,8 @@ from opencis.cxl.component.cxl_connection import CxlConnection
 from opencis.cxl.component.cxl_packet_processor import CxlPacketProcessor
 from opencis.util.component import RunnableComponent
 from opencis.util.pci import create_bdf
+from opencis.cxl.transport.shm_stream import ShmStreamPair
+from opencis.cxl.transport.packet_constants import SYSTEM_PAYLOAD_TYPE
 
 
 class INJECTED_ERRORS(Enum):
@@ -56,37 +58,11 @@ class SwitchConnectionClient(RunnableComponent):
         self._stop_signal = False
 
     async def _connect(self) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
-        reader, writer = await asyncio.open_connection(self._host, self._port)
-        if self._injected_error is None:
-            request = SidebandConnectionRequestPacket.create(self._port_index)
-        elif self._injected_error == INJECTED_ERRORS.NON_SIDEBAND:
-            request = CxlIoCfgRdPacket.create(create_bdf(0, 0, 0), 0, 4)
-        elif self._injected_error == INJECTED_ERRORS.NON_CONNNECTION_REQUEST:
-            request = BaseSidebandPacket.create(SIDEBAND_TYPES.CONNECTION_REJECT)
-
-        logger.debug(self._create_message("Sending Connection Request Packet"))
-        writer.write(bytes(request))
-        await writer.drain()
-
-        logger.debug(self._create_message("Waiting for Connection Accept"))
-        packet_reader = PacketReader(reader, parent_name=self.get_message_label())
-        response = await packet_reader.get_packet()
-
-        if not response.is_sideband():
-            message = "Received unexpected packet"
-            logger.warning(self._create_message(message))
-            raise Exception(message)
-        sideband_response = cast(BaseSidebandPacket, response)
-        if sideband_response.is_connection_reject():
-            message = "Connection rejected"
-            logger.warning(self._create_message(message))
-            raise Exception(message)
-        if not sideband_response.is_connection_accept():
-            message = "Received unexpected sideband packet"
-            logger.warning(self._create_message(message))
-            raise Exception(message)
-        logger.debug(self._create_message("Client Connected"))
-
+        # Connect over shared memory
+        shm_pair = ShmStreamPair(port_index=self._port_index, is_server=False, namespace="switch")
+        reader = shm_pair.reader
+        writer = shm_pair.writer
+        logger.debug(self._create_message("Client Connected (shm)"))
         return (reader, writer)
 
     def inject_error(self, injected_error: INJECTED_ERRORS):
@@ -113,8 +89,27 @@ class SwitchConnectionClient(RunnableComponent):
                     break
                 try:
                     (reader, writer) = await self._connect()
+                    logger.info(self._create_message("Client connected over shm"))
+                    # Send sideband connection request and wait for accept
+                    logger.info(self._create_message("Sending CONNECTION_REQUEST"))
+                    sb_req = SidebandConnectionRequestPacket.create(self._port_index)
+                    writer.write(bytes(sb_req))
+                    await writer.drain()
+                    logger.info(self._create_message("Sent CONNECTION_REQUEST; waiting for ACCEPT"))
+                    pr = PacketReader(reader, "SwitchConnectionClient")
+                    packet = await pr.get_packet()
+                    if packet.system_header.payload_type != SYSTEM_PAYLOAD_TYPE.SIDEBAND:
+                        raise Exception(self._create_message("Handshake Error: non-sideband"))
+                    base_sideband_packet = cast(BaseSidebandPacket, packet)
+                    if (
+                        base_sideband_packet.sideband_header.type
+                        != SIDEBAND_TYPES.CONNECTION_ACCEPT
+                    ):
+                        raise Exception(self._create_message("Handshake Error: not accepted"))
+                    logger.info(self._create_message("Handshake accepted by server"))
                     break
                 except Exception as e:
+                    logger.warning(self._create_message(f"Connect/Handshake failed: {e}"))
                     if loop.time() >= end_time:
                         raise Exception(
                             self._create_message("Timed out waiting for CXL-Switch")
@@ -128,9 +123,22 @@ class SwitchConnectionClient(RunnableComponent):
                     await asyncio.sleep(1)
         else:
             (reader, writer) = await self._connect()
+            # Send sideband connection request and wait for accept
+            logger.info(self._create_message("Sending CONNECTION_REQUEST"))
+            sb_req = SidebandConnectionRequestPacket.create(self._port_index)
+            writer.write(bytes(sb_req))
+            await writer.drain()
+            logger.info(self._create_message("Sent CONNECTION_REQUEST; waiting for ACCEPT"))
+            pr = PacketReader(reader, "SwitchConnectionClient")
+            packet = await pr.get_packet()
+            if packet.system_header.payload_type != SYSTEM_PAYLOAD_TYPE.SIDEBAND:
+                raise Exception(self._create_message("Handshake Error: non-sideband"))
+            base_sideband_packet = cast(BaseSidebandPacket, packet)
+            if base_sideband_packet.sideband_header.type != SIDEBAND_TYPES.CONNECTION_ACCEPT:
+                raise Exception(self._create_message("Handshake Error: not accepted"))
+            logger.info(self._create_message("Handshake accepted by server"))
 
-        _, local_port = writer.get_extra_info("sockname")
-        logger.info(self._create_message(f"Connected to switch using local port {local_port}"))
+        logger.info(self._create_message("Connected to switch using shm"))
 
         self._packet_processor = CxlPacketProcessor(
             reader,
@@ -139,8 +147,11 @@ class SwitchConnectionClient(RunnableComponent):
             self._component_type,
             label=f"ClientPort{self._port_index}",
         )
+        logger.info(self._create_message("Starting client PacketProcessor"))
         tasks = [asyncio.create_task(self._packet_processor.run())]
         await self._packet_processor.wait_for_ready()
+        logger.info(self._create_message("Client PacketProcessor RUNNING"))
+        logger.info(self._create_message("SwitchConnectionClient READY"))
         await self._change_status_to_running()
         await asyncio.gather(*tasks)
 

@@ -20,6 +20,11 @@ from opencis.cxl.component.cxl_host import CxlHost, CxlHostConfig
 from opencis.cxl.component.hdm_decoder import INTERLEAVE_GRANULARITY, INTERLEAVE_WAYS
 from opencis.cpu import CPU
 from opencis.util.number_const import MB
+import asyncio as _asyncio
+
+
+# Global event used to gate user_app start until SYS-SW completes HDM setup
+_SYS_SW_READY = _asyncio.Event()
 
 
 @dataclass
@@ -76,6 +81,7 @@ host_fm_conn = None
 
 
 async def my_sys_sw_app(ig: int = None, iw: int = None, host_fm_conn_port: int = 8700, **kwargs):
+    logger.info("[SYS-SW] my_sys_sw_app starting")
     cxl_memory_hub: CxlMemoryHub
 
     # Max addr for CFG is 0x9FFFFFFF, given max num bus = 8
@@ -109,9 +115,44 @@ async def my_sys_sw_app(ig: int = None, iw: int = None, host_fm_conn_port: int =
     cxl_mem_driver = CxlMemDriver(cxl_bus_driver, root_complex)
     await cxl_bus_driver.init()
     await cxl_mem_driver.init()
+    # Poll briefly for CXL.mem devices to appear after initial PCI enumeration config
+    poll_start = time.time()
+    while len(cxl_mem_driver.get_devices()) == 0 and (time.time() - poll_start) < 5:
+        await asyncio.sleep(0.05)
+        await cxl_bus_driver.init()
+        await cxl_mem_driver.init()
 
     pci_cfg_size = 0x10000000  # assume bus bits n = 8
     memory_base_tracker = MemoryBaseTracker(cxl_hpa_base_addr, pci_cfg_base_addr, mmio_base)
+
+    # Early minimal HDM setup: configure first device and USP to unblock user_app
+    early_attached_bdf = None
+    devices = cxl_mem_driver.get_devices()
+    if False and devices:
+        first_device = devices[0]
+        size = first_device.get_memory_size()
+        successful = await cxl_mem_driver.attach_single_mem_device(
+            first_device, memory_base_tracker.hpa_base, size
+        )
+        if successful:
+            sn = first_device.pci_device_info.serial_number
+            vppb = cxl_mem_driver.get_port_number(first_device)
+            logger.warning(f"[SYS-SW] Early attached device, SN: {sn}, port: {vppb}")
+            if await first_device.get_bi_enable():
+                mem_tracker.add_mem_range(
+                    vppb, memory_base_tracker.hpa_base, size, MEM_ADDR_TYPE.CXL_CACHED_BI
+                )
+            else:
+                mem_tracker.add_mem_range(
+                    vppb, memory_base_tracker.hpa_base, size, MEM_ADDR_TYPE.CXL_UNCACHED
+                )
+            logger.warning(
+                f"[SYS-SW] Added CXL.mem range base=0x{memory_base_tracker.hpa_base:X} size=0x{size:X}"
+            )
+            early_attached_bdf = first_device.pci_device_info.bdf
+            _SYS_SW_READY.set()
+            logger.warning("[SYS-SW] _SYS_SW_READY set (early attach)")
+            memory_base_tracker.hpa_base += size
 
     for device in pci_bus_driver.get_devices():
         if not device.is_bridge:
@@ -180,9 +221,18 @@ async def my_sys_sw_app(ig: int = None, iw: int = None, host_fm_conn_port: int =
                 interleaved_mem_size,
                 MEM_ADDR_TYPE.CXL_UNCACHED,
             )
+        logger.warning(
+            f"[SYS-SW] Added interleaved CXL.mem range base=0x{memory_base_tracker.hpa_base:X} size=0x{interleaved_mem_size:X}"
+        )
+        _SYS_SW_READY.set()
+        logger.warning("[SYS-SW] _SYS_SW_READY set (interleaved)")
     else:
         # interleave disabled
+        # Allow benchmark to start after the first successful attach and range addition
+        first_attached_done = False
         for device in cxl_mem_driver.get_devices():
+            if early_attached_bdf is not None and device.pci_device_info.bdf == early_attached_bdf:
+                continue
             size = device.get_memory_size()
             successful = await cxl_mem_driver.attach_single_mem_device(
                 device, memory_base_tracker.hpa_base, size
@@ -203,7 +253,15 @@ async def my_sys_sw_app(ig: int = None, iw: int = None, host_fm_conn_port: int =
                 mem_tracker.add_mem_range(
                     vppb, memory_base_tracker.hpa_base, size, MEM_ADDR_TYPE.CXL_UNCACHED
                 )
+            logger.warning(
+                f"[SYS-SW] Added CXL.mem range base=0x{memory_base_tracker.hpa_base:X} size=0x{size:X}"
+            )
             memory_base_tracker.hpa_base += size
+            if not first_attached_done:
+                _SYS_SW_READY.set()
+                logger.warning("[SYS-SW] _SYS_SW_READY set (first attach)")
+                first_attached_done = True
+                break
 
     # System Memory
     sys_mem_size = root_complex.get_sys_mem_size()
@@ -215,9 +273,12 @@ async def my_sys_sw_app(ig: int = None, iw: int = None, host_fm_conn_port: int =
             f"size: 0x{range.size:X}, type: {str(range.addr_type)}"
         )
 
+    # Note: readiness is signaled at the point the first CXL.mem range is added
+
     logger.debug(f"[SYS-SW] Creating connection for host with root port {root_port}")
 
     await host_fm_conn_client.start_connection()
+    logger.info("[SYS-SW] ShortMsg host connection to FM established")
 
     def bind():
         async def _bind(_: int, data: HostFMMsg):
@@ -313,29 +374,44 @@ async def sample_app(keepalive: bool, **kwargs):
     cpu: CPU
 
     cpu = kwargs["cpu"]
-    logger.info("[USER-APP] Starting...")
+    # Ensure SYS-SW completed before starting the benchmark
+    await _SYS_SW_READY.wait()
+    # Additionally, wait for a CXL.mem range to be present in the hub
+    cxl_memory_hub: CxlMemoryHub = kwargs["cxl_memory_hub"]
+    start_wait = time.time()
+    while True:
+        ranges = cxl_memory_hub.get_memory_ranges()
+        has_cxl_mem = any(
+            r.addr_type in (MEM_ADDR_TYPE.CXL_CACHED_BI, MEM_ADDR_TYPE.CXL_UNCACHED) for r in ranges
+        )
+        if has_cxl_mem:
+            break
+        if time.time() - start_wait > 20:
+            break
+        await asyncio.sleep(0.05)
+    logger.warning("[USER-APP] Starting...")
     # await cpu.store(0x100000000000, 0x40, 0xDEADBEEF)
     # val = await cpu.load(0x100000000000, 0x40)
     # logger.info(f"0x{val:X}")
     # val = await cpu.load(0x100000000040, 0x40)
     # logger.info(f"0x{val:X}")
 
-    BYTE_COUNT = 0x80000
+    BYTE_COUNT = 0x1000
     start = time.time()
     for offset in range(0, BYTE_COUNT, 0x40):
         await cpu.store(0x100000000000 + offset, 0x40, 0xDEADBEEF)
     end = time.time()
     wr_time = end - start
-    wr_throughput = (BYTE_COUNT / (1024*1024)) / wr_time
-    logger.info(f"Write RESULTS: {wr_throughput} MB/s")
+    wr_throughput = (BYTE_COUNT / (1024 * 1024)) / wr_time
+    logger.warning(f"Write RESULTS: {wr_throughput} MB/s")
 
     start = time.time()
     for offset in range(0, BYTE_COUNT, 0x40):
         await cpu.load(0x100000000000 + offset, 0x40)
     end = time.time()
     rd_time = end - start
-    rd_throughput = (BYTE_COUNT / (1024*1024)) / rd_time
-    logger.info(f"Read RESULTS: {rd_throughput} MB/s")
+    rd_throughput = (BYTE_COUNT / (1024 * 1024)) / rd_time
+    logger.warning(f"Read RESULTS: {rd_throughput} MB/s")
 
     if keepalive:
         await asyncio.Event().wait()

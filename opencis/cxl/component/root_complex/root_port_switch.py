@@ -77,6 +77,9 @@ class CxlRootPort(RunnableComponent):
         ]
         await asyncio.gather(*wait_tasks)
         await self._change_status_to_running()
+        from opencis.util.logger import logger
+
+        logger.info(self._create_message("RootPort FIFO relays RUNNING"))
         await asyncio.gather(*run_tasks)
 
     async def _stop(self):

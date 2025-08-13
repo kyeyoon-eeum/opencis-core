@@ -59,6 +59,7 @@ class RunnableComponent(LabeledComponent):
 
             self._status = COMPONENT_STATUS.STARTING
             logger.debug(self._create_message("Starting"))
+            logger.info(self._create_message("Lifecycle: STARTING"))
             self._condition.notify_all()
             self._condition.release()
 
@@ -66,6 +67,7 @@ class RunnableComponent(LabeledComponent):
             await self._run()
 
             logger.debug(self._create_message("Stopped"))
+            logger.info(self._create_message("Lifecycle: STOPPED"))
             await self._condition.acquire()
             self._status = COMPONENT_STATUS.STOPPED
             self._condition.notify_all()
@@ -164,6 +166,7 @@ class RunnableComponent(LabeledComponent):
         self._status = COMPONENT_STATUS.RUNNING
         self._condition.notify_all()
         self._condition.release()
+        logger.info(self._create_message("Lifecycle: RUNNING"))
 
     @abstractmethod
     async def _stop(self):
@@ -171,8 +174,10 @@ class RunnableComponent(LabeledComponent):
 
     async def wait_for_ready(self):
         await self._condition.acquire()
+        logger.info(self._create_message("wait_for_ready(): waiting for RUNNING"))
         while self._status != COMPONENT_STATUS.RUNNING:
             logger.debug(self._create_message("Not running yet. Waiting"))
             await self._condition.wait()
         self._condition.release()
         self._ready_waited = True
+        logger.info(self._create_message("wait_for_ready(): READY"))

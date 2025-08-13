@@ -32,26 +32,26 @@ class PacketProcessor(RunnableComponent):
         if self._downstream_fifo is None:
             logger.debug(self._create_message("Skipped processing host to target packets"))
             return
-        logger.debug(self._create_message("Started processing host to target packets"))
+        logger.info(self._create_message("Started processing host->target packets"))
         while True:
             packet = await self._upstream_fifo.host_to_target.get()
             if packet is None:
-                logger.debug(self._create_message("Stopped host to target packets"))
+                logger.info(self._create_message("Stopped host->target packets"))
                 break
-            logger.debug(self._create_message("Received host to target Packet"))
+            logger.info(self._create_message("Forwarding host->target packet"))
             await self._downstream_fifo.host_to_target.put(packet)
 
     async def _process_target_to_host(self):
         if self._downstream_fifo is None:
             logger.debug(self._create_message("Skipped processing target to host packets"))
             return
-        logger.debug(self._create_message("Started processing target to host packets"))
+        logger.info(self._create_message("Started processing target->host packets"))
         while True:
             packet = await self._downstream_fifo.target_to_host.get()
             if packet is None:
-                logger.debug(self._create_message("Stopped target to host packets"))
+                logger.info(self._create_message("Stopped target->host packets"))
                 break
-            logger.debug(self._create_message("Received target to host Packet"))
+            logger.info(self._create_message("Forwarding target->host packet"))
             await self._upstream_fifo.target_to_host.put(packet)
 
     async def _run(self):

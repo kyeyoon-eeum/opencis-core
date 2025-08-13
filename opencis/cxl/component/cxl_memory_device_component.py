@@ -224,7 +224,7 @@ class CxlMemoryDeviceComponent(CxlDeviceComponent):
         )
         self._hdm_decoder_manager = DeviceHdmDecoderManager(hdm_decoder_capabilities, label=label)
         if memory_size is None:
-            memory_size = self._identity.get_total_capacity() // SIZE_256MB
+            memory_size = self._identity.get_total_capacity()
         if "/dev" in memory_file:
             self._memory_accessor = CharDriverAccessor(memory_file, memory_size)
         elif memory_file == "":

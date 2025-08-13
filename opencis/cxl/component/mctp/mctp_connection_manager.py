@@ -17,6 +17,7 @@ from opencis.cxl.component.mctp.mctp_packet_processor import (
 )
 from opencis.util.component import RunnableComponent
 from opencis.util.server import ServerComponent
+from opencis.cxl.transport.shm_stream import ShmStreamPair
 
 # pylint: disable=duplicate-code
 
@@ -39,21 +40,19 @@ class MctpConnectionManager(RunnableComponent):
         self._host = host
         self._port = port
         self._connection_timeout_ms = connection_timeout_ms
-        # TODO: Support receiving connections from CXL Devices
         self._switch_port = MctpPort()
-        self._server_component = ServerComponent(
-            handle_client=self._handle_client,
-            host=self._host,
-            port=self._port,
-            stop_callback=self._stop_callback,
-        )
+        # No TCP server; use shared memory stream pair at logical port 0
+        self._shm_pair = ShmStreamPair(port_index=0, is_server=True, namespace="mctp")
+        self._server_component = None
 
     async def _run(self):
-        server_task = asyncio.create_task(self._server_component.run())
-        await self._server_component.wait_for_ready()
-        self._port = self._server_component.get_port()
+        logger.info(self._create_message("MCTP SHM server initializing"))
+        reader = self._shm_pair.reader
+        writer = self._shm_pair.writer
+        self._switch_port.connected = True
         await self._change_status_to_running()
-        await server_task
+        logger.info(self._create_message("MCTP SHM server RUNNING; starting processor"))
+        await self._start_packet_processor(reader, writer)
 
     async def _stop_callback(self):
         if self._switch_port.packet_processor is not None:
@@ -62,22 +61,14 @@ class MctpConnectionManager(RunnableComponent):
             logger.info(self._create_message("Stopped PacketProcessor for Switch Port"))
 
     async def _stop(self):
-        logger.info(self._create_message("Canceling TCP server task"))
-        await self._server_component.stop()
+        if self._switch_port.packet_processor is not None:
+            await self._switch_port.packet_processor.stop()
+        if self._shm_pair:
+            self._shm_pair.close()
 
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-        try:
-            logger.info(self._create_message("Found a new socket connection"))
-            if self._switch_port.connected:
-                logger.warning(self._create_message("Connection already exists for Switch Port"))
-            else:
-                logger.info(self._create_message("Binding incoming connection to Switch Port"))
-                self._switch_port.connected = True
-                await self._start_packet_processor(reader, writer)
-        except Exception as e:
-            logger.warning(self._create_message(str(e)))
-
-        self._switch_port.connected = False
+        # Unused in shm mode
+        pass
 
     async def _start_packet_processor(
         self,

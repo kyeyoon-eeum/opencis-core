@@ -47,6 +47,13 @@ class RootPortClientManager(RunnableComponent):
                 parent_name=self.get_message_label(),
             )
             self._sw_conn_clients.append(connection_client)
+            from opencis.util.logger import logger
+
+            logger.info(
+                self._create_message(
+                    f"Initialized RootPortClient for port {client_config.port_index}"
+                )
+            )
 
     def get_cxl_connections(self) -> List[RootPortConnection]:
         connections = []
@@ -59,12 +66,21 @@ class RootPortClientManager(RunnableComponent):
         return connections
 
     async def _run(self):
+        from opencis.util.logger import logger
+
+        logger.info(self._create_message("RootPortClientManager starting"))
         run_tasks = [asyncio.create_task(client.run()) for client in self._sw_conn_clients]
-        wait_tasks = [
-            asyncio.create_task(client.wait_for_ready()) for client in self._sw_conn_clients
-        ]
-        await asyncio.gather(*wait_tasks)
+        logger.info(
+            self._create_message(f"Waiting for {len(self._sw_conn_clients)} client(s) READY")
+        )
+        # Await each client sequentially to avoid scheduler races and to get clear logs
+        for idx, client in enumerate(self._sw_conn_clients):
+            logger.info(self._create_message(f"Waiting for client {idx} READY"))
+            await client.wait_for_ready()
+            logger.info(self._create_message(f"Client {idx} READY"))
+        logger.info(self._create_message("All clients READY"))
         await self._change_status_to_running()
+        logger.info(self._create_message("RootPortClientManager RUNNING"))
         await asyncio.gather(*run_tasks)
 
     async def _stop(self):

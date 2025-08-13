@@ -27,6 +27,18 @@ ext_modules = cythonize(
             extra_compile_args=common_cflags,
             extra_link_args=["-g"],
         ),
+        Extension(
+            "shm_ring",
+            [os.path.join(here, "shm_ring.pyx")],
+            extra_compile_args=common_cflags,
+            extra_link_args=["-g"],
+        ),
+        Extension(
+            "c_mmap",
+            [os.path.join(here, "c_mmap.pyx")],
+            extra_compile_args=common_cflags,
+            extra_link_args=["-g"],
+        ),
     ],
     gdb_debug=True,
     compiler_directives={

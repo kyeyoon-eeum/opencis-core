@@ -61,6 +61,9 @@ class PhysicalPortManager(RunnableComponent):
             if port_config.type == PORT_TYPE.USP:
                 self._port_devices.append(UpstreamPortDevice(transport_connection, port_index))
                 self._ppb_binds.append(None)
+                from opencis.util.logger import logger
+
+                logger.info(self._create_message(f"Initialized USP device for port {port_index}"))
             else:
                 physical_port = DownstreamPortDevice(transport_connection, port_index)
                 ppb = PpbDevice(port_index)
@@ -71,6 +74,11 @@ class PhysicalPortManager(RunnableComponent):
                 )
                 self._ppb_binds.append(bind)
                 physical_port.set_ppb(ppb, bind)
+                from opencis.util.logger import logger
+
+                logger.info(
+                    self._create_message(f"Initialized DSP device and PPB for port {port_index}")
+                )
 
     def get_port_device(self, port_index: int) -> CxlPortDevice:
         if port_index < 0 or port_index >= len(self._port_devices):
@@ -157,6 +165,9 @@ class PhysicalPortManager(RunnableComponent):
 
         await gather(*wait_tasks)
         await self._change_status_to_running()
+        from opencis.util.logger import logger
+
+        logger.info(self._create_message("PhysicalPortManager RUNNING"))
         await gather(*run_tasks)
 
     async def _stop(self):

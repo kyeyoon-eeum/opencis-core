@@ -47,7 +47,22 @@ class ServerComponent(RunnableComponent):
         return self._port
 
     async def _create_server(self):
+        # When in shm mode, this component may be constructed but should not create a TCP server
+        if "SHM" in self._descriptor:
+            return None
+
         async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+            try:
+                sock = writer.get_extra_info("socket")
+                if sock is not None:
+                    import socket
+
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    # Increase buffers to reduce syscalls for small writes
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1 << 20)
+            except Exception:
+                pass
             self._clients.add(writer)
             logger.info(
                 self._create_message(
@@ -84,6 +99,10 @@ class ServerComponent(RunnableComponent):
         try:
             logger.info(self._create_message(f"Creating {self._descriptor}"))
             server = await self._create_server()
+            if server is None:
+                await self._change_status_to_running()
+                await asyncio.Event().wait()
+                return
             self._server_task = asyncio.create_task(server.serve_forever())
             while not server.is_serving():
                 await asyncio.sleep(0.1)

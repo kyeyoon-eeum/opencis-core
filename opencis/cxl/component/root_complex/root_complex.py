@@ -166,15 +166,25 @@ class RootComplex(RunnableComponent):
             asyncio.create_task(self._home_agent.run()),
             asyncio.create_task(self._memory_controller.run()),
         ]
-        wait_tasks = [
-            asyncio.create_task(self._root_port_switch.wait_for_ready()),
-            asyncio.create_task(self._io_bridge.wait_for_ready()),
-            asyncio.create_task(self._cache_coherency_bridge.wait_for_ready()),
-            asyncio.create_task(self._home_agent.wait_for_ready()),
-            asyncio.create_task(self._memory_controller.wait_for_ready()),
-        ]
-        await asyncio.gather(*wait_tasks)
+        from opencis.util.logger import logger
+
+        logger.info(self._create_message("Waiting RootPortSwitch READY"))
+        await self._root_port_switch.wait_for_ready()
+        logger.info(self._create_message("RootPortSwitch READY"))
+        logger.info(self._create_message("Waiting IoBridge READY"))
+        await self._io_bridge.wait_for_ready()
+        logger.info(self._create_message("IoBridge READY"))
+        logger.info(self._create_message("Waiting CacheCoherencyBridge READY"))
+        await self._cache_coherency_bridge.wait_for_ready()
+        logger.info(self._create_message("CacheCoherencyBridge READY"))
+        logger.info(self._create_message("Waiting HomeAgent READY"))
+        await self._home_agent.wait_for_ready()
+        logger.info(self._create_message("HomeAgent READY"))
+        logger.info(self._create_message("Waiting MemoryController READY"))
+        await self._memory_controller.wait_for_ready()
+        logger.info(self._create_message("MemoryController READY"))
         await self._change_status_to_running()
+        logger.info(self._create_message("RootComplex RUNNING"))
         await asyncio.gather(*run_tasks)
 
     async def _stop(self):

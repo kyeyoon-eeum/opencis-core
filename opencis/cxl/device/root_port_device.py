@@ -227,6 +227,7 @@ class CxlRootPortDevice(RunnableComponent):
 
         cfg_fifo = self._downstream_connection.cfg_fifo
         await cfg_fifo.host_to_target.put(packet)
+        logger.info(self._create_message("Host enqueued CFG WR to host_to_target"))
 
         # TODO: Wait for an incoming packet that matchs tag
         packet = await cfg_fifo.target_to_host.get()
@@ -268,6 +269,7 @@ class CxlRootPortDevice(RunnableComponent):
         self._next_tag = (self._next_tag + 1) % 256
         cfg_fifo = self._downstream_connection.cfg_fifo
         await cfg_fifo.host_to_target.put(packet)
+        logger.info(self._create_message("Host enqueued CFG RD to host_to_target"))
 
         # TODO: Wait for an incoming packet that matchs tag
         packet = await cfg_fifo.target_to_host.get()

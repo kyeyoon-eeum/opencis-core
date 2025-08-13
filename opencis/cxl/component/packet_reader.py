@@ -5,7 +5,7 @@ This software is licensed under the terms of the Revised BSD License.
 See LICENSE for details.
 """
 
-from asyncio import CancelledError, StreamReader, create_task
+from asyncio import CancelledError, create_task
 from enum import Enum, auto
 import traceback
 from typing import Optional, Tuple
@@ -65,9 +65,7 @@ class PACKET_READ_STATUS(Enum):
 
 
 class PacketReader(LabeledComponent):
-    def __init__(
-        self, reader: StreamReader, label: Optional[str] = None, parent_name: Optional[str] = None
-    ):
+    def __init__(self, reader, label: Optional[str] = None, parent_name: Optional[str] = None):
         label_prefix = f"{parent_name}:" if parent_name else ""
         label_suffix = f":{label}" if label else ""
         super().__init__(lambda class_name: f"{label_prefix}{class_name}{label_suffix}")
@@ -125,22 +123,23 @@ class PacketReader(LabeledComponent):
 
     async def _get_payload(self) -> Tuple[BasePacket, bytes]:
         logger.debug(self._create_message("Waiting Packet"))
-        header_bytes = await self._read_payload(SystemHeader.get_size())
-        # logger.info(f"header_bytes: {header_bytes}")
+        logger.debug(self._create_message("Waiting SystemHeader bytes"))
+        header_bytes = await self._reader.readexactly(SystemHeader.get_size())
         base_packet = BasePacket(bytearray(header_bytes))
         remaining_length = base_packet.system_header.payload_length - len(base_packet)
-        # logger.info(f"remaining_length: {remaining_length}")
+        logger.debug(
+            self._create_message(f"Got SystemHeader; remaining_payload_bytes={remaining_length}")
+        )
         if remaining_length < 0:
             raise Exception("remaining length is less than 0")
-        payload = bytes(base_packet) + await self._read_payload(remaining_length)
+        if remaining_length:
+            payload_rest = await self._reader.readexactly(remaining_length)
+        else:
+            payload_rest = b""
+        payload = bytes(base_packet) + payload_rest
         logger.debug(self._create_message("Received Packet"))
+        logger.debug(self._create_message("Assembled full packet payload"))
         return base_packet, payload
-
-    async def _read_payload(self, size: int) -> bytes:
-        payload = await self._reader.read(size)
-        if not payload:
-            raise Exception("Connection disconnected")
-        return payload
 
     def _get_cxl_io_packet(self, payload: bytes) -> CxlIoBasePacket:
         payload = bytearray(payload)

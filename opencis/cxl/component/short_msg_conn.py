@@ -22,6 +22,7 @@ from typing import Callable
 from opencis.util.component import RunnableComponent
 from opencis.util.logger import logger
 from opencis.util.server import ServerComponent
+from opencis.cxl.transport.shm_stream import ShmStreamPair
 
 
 class ShortMsgBase(Enum):
@@ -53,15 +54,7 @@ class ShortMsgConn(RunnableComponent):
         self._msg_to_interrupt_event = {}
         self._general_interrupt_event = {}
         self._server = server
-        if server:
-            self._server_component = ServerComponent(
-                handle_client=self._new_conn,
-                host=self._addr,
-                port=self._port,
-                leave_opened=True,
-            )
-        else:
-            self._server_component = None
+        self._server_component = None
         self._connections: dict[int, tuple[StreamReader, StreamWriter]] = {}
         self._tasks: list[Task] = []
         self._msg_handlers: list[Task] = []
@@ -190,9 +183,12 @@ class ShortMsgConn(RunnableComponent):
         await writer.drain()
 
     async def start_connection(self):
-        reader, writer = await open_connection(self._addr, self._port)
+        logger.info(self._create_message("ShortMsg client starting SHM connection"))
+        shm = ShmStreamPair(port_index=self._port, is_server=False, namespace="shortmsg")
+        reader, writer = shm.reader, shm.writer
         writer.write(int.to_bytes(self._device_id, 16, "little"))
         await writer.drain()
+        logger.info(self._create_message("ShortMsg client sent device ID"))
         self._connections[0] = (reader, writer)
         self._run_status = True
 
@@ -207,14 +203,28 @@ class ShortMsgConn(RunnableComponent):
     async def _run(self):
         try:
             if self._server:
-                server_task = create_task(self._server_component.run())
-                await self._server_component.wait_for_ready()
-                self._port = self._server_component.get_port()
+                logger.info(self._create_message("ShortMsg server starting SHM listener"))
+                shm = ShmStreamPair(port_index=self._port, is_server=True, namespace="shortmsg")
+                reader, writer = shm.reader, shm.writer
                 self._run_status = True
-                self._tasks.append(server_task)
+
+                # Accept connection and device ID in background so server can become READY immediately
+                async def _accept_first_client():
+                    remote_dev_id = await reader.readexactly(16)
+                    remote_dev_id_int = int.from_bytes(remote_dev_id, "little")
+                    logger.info(
+                        self._create_message(
+                            f"ShortMsg server received device ID {remote_dev_id_int}"
+                        )
+                    )
+                    self._connections[remote_dev_id_int] = (reader, writer)
+                    self._msg_handlers.append(create_task(self._msg_handler(reader, writer)))
+
+                self._tasks.append(create_task(_accept_first_client()))
             else:
                 pass
             await self._change_status_to_running()
+            logger.info(self._create_message("ShortMsg RUNNING"))
             self._tasks.append(create_task(self._end_signal.wait()))
 
             await gather(*self._tasks)

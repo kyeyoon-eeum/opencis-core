@@ -81,9 +81,11 @@ class IoBridge(RunnableComponent):
         self._next_tag = (self._next_tag + 1) % 256
 
         await self._cxl_io_cfg_fifos.host_to_target.put(packet)
+        logger.debug(self._create_message("Enqueued CFG WR to host_to_target"))
 
         # TODO: Wait for an incoming packet that matchs tag
         packet = await self._cxl_io_cfg_fifos.target_to_host.get()
+        logger.debug(self._create_message("Dequeued CFG completion from target_to_host"))
 
         tpl_type_str = "CFG WR0" if is_type0 else "CFG WR1"
 
@@ -127,10 +129,12 @@ class IoBridge(RunnableComponent):
         packet = CxlIoCfgRdPacket.create(bdf, offset, size, is_type0, req_id=0, tag=self._next_tag)
         self._next_tag = (self._next_tag + 1) % 256
         await self._cxl_io_cfg_fifos.host_to_target.put(packet)
+        logger.debug(self._create_message("Enqueued CFG RD to host_to_target"))
 
         # TODO: Wait for an incoming packet that matchs tag
         logger.debug(self._create_message("Putting Read Config packet to FIFO"))
         packet = await self._cxl_io_cfg_fifos.target_to_host.get()
+        logger.debug(self._create_message("Dequeued CFG completion from target_to_host"))
 
         bit_offset = (offset % 4) * 8
 
@@ -160,12 +164,14 @@ class IoBridge(RunnableComponent):
         logger.debug(message)
         packet = CxlIoMemWrPacket.create(address, size, value)
         await self._cxl_io_mmio_fifos.host_to_target.put(packet)
+        logger.debug(self._create_message("Enqueued MMIO WR to host_to_target"))
 
     async def read_mmio(self, address: int, size: int) -> int:
         message = self._create_message(f"MMIO: Reading data from 0x{address:08x}")
         logger.debug(message)
         packet = CxlIoMemRdPacket.create(address, size)
         await self._cxl_io_mmio_fifos.host_to_target.put(packet)
+        logger.debug(self._create_message("Enqueued MMIO RD to host_to_target"))
 
         try:
             async with timeout(10):
@@ -176,6 +182,7 @@ class IoBridge(RunnableComponent):
             return None
 
         cpld_packet = cast(CxlIoCompletionPacket, packet)
+        logger.debug(self._create_message("Received MMIO completion"))
         return cpld_packet.get_data_as_int()
 
     # pylint: enable=duplicate-code

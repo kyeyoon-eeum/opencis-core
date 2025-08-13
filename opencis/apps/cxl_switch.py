@@ -167,6 +167,9 @@ class CxlSwitch(RunnableComponent):
         self._virtual_switch_manager.register_event_handler(handle_switch_event)
 
     async def _run(self):
+        from opencis.util.logger import logger
+
+        logger.info(self._create_message("CxlSwitch starting components"))
         components = [
             self._switch_connection_manager,
             self._physical_port_manager,
@@ -185,6 +188,7 @@ class CxlSwitch(RunnableComponent):
         await self._change_status_to_running()
         if self._run_as_child:
             os.kill(os.getppid(), signal.SIGCONT)
+        logger.info(self._create_message("CxlSwitch components RUNNING"))
         await gather(*run_tasks)
 
     async def _stop(self):
