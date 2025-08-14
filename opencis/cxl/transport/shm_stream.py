@@ -36,15 +36,15 @@ class ShmEndpoint:
             # Server creates rings
             self._in_ring.create(c2s, DEFAULT_CAPACITY, DEFAULT_ELEM_SIZE)
             self._out_ring.create(s2c, DEFAULT_CAPACITY, DEFAULT_ELEM_SIZE)
-            logger.info(f"[ShmEndpoint] created rings: in={c2s}, out={s2c}")
+            logger.debug(f"[ShmEndpoint] created rings: in={c2s}, out={s2c}")
         else:
             # Client opens existing rings (may need to wait until server creates)
-            logger.info(f"[ShmEndpoint] opening rings: in={s2c}, out={c2s}")
+            logger.debug(f"[ShmEndpoint] opening rings: in={s2c}, out={c2s}")
             while True:
                 try:
                     self._in_ring.open(s2c)
                     self._out_ring.open(c2s)
-                    logger.info("[ShmEndpoint] opened rings successfully")
+                    logger.debug("[ShmEndpoint] opened rings successfully")
                     break
                 except Exception:
                     # Rings not ready yet; sleep a bit
@@ -87,7 +87,7 @@ class ShmStreamReader:
                     self._buf.extend(payload)
                 self._debug_reads += 1
                 if self._debug_reads <= 3:
-                    logger.info(f"[ShmStreamReader] read frame bytes={length}")
+                    logger.debug(f"[ShmStreamReader] read frame bytes={length}")
                 break
         # Return up to n bytes
         out_len = min(n, len(self._buf))
@@ -110,7 +110,7 @@ class ShmStreamReader:
                 self._buf.extend(payload)
             self._debug_reads += 1
             if self._debug_reads <= 3:
-                logger.info(f"[ShmStreamReader] readexactly frame bytes={length}")
+                logger.debug(f"[ShmStreamReader] readexactly frame bytes={length}")
         out = self._buf[:n]
         del self._buf[:n]
         return bytes(out)
@@ -144,7 +144,7 @@ class ShmStreamWriter:
             offset += length
             self._debug_writes += 1
             if self._debug_writes <= 3:
-                logger.info(f"[ShmStreamWriter] wrote frame bytes={length}")
+                logger.debug(f"[ShmStreamWriter] wrote frame bytes={length}")
 
     async def drain(self):
         # No-op for now
@@ -159,7 +159,7 @@ class ShmStreamPair:
         self._endpoint = ShmEndpoint(port_index, is_server, namespace)
         self.reader = ShmStreamReader(self._endpoint)
         self.writer = ShmStreamWriter(self._endpoint)
-        logger.info(
+        logger.debug(
             f"[ShmStreamPair] created for port={port_index} server={is_server} ns={namespace}"
         )
 

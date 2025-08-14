@@ -38,7 +38,7 @@ class PacketProcessor(RunnableComponent):
             if packet is None:
                 logger.info(self._create_message("Stopped host->target packets"))
                 break
-            logger.info(self._create_message("Forwarding host->target packet"))
+            logger.debug(self._create_message("Forwarding host->target packet"))
             await self._downstream_fifo.host_to_target.put(packet)
 
     async def _process_target_to_host(self):
@@ -51,7 +51,7 @@ class PacketProcessor(RunnableComponent):
             if packet is None:
                 logger.info(self._create_message("Stopped target->host packets"))
                 break
-            logger.info(self._create_message("Forwarding target->host packet"))
+            logger.debug(self._create_message("Forwarding target->host packet"))
             await self._upstream_fifo.target_to_host.put(packet)
 
     async def _run(self):

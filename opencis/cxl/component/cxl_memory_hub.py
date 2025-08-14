@@ -150,7 +150,7 @@ class CxlMemoryHub(RunnableComponent):
         )
 
     def add_mem_range(self, addr: int, size: int, addr_type: MEM_ADDR_TYPE):
-        logger.info(
+        logger.debug(
             self._create_message(
                 f"Add mem range type={addr_type.name} base=0x{addr:x} size=0x{size:x}"
             )
