@@ -293,19 +293,19 @@ def child_process_wrapper(target):
     os.setpgrp()
     setup_child_signal_handlers()
     # Enable per-process file logging for comprehensive tracing
-    try:
-        from opencis.util.logger import logger as _logger
+    # try:
+    #     from opencis.util.logger import logger as _logger
 
-        _logger.create_log_file(
-            filename=f"logs/proc-{os.getpid()}.log",
-            loglevel="DEBUG",
-            show_timestamp=True,
-            show_loglevel=True,
-            show_linenumber=False,
-        )
-        _logger.info(f"Child logger initialized for pid {os.getpid()}")
-    except Exception:
-        pass
+    #     _logger.create_log_file(
+    #         filename=f"logs/proc-{os.getpid()}.log",
+    #         loglevel="WARNING",
+    #         show_timestamp=True,
+    #         show_loglevel=True,
+    #         show_linenumber=False,
+    #     )
+    #     _logger.info(f"Child logger initialized for pid {os.getpid()}")
+    # except Exception:
+    #     pass
 
     target()
 

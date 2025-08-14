@@ -239,7 +239,7 @@ class CxlPacketProcessor(RunnableComponent):
                         break
                     # Ignore other sideband frames
                     logger.debug(self._create_message("Received sideband; ignoring"))
-                    continue
+                    raise Exception("Received unexpected CXL.io packet")
                 if packet.is_cxl_io():
                     cxl_io_packet = cast(CxlIoBasePacket, packet)
                     if cxl_io_packet.is_cpl() or cxl_io_packet.is_cpld():
@@ -336,11 +336,11 @@ class CxlPacketProcessor(RunnableComponent):
                         logger.error(
                             self._create_message("Got CCI packet on wrong device type - SLD")
                         )
-                        continue
+                        raise Exception("Got CCI packet on wrong device type - SLD")
                     if self._component_type == CXL_COMPONENT_TYPE.LD:
                         if self._fmld.upstream_fifo is None:
                             logger.error(self._create_message("Got CCI packet on no CCI FIFO"))
-                            continue
+                            raise Exception("Got CCI packet on no CCI FIFO")
                         cci_packet = cast(CciRequestPacket, packet)
                         await self._fmld.upstream_fifo.host_to_target.put(cci_packet)
                     elif self._component_type == CXL_COMPONENT_TYPE.DSP:
@@ -348,7 +348,7 @@ class CxlPacketProcessor(RunnableComponent):
                 else:
                     message = f"Received unexpected {self._incoming_dir} packet"
                     logger.warning(self._create_message(message))
-                    continue
+                    raise Exception(message)
             except Exception as e:
                 msg = str(e)
                 logger.debug(self._create_message(msg))
