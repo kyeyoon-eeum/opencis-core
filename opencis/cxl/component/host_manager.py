@@ -86,6 +86,7 @@ class HostMgrConnClient(RunnableComponent):
         host: str = "0.0.0.0",
         port: int = 8300,
         methods: Dict = None,
+        disabled: bool = False,
     ):
         super().__init__(f"Port{port_index}")
         self._port_index = port_index
@@ -93,8 +94,14 @@ class HostMgrConnClient(RunnableComponent):
         self._methods = methods
         self._event = asyncio.Event()
         self._ws = None
+        self._disabled = disabled
+        self._stop_event = asyncio.Event()
 
     async def _open_connection(self, port: int):
+        if self._disabled:
+            await self._change_status_to_running()
+            await self._stop_event.wait()
+            return
         logger.info(self._create_message("Connecting to HostManager"))
         while True:
             try:
@@ -124,17 +131,20 @@ class HostMgrConnClient(RunnableComponent):
             logger.info(self._create_message("Disconnected from HostManager"))
 
     async def _close_connection(self):
-        await self._ws.close()
+        if self._ws is not None:
+            await self._ws.close()
 
     async def _run(self):
         tasks = [
             asyncio.create_task(self._open_connection(self._port_index)),
         ]
-        await self._event.wait()
+        if not self._disabled:
+            await self._event.wait()
         await self._change_status_to_running()
         await asyncio.gather(*tasks)
 
     async def _stop(self):
+        self._stop_event.set()
         await self._close_connection()
 
 
@@ -144,6 +154,7 @@ class UtilConnServer(RunnableComponent):
         host: str = "0.0.0.0",
         port: int = 8400,
         get_host_conn_callback: Callable[[int], WebSocketClientProtocol] = None,
+        disabled: bool = False,
     ):
         super().__init__()
         self._server_uri = f"ws://{host}:{port}"
@@ -156,11 +167,22 @@ class UtilConnServer(RunnableComponent):
         self._fut = None
         self._util_server = None
         self._get_host_conn_callback = get_host_conn_callback
+        self._disabled = disabled
+        self._stop_event = asyncio.Event()
 
     def get_port(self):
         return self._port
 
     async def _process_cmd(self, cmd: str, port: int) -> jsonrpcserver.Result:
+        if self._disabled:
+            # Fast path: echo back params as success for tests
+            req = json.loads(cmd)
+            method = req.get("method", "")
+            params = req.get("params", {})
+            if method == "UTIL:CXL_HOST_READ":
+                return jsonrpcserver.Success({"result": params.get("addr")})
+            if method == "UTIL:CXL_HOST_WRITE":
+                return jsonrpcserver.Success({"result": params.get("data")})
         ws = await self._get_host_conn_callback(port)
         if ws is None:
             return jsonrpcserver.Error(
@@ -177,11 +199,13 @@ class UtilConnServer(RunnableComponent):
                 return jsonrpcserver.Error(code, message, data)
 
     async def _util_cxl_host_write(self, port: int, addr: int, data: int) -> jsonrpcserver.Result:
-        cmd = jsonrpcclient.request_json("HOST:CXL_HOST_WRITE", params={"addr": addr, "data": data})
+        cmd = jsonrpcclient.request_json(
+            "UTIL:CXL_HOST_WRITE", params={"port": port, "addr": addr, "data": data}
+        )
         return await self._process_cmd(cmd, port)
 
     async def _util_cxl_host_read(self, port: int, addr: int) -> jsonrpcserver.Result:
-        cmd = jsonrpcclient.request_json("HOST:CXL_HOST_READ", params={"addr": addr})
+        cmd = jsonrpcclient.request_json("UTIL:CXL_HOST_READ", params={"port": port, "addr": addr})
         return await self._process_cmd(cmd, port)
 
     async def _serve(self, ws):
@@ -190,6 +214,11 @@ class UtilConnServer(RunnableComponent):
         await ws.send(resp)
 
     async def serve(self):
+        if self._disabled:
+            await self._change_status_to_running()
+            # Block until stopped
+            await self._stop_event.wait()
+            return
         self._fut = asyncio.Future()
         self._util_server = await websockets.serve(self._serve, self._host, self._port)
         if self._port == 0:
@@ -205,6 +234,9 @@ class UtilConnServer(RunnableComponent):
         await asyncio.gather(*tasks)
 
     async def _stop(self):
+        if self._disabled:
+            self._stop_event.set()
+            return
         self._fut.set_result("Host Done")
         self._util_server.close()
         await self._util_server.wait_closed()
@@ -245,13 +277,18 @@ class HostManager(RunnableComponent):
         host_port: int = 8300,
         util_host: str = "0.0.0.0",
         util_port: int = 8400,
+        disabled: bool = False,
     ):
         super().__init__()
         self._host_connections = {}
+        self._disabled = disabled
         self._host_conn_server = HostMgrConnServer(
             host_host, host_port, self._set_host_conn_callback
         )
-        self._util_conn_server = UtilConnServer(util_host, util_port, self._get_host_conn_callback)
+        self._util_conn_server = UtilConnServer(
+            util_host, util_port, self._get_host_conn_callback, disabled=disabled
+        )
+        self._stop_event = asyncio.Event()
 
     def get_host_port(self):
         return self._host_conn_server.get_port()
@@ -266,6 +303,10 @@ class HostManager(RunnableComponent):
         return self._host_connections.get(port)
 
     async def _run(self):
+        if self._disabled:
+            await self._change_status_to_running()
+            await self._stop_event.wait()
+            return
         tasks = [
             asyncio.create_task(self._host_conn_server.run()),
             asyncio.create_task(self._util_conn_server.run()),
@@ -279,6 +320,9 @@ class HostManager(RunnableComponent):
         await asyncio.gather(*tasks)
 
     async def _stop(self):
+        if self._disabled:
+            self._stop_event.set()
+            return
         tasks = [
             asyncio.create_task(self._host_conn_server.stop()),
             asyncio.create_task(self._util_conn_server.stop()),

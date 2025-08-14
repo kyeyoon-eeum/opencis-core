@@ -22,11 +22,13 @@ def get_memory_bin_name(index_primary: int = 0, index_secondary: int = -1) -> st
     # pylint: disable=protected-access
     func_name = sys._getframe(1).f_code.co_name
 
+    base_dir = "/tmp"
     while True:
         if index_secondary != -1:
-            bin_name = f"mem_{func_name}_{index_primary}-{index_secondary}.bin"
+            bin_name_only = f"mem_{func_name}_{index_primary}-{index_secondary}.bin"
         else:
-            bin_name = f"mem_{func_name}_{index_primary}.bin"
+            bin_name_only = f"mem_{func_name}_{index_primary}.bin"
+        bin_name = os.path.join(base_dir, bin_name_only)
         # Check if the bin name already exists
         if not os.path.exists(bin_name):
             break

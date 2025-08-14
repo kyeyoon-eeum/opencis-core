@@ -7,7 +7,8 @@ See LICENSE for details.
 
 from dataclasses import dataclass
 from typing import cast
-from asyncio import Queue, create_task, gather, timeout, exceptions
+from opencis.util.async_queue import AsyncQueue as Queue
+from asyncio import create_task, gather, timeout, exceptions
 from opencis.util.component import RunnableComponent
 from opencis.pci.component.fifo_pair import FifoPair
 from opencis.cxl.transport.memory_fifo import MemoryFifoPair

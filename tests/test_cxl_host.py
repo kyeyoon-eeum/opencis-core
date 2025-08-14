@@ -292,7 +292,7 @@ async def test_cxl_host_type3_ete():
     )
 
     fabric_manager = CxlFabricManager(mctp_port=0, host_fm_conn_port=0)
-    host_manager = HostManager(host_port=0, util_port=0)
+    host_manager = HostManager(host_port=0, util_port=0, disabled=True)
 
     # 256B / No interleave
     ig = 0

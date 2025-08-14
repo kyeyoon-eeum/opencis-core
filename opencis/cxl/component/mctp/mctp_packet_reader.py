@@ -5,7 +5,7 @@ This software is licensed under the terms of the Revised BSD License.
 See LICENSE for details.
 """
 
-from asyncio import StreamReader, create_task
+from asyncio import create_task
 from typing import Optional
 
 from opencis.cxl.transport.cci_packets import CciMessagePacket, CciPayloadPacket
@@ -13,6 +13,7 @@ from opencis.util.logger import logger
 from opencis.util.component import LabeledComponent
 from opencis.cxl.transport.packet_structs import SystemHeader
 from opencis.cxl.transport.common import BasePacket
+from opencis.cxl.transport.stream_types import StreamReaderLike
 
 # pylint: disable=duplicate-code
 
@@ -20,7 +21,7 @@ from opencis.cxl.transport.common import BasePacket
 class MctpPacketReader(LabeledComponent):
     def __init__(
         self,
-        reader: StreamReader,
+        reader: StreamReaderLike,
         label: Optional[str] = None,
         parent_name: Optional[str] = None,
     ):

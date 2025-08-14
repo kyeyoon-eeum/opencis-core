@@ -129,10 +129,12 @@ class MemoryDeviceIdentity(UnalignedBitStructure):
         return self.total_capacity * SIZE_256MB
 
     def set_total_capacity(self, capacity: int):
-        self.total_capacity = capacity // SIZE_256MB
+        self.total_capacity = (capacity + SIZE_256MB - 1) // SIZE_256MB if capacity > 0 else 0
 
     def set_volatile_only_capacity(self, capacity: int):
-        self.volatile_only_capacity = capacity // SIZE_256MB
+        self.volatile_only_capacity = (
+            (capacity + SIZE_256MB - 1) // SIZE_256MB if capacity > 0 else 0
+        )
 
 
 class MEDIA_STATUS(IntEnum):

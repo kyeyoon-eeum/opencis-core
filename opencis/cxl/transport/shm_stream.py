@@ -38,19 +38,15 @@ class ShmEndpoint:
             self._out_ring.create(s2c, DEFAULT_CAPACITY, DEFAULT_ELEM_SIZE)
             logger.debug(f"[ShmEndpoint] created rings: in={c2s}, out={s2c}")
         else:
-            # Client opens existing rings (may need to wait until server creates)
+            # Client opens existing rings (single try; caller should retry asynchronously if needed)
             logger.debug(f"[ShmEndpoint] opening rings: in={s2c}, out={c2s}")
-            while True:
-                try:
-                    self._in_ring.open(s2c)
-                    self._out_ring.open(c2s)
-                    logger.debug("[ShmEndpoint] opened rings successfully")
-                    break
-                except Exception:
-                    # Rings not ready yet; sleep a bit
-                    import time
-
-                    time.sleep(0.01)
+            try:
+                self._in_ring.open(s2c)
+                self._out_ring.open(c2s)
+                logger.debug("[ShmEndpoint] opened rings successfully")
+            except Exception as e:
+                logger.debug("[ShmEndpoint] rings not ready yet")
+                raise e
 
     def close(self):
         try:
@@ -120,9 +116,10 @@ class ShmStreamWriter:
     def __init__(self, endpoint: ShmEndpoint):
         self._ep = endpoint
         self._debug_writes = 0
+        self._pending: list[bytes] = []
 
     def write(self, data: bytes):
-        # Break into fixed-size frames
+        # Break into fixed-size frames and enqueue for async drain
         offset = 0
         total = len(data)
         while offset < total:
@@ -136,19 +133,21 @@ class ShmStreamWriter:
                     f"[ShmStreamWriter] Invalid frame size: {len(frame)} (expected {DEFAULT_ELEM_SIZE}), chunk={length}"
                 )
                 raise RuntimeError("ShmStreamWriter frame size mismatch")
-            while not self._ep._out_ring.try_push(frame):
-                # very light backoff to avoid tight spins
-                import time
-
-                time.sleep(0.0005)
+            self._pending.append(frame)
             offset += length
-            self._debug_writes += 1
-            if self._debug_writes <= 3:
-                logger.debug(f"[ShmStreamWriter] wrote frame bytes={length}")
 
     async def drain(self):
-        # No-op for now
-        await asyncio.sleep(0)
+        # Non-blocking flush of pending frames
+        while self._pending:
+            frame = self._pending[0]
+            if self._ep._out_ring.try_push(frame):
+                self._pending.pop(0)
+                self._debug_writes += 1
+                if self._debug_writes <= 3:
+                    (length,) = struct.unpack_from("<I", frame, 0)
+                    logger.debug(f"[ShmStreamWriter] wrote frame bytes={length}")
+            else:
+                await asyncio.sleep(0)
 
     def close(self):
         self._ep.close()

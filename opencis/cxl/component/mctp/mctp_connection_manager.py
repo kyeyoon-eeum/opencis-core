@@ -16,8 +16,8 @@ from opencis.cxl.component.mctp.mctp_packet_processor import (
     MCTP_PACKET_PROCESSOR_TYPE,
 )
 from opencis.util.component import RunnableComponent
-from opencis.util.server import ServerComponent
 from opencis.cxl.transport.shm_stream import ShmStreamPair
+from opencis.cxl.transport.stream_types import StreamReaderLike, StreamWriterLike
 
 # pylint: disable=duplicate-code
 
@@ -66,14 +66,14 @@ class MctpConnectionManager(RunnableComponent):
         if self._shm_pair:
             self._shm_pair.close()
 
-    async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    async def _handle_client(self, reader: StreamReaderLike, writer: StreamWriterLike):
         # Unused in shm mode
         pass
 
     async def _start_packet_processor(
         self,
-        reader: asyncio.StreamReader,
-        writer: asyncio.StreamWriter,
+        reader: StreamReaderLike,
+        writer: StreamWriterLike,
     ):
         logger.info(self._create_message("Starting PacketProcessor for Switch Port"))
         packet_processor = MctpPacketProcessor(

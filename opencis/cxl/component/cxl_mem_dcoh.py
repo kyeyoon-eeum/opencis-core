@@ -6,7 +6,8 @@ See LICENSE for details.
 """
 
 from typing import Optional, Tuple, cast
-from asyncio import create_task, gather, sleep, Queue
+from asyncio import create_task, gather, sleep
+from opencis.util.async_queue import AsyncQueue as Queue
 from dataclasses import dataclass, field
 from enum import Enum, auto
 

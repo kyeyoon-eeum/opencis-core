@@ -24,6 +24,7 @@ from opencis.util.component import RunnableComponent
 from opencis.util.pci import create_bdf
 from opencis.cxl.transport.shm_stream import ShmStreamPair
 from opencis.cxl.transport.packet_constants import SYSTEM_PAYLOAD_TYPE
+from opencis.cxl.transport.stream_types import StreamReaderLike, StreamWriterLike
 
 
 class INJECTED_ERRORS(Enum):
@@ -57,13 +58,24 @@ class SwitchConnectionClient(RunnableComponent):
         self._retry = retry
         self._stop_signal = False
 
-    async def _connect(self) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
-        # Connect over shared memory
-        shm_pair = ShmStreamPair(port_index=self._port_index, is_server=False, namespace="switch")
-        reader = shm_pair.reader
-        writer = shm_pair.writer
-        logger.debug(self._create_message("Client Connected (shm)"))
-        return (reader, writer)
+    async def _connect(self) -> Tuple[StreamReaderLike, StreamWriterLike]:
+        # Connect over shared memory with async retry for server readiness
+        retry_deadline = asyncio.get_running_loop().time() + 2.0
+        last_error = None
+        while True:
+            try:
+                shm_pair = ShmStreamPair(
+                    port_index=self._port_index, is_server=False, namespace="switch"
+                )
+                reader = shm_pair.reader
+                writer = shm_pair.writer
+                logger.debug(self._create_message("Client Connected (shm)"))
+                return (reader, writer)
+            except Exception as e:
+                last_error = e
+                if asyncio.get_running_loop().time() >= retry_deadline:
+                    raise e
+                await asyncio.sleep(0.01)
 
     def inject_error(self, injected_error: INJECTED_ERRORS):
         self._injected_error = injected_error

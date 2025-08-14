@@ -56,6 +56,8 @@ class CxlHost(RunnableComponent):
             port=config.irq_port,
             server=True,
             device_id=config.port_index,
+            # Disable ShortMsg IRQ handler in tests when HM is disabled
+            disabled=not config.enable_hm,
         )
         self._cxl_memory_hub_config = CxlMemoryHubConfig(
             host_name=host_name,

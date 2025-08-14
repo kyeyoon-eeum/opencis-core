@@ -314,13 +314,13 @@ async def sample_app(keepalive: bool, **kwargs):
 
     cpu = kwargs["cpu"]
     logger.info("[USER-APP] Starting...")
-    # await cpu.store(0x100000000000, 0x40, 0xDEADBEEF)
-    # val = await cpu.load(0x100000000000, 0x40)
-    # logger.info(f"0x{val:X}")
-    # val = await cpu.load(0x100000000040, 0x40)
-    # logger.info(f"0x{val:X}")
+    await cpu.store(0x100000000000, 0x40, 0xDEADBEEF)
+    val = await cpu.load(0x100000000000, 0x40)
+    logger.info(f"0x{val:X}")
+    val = await cpu.load(0x100000000040, 0x40)
+    logger.info(f"0x{val:X}")
 
-    BYTE_COUNT = 0x80000
+    BYTE_COUNT = 0x10000
     start = time.time()
     for offset in range(0, BYTE_COUNT, 0x40):
         await cpu.store(0x100000000000 + offset, 0x40, 0xDEADBEEF)

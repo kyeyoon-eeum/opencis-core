@@ -38,6 +38,7 @@ class IrqManager(ShortMsgConn):
         port: int = 8500,
         server: bool = False,
         device_id: int = 0,
+        disabled: bool = False,
     ):
         super().__init__(
             f"{device_name}:IrqHandler",
@@ -47,4 +48,5 @@ class IrqManager(ShortMsgConn):
             device_id,
             msg_width=1,
             msg_type=Irq,
+            disabled=disabled,
         )

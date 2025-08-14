@@ -5,7 +5,7 @@ This software is licensed under the terms of the Revised BSD License.
 See LICENSE for details.
 """
 
-from asyncio import Queue
+from opencis.util.async_queue import AsyncQueue as Queue
 from dataclasses import dataclass, field
 from enum import Enum, auto
 

@@ -6,8 +6,6 @@ See LICENSE for details.
 """
 
 from asyncio import (
-    StreamReader,
-    StreamWriter,
     create_task,
     gather,
     Queue,
@@ -33,6 +31,7 @@ from opencis.cxl.transport.packet_constants import (
     CXL_IO_FMT_TYPE,
     SIDEBAND_TYPES,
 )
+from opencis.cxl.transport.stream_types import StreamReaderLike, StreamWriterLike
 
 from opencis.cxl.transport.cci_packets import (
     CciRequestPacket,
@@ -67,8 +66,8 @@ class PROCESSOR_DIRECTION(StrEnum):
 class CxlPacketProcessor(RunnableComponent):
     def __init__(
         self,
-        reader: StreamReader,
-        writer: StreamWriter,
+        reader: StreamReaderLike,
+        writer: StreamWriterLike,
         # cxl_connection for SLD & MLD
         cxl_connection: Union[CxlConnection, List[CxlConnection]],
         component_type: CXL_COMPONENT_TYPE,

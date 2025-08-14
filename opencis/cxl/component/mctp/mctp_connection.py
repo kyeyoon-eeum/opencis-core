@@ -6,7 +6,7 @@ See LICENSE for details.
 """
 
 from dataclasses import dataclass, field
-from asyncio import Queue
+from opencis.util.async_queue import AsyncQueue as Queue
 from opencis.pci.component.pci_connection import PciConnection
 
 

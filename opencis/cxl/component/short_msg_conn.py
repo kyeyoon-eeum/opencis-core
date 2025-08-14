@@ -7,12 +7,9 @@ See LICENSE for details.
 
 from asyncio import (
     Event,
-    StreamReader,
-    StreamWriter,
     Task,
     create_task,
     gather,
-    open_connection,
     Lock,
 )
 from asyncio.exceptions import CancelledError
@@ -21,8 +18,10 @@ from typing import Callable
 
 from opencis.util.component import RunnableComponent
 from opencis.util.logger import logger
-from opencis.util.server import ServerComponent
+
+# from opencis.util.server import ServerComponent
 from opencis.cxl.transport.shm_stream import ShmStreamPair
+from opencis.cxl.transport.stream_types import StreamReaderLike, StreamWriterLike
 
 
 class ShortMsgBase(Enum):
@@ -45,6 +44,7 @@ class ShortMsgConn(RunnableComponent):
         device_id: int = 0,
         msg_width: int = 2,
         msg_type=ShortMsgBase,
+        disabled: bool = False,
     ):
         super().__init__(f"{device_name}:ShortMsgConn")
         self._addr = addr
@@ -55,7 +55,7 @@ class ShortMsgConn(RunnableComponent):
         self._general_interrupt_event = {}
         self._server = server
         self._server_component = None
-        self._connections: dict[int, tuple[StreamReader, StreamWriter]] = {}
+        self._connections: dict[int, tuple[StreamReaderLike, StreamWriterLike]] = {}
         self._tasks: list[Task] = []
         self._msg_handlers: list[Task] = []
         self._lock = Lock()
@@ -66,6 +66,7 @@ class ShortMsgConn(RunnableComponent):
         self._run_status = False
         self._msg_tasks: list[Task] = []
         self._msg_type = msg_type
+        self._disabled = disabled
 
     def get_port(self):
         return self._port
@@ -113,7 +114,7 @@ class ShortMsgConn(RunnableComponent):
         )
         self._general_interrupt_event[short_msg] = (cb_func, persistent)
 
-    async def _msg_handler(self, reader: StreamReader, _: StreamWriter):
+    async def _msg_handler(self, reader: StreamReaderLike, _: StreamWriterLike):
         this_dev_name = f"Device {self._device_id}"
         if self._server:
             this_dev_name = "Host"
@@ -160,10 +161,8 @@ class ShortMsgConn(RunnableComponent):
                 )
             )
 
-    async def _new_conn(self, reader: StreamReader, writer: StreamWriter):
-        logger.debug(
-            self._create_message(f"New ShortMsg connection: {writer.get_extra_info('peername')}")
-        )
+    async def _new_conn(self, reader: StreamReaderLike, writer: StreamWriterLike):
+        logger.debug(self._create_message("New ShortMsg connection established"))
         remote_dev_id = await reader.readexactly(16)
         remote_dev_id_int = int.from_bytes(remote_dev_id, "little")
         self._connections[remote_dev_id_int] = (reader, writer)
@@ -173,6 +172,8 @@ class ShortMsgConn(RunnableComponent):
         """
         Sends an ShortMsg request as the client.
         """
+        if self._disabled:
+            return
         info = f"host sending to device {device}"
         if not self._server:
             info = f"device {self._device_id} sending to host"
@@ -202,6 +203,10 @@ class ShortMsgConn(RunnableComponent):
 
     async def _run(self):
         try:
+            if self._disabled:
+                await self._change_status_to_running()
+                await self._end_signal.wait()
+                return
             if self._server:
                 logger.info(self._create_message("ShortMsg server starting SHM listener"))
                 shm = ShmStreamPair(port_index=self._port, is_server=True, namespace="shortmsg")
@@ -238,10 +243,3 @@ class ShortMsgConn(RunnableComponent):
         logger.debug(self._create_message("ShortMsg Manager Stopping"))
         for task in self._msg_tasks:
             task.cancel()
-        self._end_signal.set()
-        for task in self._tasks:
-            task.cancel()
-        logger.debug(self._create_message("ShortMsg tasks cancelled"))
-        for handler in self._msg_handlers:
-            handler.cancel()
-        logger.debug(self._create_message("ShortMsg handlers cancelled"))

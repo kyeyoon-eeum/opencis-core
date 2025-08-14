@@ -5,7 +5,7 @@ This software is licensed under the terms of the Revised BSD License.
 See LICENSE for details.
 """
 
-from asyncio import StreamReader, StreamWriter, create_task, gather
+from asyncio import create_task, gather
 from enum import Enum, auto
 from typing import Optional
 
@@ -13,6 +13,7 @@ from opencis.util.logger import logger
 from opencis.cxl.component.mctp.mctp_connection import MctpConnection
 from opencis.cxl.component.mctp.mctp_packet_reader import MctpPacketReader
 from opencis.util.component import RunnableComponent
+from opencis.cxl.transport.stream_types import StreamReaderLike, StreamWriterLike
 
 
 class MCTP_PACKET_PROCESSOR_TYPE(Enum):
@@ -23,8 +24,8 @@ class MCTP_PACKET_PROCESSOR_TYPE(Enum):
 class MctpPacketProcessor(RunnableComponent):
     def __init__(
         self,
-        reader: StreamReader,
-        writer: StreamWriter,
+        reader: StreamReaderLike,
+        writer: StreamWriterLike,
         mctp_connection: MctpConnection,
         processor_type: MCTP_PACKET_PROCESSOR_TYPE,
         label: Optional[str] = None,

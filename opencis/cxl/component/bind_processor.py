@@ -5,7 +5,8 @@ This software is licensed under the terms of the Revised BSD License.
 See LICENSE for details.
 """
 
-from asyncio import Queue, create_task, gather
+from opencis.util.async_queue import AsyncQueue as Queue
+from asyncio import create_task, gather
 from dataclasses import dataclass
 
 from opencis.cxl.component.cxl_connection import CxlConnection

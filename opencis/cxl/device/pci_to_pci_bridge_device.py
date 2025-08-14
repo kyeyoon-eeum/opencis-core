@@ -7,7 +7,8 @@ See LICENSE for details.
 
 from dataclasses import dataclass
 from typing import cast
-from asyncio import Queue, create_task, gather
+from opencis.util.async_queue import AsyncQueue as Queue
+from asyncio import create_task, gather
 
 from opencis.util.logger import logger
 from opencis.util.component import RunnableComponent
