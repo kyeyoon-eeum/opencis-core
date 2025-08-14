@@ -81,7 +81,6 @@ class CxlPacketProcessor(RunnableComponent):
         self._component_type = component_type
         self._fmld = None
         self._cci_connection_for_fmld = None
-        self._writer_lock = Lock()
 
         logger.debug(self._create_message(f"Configured for {component_type.name}"))
         if component_type in (CXL_COMPONENT_TYPE.R, CXL_COMPONENT_TYPE.DSP):
@@ -398,9 +397,8 @@ class CxlPacketProcessor(RunnableComponent):
                     )
                 )
                 self._push_tlp_table_entry(cxl_io_packet)
-            async with self._writer_lock:
-                self._writer.write(bytes(packet))
-                await self._writer.drain()
+            self._writer.write(bytes(packet))
+            await self._writer.drain()
         logger.debug(self._create_message("Stopped outgoing CFG FIFO processor"))
 
     async def _process_outgoing_mmio_packets(self):
@@ -421,9 +419,8 @@ class CxlPacketProcessor(RunnableComponent):
                 )
                 if cxl_io_packet.is_mem_write() is False:
                     self._push_tlp_table_entry(cxl_io_packet)
-            async with self._writer_lock:
-                self._writer.write(bytes(packet))
-                await self._writer.drain()
+            self._writer.write(bytes(packet))
+            await self._writer.drain()
         logger.debug(self._create_message("Stopped outgoing MMIO FIFO processor"))
 
     async def _process_outgoing_cxl_mem_packets(self):
@@ -432,9 +429,8 @@ class CxlPacketProcessor(RunnableComponent):
             packet = await self._outgoing.cxl_mem.get()
             if self._is_disconnection_notification(packet):
                 break
-            async with self._writer_lock:
-                self._writer.write(bytes(packet))
-                await self._writer.drain()
+            self._writer.write(bytes(packet))
+            await self._writer.drain()
         logger.debug(self._create_message("Stopped outgoing CXL.mem FIFO processor"))
 
     async def _process_outgoing_cxl_cache_packets(self):
@@ -443,9 +439,8 @@ class CxlPacketProcessor(RunnableComponent):
             packet = await self._outgoing.cxl_cache.get()
             if self._is_disconnection_notification(packet):
                 break
-            async with self._writer_lock:
-                self._writer.write(bytes(packet))
-                await self._writer.drain()
+            self._writer.write(bytes(packet))
+            await self._writer.drain()
         logger.debug(self._create_message("Stopped outgoing CXL.cache FIFO processor"))
 
     async def _process_outgoing_cci_packets(self):
@@ -460,28 +455,24 @@ class CxlPacketProcessor(RunnableComponent):
                 logger.info(self._create_message(f"Received CCI packet with opcode {opcode:x}"))
                 if opcode == CCI_FM_API_COMMAND_OPCODE.GET_LD_INFO:
                     packet = cast(GetLdInfoResponsePacket, packet)
-                    async with self._writer_lock:
-                        self._writer.write(bytes(packet))
-                        await self._writer.drain()
+                    self._writer.write(bytes(packet))
+                    await self._writer.drain()
                 elif opcode == CCI_FM_API_COMMAND_OPCODE.GET_LD_ALLOCATIONS:
                     packet = cast(GetLdAllocationsResponsePacket, packet)
-                    async with self._writer_lock:
-                        self._writer.write(bytes(packet))
-                        await self._writer.drain()
+                    self._writer.write(bytes(packet))
+                    await self._writer.drain()
                 elif opcode == CCI_FM_API_COMMAND_OPCODE.SET_LD_ALLOCATIONS:
                     packet = cast(SetLdAllocationsResponsePacket, packet)
-                    async with self._writer_lock:
-                        self._writer.write(bytes(packet))
-                        await self._writer.drain()
+                    self._writer.write(bytes(packet))
+                    await self._writer.drain()
                 else:
                     logger.warning(self._create_message("Unsupported CCI packet"))
             elif self._component_type == CXL_COMPONENT_TYPE.DSP:
                 packet = await self._outgoing.cci_fifo.get()
                 if self._is_disconnection_notification(packet):
                     break
-                async with self._writer_lock:
-                    self._writer.write(bytes(packet))
-                    await self._writer.drain()
+                self._writer.write(bytes(packet))
+                await self._writer.drain()
             else:
                 break
         logger.debug(self._create_message("Stopped outgoing CCI FIFO processor"))
