@@ -239,7 +239,8 @@ cdef class ShmRing:
                 return None
             ts.tv_sec = 0
             ts.tv_nsec = step
-            nanosleep(&ts, <timespec*>0)
+            with nogil:
+                nanosleep(&ts, <timespec*>0)
             slept_ns += step
             if step < 1000000:
                 step <<= 1

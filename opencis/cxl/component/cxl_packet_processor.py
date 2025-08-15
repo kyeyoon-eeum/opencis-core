@@ -11,6 +11,7 @@ from asyncio import (
     Queue,
     Lock,
 )
+import asyncio
 from dataclasses import dataclass
 from enum import StrEnum, IntEnum
 from typing import cast, Optional, Dict, Union, List
@@ -20,7 +21,6 @@ from opencis.cxl.cci.common import CCI_FM_API_COMMAND_OPCODE
 from opencis.util.component import RunnableComponent
 from opencis.cxl.component.common import CXL_COMPONENT_TYPE
 from opencis.cxl.component.cxl_connection import CxlConnection
-from opencis.cxl.component.packet_reader import PacketReader
 from opencis.cxl.transport.common import BasePacket
 from opencis.cxl.transport.sideband_packets import BaseSidebandPacket
 from opencis.cxl.transport.cxl_io_packets import CxlIoBasePacket
@@ -32,7 +32,6 @@ from opencis.cxl.transport.packet_constants import (
     SIDEBAND_TYPES,
 )
 from opencis.cxl.transport.stream_types import StreamReaderLike, StreamWriterLike
-
 from opencis.cxl.transport.cci_packets import (
     CciRequestPacket,
     CciResponsePacket,
@@ -42,6 +41,12 @@ from opencis.cxl.transport.cci_packets import (
 )
 from opencis.cxl.device.cxl_type3_device import CXL_T3_DEV_TYPE
 from opencis.cxl.component.fmld import FMLD
+from opencis.cxl.transport.shm_stream import ShmStreamReader
+
+try:
+    from opencis.cxl.transport import packet_reader_c as _prc
+except Exception as e:  # pragma: no cover
+    raise
 
 
 @dataclass
@@ -74,7 +79,14 @@ class CxlPacketProcessor(RunnableComponent):
         label: Optional[str] = None,
     ):
         super().__init__(label)
-        self._reader = PacketReader(reader, label=label)
+        if not isinstance(reader, ShmStreamReader):
+            raise TypeError("CxlPacketProcessor requires ShmStreamReader")
+        # Construct Cython ShmPacketReader directly
+        ep = getattr(reader, "_ep", None)
+        if ep is None or getattr(ep, "_in_ring", None) is None:
+            raise TypeError("ShmStreamReader is missing underlying ring")
+        ring = ep._in_ring
+        self._reader = _prc.ShmPacketReader(ring)
         self._writer = writer
         self._tlp_table: Dict[int, CXL_IO_FIFO_TYPE] = {}
         self._cxl_connection = cxl_connection
@@ -226,7 +238,7 @@ class CxlPacketProcessor(RunnableComponent):
         logger.debug(self._create_message(f"Starting {self._incoming_dir} packet processor"))
         while True:  # pylint: disable=too-many-nested-blocks
             try:
-                packet = await self._reader.get_packet()
+                packet = await asyncio.to_thread(self._reader.get_packet)
                 # Gracefully handle sideband frames that may appear on the stream (e.g., transport handshakes)
                 base_packet = cast(BasePacket, packet)
                 if base_packet.system_header.payload_type == SYSTEM_PAYLOAD_TYPE.SIDEBAND:

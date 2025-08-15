@@ -17,14 +17,18 @@ from opencis.cxl.transport.sideband_packets import (
 )
 from opencis.cxl.transport.cxl_io_packets import CxlIoCfgRdPacket
 from opencis.cxl.component.common import CXL_COMPONENT_TYPE
-from opencis.cxl.component.packet_reader import PacketReader
 from opencis.cxl.component.cxl_connection import CxlConnection
 from opencis.cxl.component.cxl_packet_processor import CxlPacketProcessor
 from opencis.util.component import RunnableComponent
 from opencis.util.pci import create_bdf
-from opencis.cxl.transport.shm_stream import ShmStreamPair
+from opencis.cxl.transport.shm_stream import ShmStreamPair, ShmStreamReader
 from opencis.cxl.transport.packet_constants import SYSTEM_PAYLOAD_TYPE
 from opencis.cxl.transport.stream_types import StreamReaderLike, StreamWriterLike
+
+try:
+    from opencis.cxl.transport import packet_reader_c as _prc
+except Exception as e:  # pragma: no cover
+    raise
 
 
 class INJECTED_ERRORS(Enum):
@@ -58,7 +62,7 @@ class SwitchConnectionClient(RunnableComponent):
         self._retry = retry
         self._stop_signal = False
 
-    async def _connect(self) -> Tuple[StreamReaderLike, StreamWriterLike]:
+    async def _connect(self) -> Tuple[ShmStreamReader, StreamWriterLike]:
         # Connect over shared memory with async retry for server readiness
         retry_deadline = asyncio.get_running_loop().time() + 2.0
         last_error = None
@@ -90,65 +94,22 @@ class SwitchConnectionClient(RunnableComponent):
         self._port = port
 
     async def _run(self):
-        if self._retry:
-            time_out = 120
-            loop = asyncio.get_running_loop()
-            end_time = loop.time() + time_out
-            print_time = loop.time() + 5
-            elapsed = 0
-            while True:
-                if self._stop_signal:
-                    break
-                try:
-                    (reader, writer) = await self._connect()
-                    logger.info(self._create_message("Client connected over shm"))
-                    # Send sideband connection request and wait for accept
-                    logger.info(self._create_message("Sending CONNECTION_REQUEST"))
-                    sb_req = SidebandConnectionRequestPacket.create(self._port_index)
-                    writer.write(bytes(sb_req))
-                    await writer.drain()
-                    logger.info(self._create_message("Sent CONNECTION_REQUEST; waiting for ACCEPT"))
-                    pr = PacketReader(reader, "SwitchConnectionClient")
-                    packet = await pr.get_packet()
-                    if packet.system_header.payload_type != SYSTEM_PAYLOAD_TYPE.SIDEBAND:
-                        raise Exception(self._create_message("Handshake Error: non-sideband"))
-                    base_sideband_packet = cast(BaseSidebandPacket, packet)
-                    if (
-                        base_sideband_packet.sideband_header.type
-                        != SIDEBAND_TYPES.CONNECTION_ACCEPT
-                    ):
-                        raise Exception(self._create_message("Handshake Error: not accepted"))
-                    logger.info(self._create_message("Handshake accepted by server"))
-                    break
-                except Exception as e:
-                    logger.warning(self._create_message(f"Connect/Handshake failed: {e}"))
-                    if loop.time() >= end_time:
-                        raise Exception(
-                            self._create_message("Timed out waiting for CXL-Switch")
-                        ) from e
-                    if loop.time() >= print_time:
-                        elapsed += 5
-                        logger.info(
-                            self._create_message(f"Awaiting CXL-Switch Ready... {elapsed}s")
-                        )
-                        print_time = loop.time() + 5
-                    await asyncio.sleep(1)
-        else:
-            (reader, writer) = await self._connect()
-            # Send sideband connection request and wait for accept
-            logger.info(self._create_message("Sending CONNECTION_REQUEST"))
-            sb_req = SidebandConnectionRequestPacket.create(self._port_index)
-            writer.write(bytes(sb_req))
-            await writer.drain()
-            logger.info(self._create_message("Sent CONNECTION_REQUEST; waiting for ACCEPT"))
-            pr = PacketReader(reader, "SwitchConnectionClient")
-            packet = await pr.get_packet()
-            if packet.system_header.payload_type != SYSTEM_PAYLOAD_TYPE.SIDEBAND:
-                raise Exception(self._create_message("Handshake Error: non-sideband"))
-            base_sideband_packet = cast(BaseSidebandPacket, packet)
-            if base_sideband_packet.sideband_header.type != SIDEBAND_TYPES.CONNECTION_ACCEPT:
-                raise Exception(self._create_message("Handshake Error: not accepted"))
-            logger.info(self._create_message("Handshake accepted by server"))
+        (reader, writer) = await self._connect()
+        logger.info(self._create_message("Client connected over shm"))
+        # Send sideband connection request and wait for accept
+        logger.info(self._create_message("Sending CONNECTION_REQUEST"))
+        sb_req = SidebandConnectionRequestPacket.create(self._port_index)
+        writer.write(bytes(sb_req))
+        await writer.drain()
+        logger.info(self._create_message("Sent CONNECTION_REQUEST; waiting for ACCEPT"))
+        pr = _prc.ShmPacketReader(getattr(reader, "_ep")._in_ring)
+        packet = await asyncio.to_thread(pr.get_packet)
+        if packet.system_header.payload_type != SYSTEM_PAYLOAD_TYPE.SIDEBAND:
+            raise Exception(self._create_message("Handshake Error: non-sideband"))
+        base_sideband_packet = cast(BaseSidebandPacket, packet)
+        if base_sideband_packet.sideband_header.type != SIDEBAND_TYPES.CONNECTION_ACCEPT:
+            raise Exception(self._create_message("Handshake Error: not accepted"))
+        logger.info(self._create_message("Handshake accepted by server"))
 
         logger.info(self._create_message("Connected to switch using shm"))
 

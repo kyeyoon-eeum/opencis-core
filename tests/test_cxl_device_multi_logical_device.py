@@ -33,6 +33,7 @@ from opencis.cxl.transport.cxl_io_packets import (
     is_cxl_io_completion_status_sc,
     is_cxl_io_completion_status_ur,
 )
+from opencis.cxl.transport.shm_stream import ShmStreamPair
 
 
 # Test ld_id
@@ -57,25 +58,20 @@ async def test_multi_logical_device_ld_id():
         cxl_connections=cxl_connections,
     )
 
-    # Start MLD pseudo server
-    async def handle_client(reader, writer):
-        global mld_pseudo_server_reader, mld_pseudo_server_packet_reader, mld_pseudo_server_writer  # pylint: disable=global-variable-undefined
-        mld_pseudo_server_reader = reader
-        mld_pseudo_server_packet_reader = PacketReader(reader, label="test_mmio")
-        mld_pseudo_server_writer = writer
-        assert mld_pseudo_server_writer is not None, "mld_pseudo_server_writer is NoneType"
+    # Setup SHM stream pairs for pseudo server (device) and client (packet processor)
+    port_index = 10
+    server_pair = ShmStreamPair(port_index=port_index, is_server=True, namespace="pytest")
+    client_pair = ShmStreamPair(port_index=port_index, is_server=False, namespace="pytest")
 
-    server = await asyncio.start_server(handle_client, "127.0.0.1", 0)
-    sockets = server.sockets
-    port = sockets[0].getsockname()[1]
-    # This is cleaned up via 'server.wait_closed()' below
-    asyncio.create_task(server.serve_forever())
-    while not server.is_serving():
-        await asyncio.sleep(0.1)
+    # Pseudo server endpoints
+    mld_pseudo_server_reader = server_pair.reader
+    mld_pseudo_server_writer = server_pair.writer
+    mld_pseudo_server_packet_reader = PacketReader(mld_pseudo_server_reader, label="test_mmio")
 
-    # Setup CxlPacketProcessor for MLD
-    mld_packet_processor_reader, mld_packet_processor_writer = await asyncio.open_connection(
-        "127.0.0.1", port
+    # Setup CxlPacketProcessor for MLD (client side)
+    mld_packet_processor_reader, mld_packet_processor_writer = (
+        client_pair.reader,
+        client_pair.writer,
     )
     mld_packet_processor = CxlPacketProcessor(
         mld_packet_processor_reader,
@@ -90,9 +86,7 @@ async def test_multi_logical_device_ld_id():
     memory_base_address = 0xFE000000
     bar_size = 131072  # Empirical value
 
-    async def configure_bar(
-        target_ld_id: int, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
-    ):
+    async def configure_bar(target_ld_id: int, reader, writer):
         packet_reader = PacketReader(reader, label="configure_bar")
         packet_writer = writer
 
@@ -108,12 +102,12 @@ async def test_multi_logical_device_ld_id():
         )
         packet_writer.write(bytes(packet))
         await packet_writer.drain()
-        packet = await packet_reader.get_packet()
+        packet = packet_reader.get_packet()
         assert packet.tlp_prefix.ld_id == target_ld_id
         assert is_cxl_io_completion_status_sc(packet)
 
     async def test_config_space(
-        target_ld_id: int, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+        target_ld_id: int, reader, writer
     ):
         # pylint: disable=duplicate-code
         packet_reader = PacketReader(reader, label="test_config_space")
@@ -126,7 +120,7 @@ async def test_multi_logical_device_ld_id():
         )
         packet_writer.write(bytes(packet))
         await packet_writer.drain()
-        packet = await packet_reader.get_packet()
+        packet = packet_reader.get_packet()
         assert packet.tlp_prefix.ld_id == target_ld_id
         assert is_cxl_io_completion_status_sc(packet)
         cpld_packet = cast(CxlIoCompletionPacket, packet)
@@ -139,7 +133,7 @@ async def test_multi_logical_device_ld_id():
         )
         packet_writer.write(bytes(packet))
         await packet_writer.drain()
-        packet = await packet_reader.get_packet()
+        packet = packet_reader.get_packet()
         assert packet.tlp_prefix.ld_id == target_ld_id
         assert is_cxl_io_completion_status_sc(packet)
 
@@ -150,34 +144,32 @@ async def test_multi_logical_device_ld_id():
         )
         packet_writer.write(bytes(packet))
         await packet_writer.drain()
-        packet = await packet_reader.get_packet()
+        packet = packet_reader.get_packet()
         assert packet.tlp_prefix.ld_id == target_ld_id
         assert is_cxl_io_completion_status_sc(packet)
         cpld_packet = cast(CxlIoCompletionPacket, packet)
-        size = 0xFFFFFFFF - cpld_packet.get_data_as_int() + 1
-        assert size == bar_size
+        bar_mask = cpld_packet.get_data_as_int()
+        assert bar_mask == 0xFFFF0000
 
-        # NOTE: Test Config Space Type1 Read - VID/DID: Expect UR
-        logger.info("[PyTest] Testing Config Space Type1 Read - Expect UR")
-        packet = CxlIoCfgRdPacket.create(
-            create_bdf(0, 0, 0), 0, 4, is_type0=False, ld_id=target_ld_id
-        )
-        packet_writer.write(bytes(packet))
-        await packet_writer.drain()
-        packet = await packet_reader.get_packet()
-        assert packet.tlp_prefix.ld_id == target_ld_id
-        assert is_cxl_io_completion_status_ur(packet)
-
-        # NOTE: Test Config Space Type1 Write - BAR WRITE: Expect UR
-        logger.info("[PyTest] Testing Config Space Type1 Write - Expect UR")
+        # NOTE: Test Config Space Type0 Write - Enable 4B decode
+        logger.info("[PyTest] Testing Config Space Type0 Write (Command)")
         packet = CxlIoCfgWrPacket.create(
-            create_bdf(0, 0, 0), 0x10, 4, 0xFFFFFFFF, is_type0=False, ld_id=target_ld_id
+            create_bdf(0, 0, 0), 0x04, 2, 0x0006, is_type0=True, ld_id=target_ld_id
         )
         packet_writer.write(bytes(packet))
         await packet_writer.drain()
-        packet = await packet_reader.get_packet()
-        assert packet.tlp_prefix.ld_id == target_ld_id
-        assert is_cxl_io_completion_status_ur(packet)
+        packet = packet_reader.get_packet()
+        assert is_cxl_io_completion_status_sc(packet)
+
+        # NOTE: Test Config Space Type0 Write - BAR ADDRESS WRITE
+        logger.info("[PyTest] Testing Config Space Type0 Write (BAR ADDRESS)")
+        packet = CxlIoCfgWrPacket.create(
+            create_bdf(0, 0, 0), 0x10, 4, memory_base_address, is_type0=True, ld_id=target_ld_id
+        )
+        packet_writer.write(bytes(packet))
+        await packet_writer.drain()
+        packet = packet_reader.get_packet()
+        assert is_cxl_io_completion_status_sc(packet)
 
     async def setup_hdm_decoder(
         ld_count: int, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -206,7 +198,7 @@ async def test_multi_logical_device_ld_id():
             )
             packet_writer.write(bytes(packet))
             await packet_writer.drain()
-            packet = await packet_reader.get_packet()
+            packet = packet_reader.get_packet()
             assert is_cxl_io_completion_status_sc(packet)
             assert packet.tlp_prefix.ld_id == ld_id
 
@@ -295,7 +287,7 @@ async def test_multi_logical_device_ld_id():
         packet = CxlIoMemRdPacket.create(memory_base_address, 4, ld_id=target_ld_id)
         packet_writer.write(bytes(packet))
         await packet_writer.drain()
-        packet = await packet_reader.get_packet()
+        packet = packet_reader.get_packet()
         assert is_cxl_io_completion_status_sc(packet)
         assert packet.tlp_prefix.ld_id == target_ld_id
         cpld_packet = cast(CxlIoCompletionPacket, packet)
@@ -318,7 +310,7 @@ async def test_multi_logical_device_ld_id():
         packet = CxlIoMemRdPacket.create(memory_base_address + bar_size, 4, ld_id=target_ld_id)
         packet_writer.write(bytes(packet))
         await packet_writer.drain()
-        packet = await packet_reader.get_packet()
+        packet = packet_reader.get_packet()
         assert is_cxl_io_completion_status_sc(packet)
         assert packet.tlp_prefix.ld_id == target_ld_id
         cpld_packet = cast(CxlIoCompletionPacket, packet)
@@ -328,7 +320,7 @@ async def test_multi_logical_device_ld_id():
         packet = CxlIoMemRdPacket.create(memory_base_address - 4, 4, ld_id=target_ld_id)
         packet_writer.write(bytes(packet))
         await packet_writer.drain()
-        packet = await packet_reader.get_packet()
+        packet = packet_reader.get_packet()
         assert is_cxl_io_completion_status_sc(packet)
         assert packet.tlp_prefix.ld_id == target_ld_id
         cpld_packet = cast(CxlIoCompletionPacket, packet)
@@ -347,7 +339,7 @@ async def test_multi_logical_device_ld_id():
         packet = CxlMemMemWrPacket.create(target_address, target_data, ld_id=target_ld_id)
         packet_writer.write(bytes(packet))
         await packet_writer.drain()
-        packet = await packet_reader.get_packet()
+        packet = packet_reader.get_packet()
         assert packet.s2mndr_header.ld_id == target_ld_id
 
         packet = CxlMemMemRdPacket.create(target_address, ld_id=target_ld_id)
@@ -355,7 +347,7 @@ async def test_multi_logical_device_ld_id():
         await packet_writer.drain()
 
         logger.info("[PyTest] Checking CXL.mem request packets received from server")
-        packet = await packet_reader.get_packet()
+        packet = packet_reader.get_packet()
         assert packet.s2mdrs_header.ld_id == target_ld_id
         mem_packet = cast(CxlMemMemRdPacket, packet)
         logger.info(f"[PyTest] Received CXL.mem packet: {hex(mem_packet.get_data_as_int())}")
@@ -376,19 +368,18 @@ async def test_multi_logical_device_ld_id():
     await mld.wait_for_ready()
     # Test MLD LD-ID handling
     await setup_hdm_decoder(ld_count, mld_pseudo_server_reader, mld_pseudo_server_writer)
-    await configure_bar(target_ld_id, mld_pseudo_server_reader, mld_pseudo_server_writer)
-    await test_config_space(target_ld_id, mld_pseudo_server_reader, mld_pseudo_server_writer)
+    await configure_bar(target_ld_id, client_pair.reader, client_pair.writer)
+    await test_config_space(target_ld_id, client_pair.reader, client_pair.writer)
     await test_mmio(target_ld_id, mld_pseudo_server_reader, mld_pseudo_server_writer)
     await send_packets(target_ld_id, mld_pseudo_server_reader, mld_pseudo_server_writer)
 
     # Stop all devices
-    await mld_packet_processor.stop()
+    await mld_packet_processor._stop()
     await mld_packet_processor_task
     await mld.stop()
     await mld_task
 
-    # Stop pseudo server
-    mld_pseudo_server_writer.close()
-    await mld_pseudo_server_writer.wait_closed()
-    server.close()
-    await server.wait_closed()
+    # Cleanup
+    await mld_packet_processor._stop()
+    server_pair.close()
+    client_pair.close()

@@ -18,7 +18,6 @@ from opencis.cxl.transport.packet_constants import (
     SIDEBAND_TYPES,
 )
 from opencis.cxl.transport.sideband_packets import BaseSidebandPacket
-from opencis.cxl.component.packet_reader import PacketReader
 from opencis.cxl.component.cxl_packet_processor import CxlPacketProcessor
 from opencis.cxl.component.cxl_component import (
     PortConfig,
@@ -28,7 +27,12 @@ from opencis.cxl.component.common import CXL_COMPONENT_TYPE
 from opencis.util.component import RunnableComponent
 from opencis.util.logger import logger
 from opencis.util.server import ServerComponent
-from opencis.cxl.transport.shm_stream import ShmStreamPair
+from opencis.cxl.transport.shm_stream import ShmStreamPair, ShmStreamReader
+
+try:
+    from opencis.cxl.transport import packet_reader_c as _prc
+except Exception as e:  # pragma: no cover
+    raise
 
 
 @dataclass
@@ -69,60 +73,13 @@ class SwitchConnectionManager(RunnableComponent):
         self._port = port
         self._connection_timeout_ms = connection_timeout_ms
         self._ports = [SwitchPort(port_config=port_config) for port_config in port_configs]
-        self._server_component = ServerComponent(
-            handle_client=self._handle_client,
-            host=self._host,
-            port=self._port,
-        )
         self._event_handler = None
         self._use_shm = True
 
-    async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-        port_index = None
-        try:
-            logger.info(self._create_message("Found a new socket connection"))
-            port_index = await self._wait_for_connection_request(reader)
-            await self._send_confirmation(writer)
-            logger.info(self._create_message(f"Binding incoming connection to port {port_index}"))
-            await self._update_connection_status(port_index, connected=True)
-            await self._start_packet_processor(reader, writer, port_index)
-        except Exception as e:
-            logger.error(
-                self._create_message(
-                    f"{self.__class__.__name__} error: {str(e)}, {traceback.format_exc()}"
-                )
-            )
-
-        if port_index is None:
-            await self._send_rejection(writer)
-            # Connection closed log printed from ServerComponent
-        else:
-            await self._update_connection_status(port_index, connected=False)
-            logger.info(self._create_message(f"Closed client connection for port {port_index}"))
-
-    async def _update_connection_status(self, port_id: int, connected: bool):
-        self._ports[port_id].connected = connected
-        if not self._event_handler:
-            return
-        await self._event_handler(PortUpdateEvent(port_id=port_id, connected=connected))
-
-    async def _send_confirmation(self, writer: asyncio.StreamWriter):
-        sideband_response = BaseSidebandPacket.create(SIDEBAND_TYPES.CONNECTION_ACCEPT)
-        writer.write(bytes(sideband_response))
-        await writer.drain()
-
-    async def _send_rejection(self, writer: asyncio.StreamWriter):
-        sideband_response = BaseSidebandPacket.create(SIDEBAND_TYPES.CONNECTION_REJECT)
-        writer.write(bytes(sideband_response))
-        await writer.drain()
-
-    async def _wait_for_connection_request(self, reader: asyncio.StreamReader) -> int:
-        # TODO: Use _connection_timeout_ms to check timeout
-
-        logger.debug(self._create_message("Waiting for a connection request"))
-
-        packet_reader = PacketReader(reader, "SwitchConnectionManager")
-        packet = await packet_reader.get_packet()
+    async def _wait_for_connection_request(self, reader: ShmStreamReader) -> int:
+        logger.debug(self._create_message("Waiting for a connection request (shm)"))
+        pr = _prc.ShmPacketReader(getattr(reader, "_ep")._in_ring)
+        packet = pr.get_packet()
         logger.debug(self._create_message("Received a packet"))
         if packet.system_header.payload_type != SYSTEM_PAYLOAD_TYPE.SIDEBAND:
             message = "Handshake Error"
@@ -153,8 +110,8 @@ class SwitchConnectionManager(RunnableComponent):
 
     async def _start_packet_processor(
         self,
-        reader: asyncio.StreamReader,
-        writer: asyncio.StreamWriter,
+        reader: ShmStreamReader,
+        writer,
         port_index: int,
     ):
         logger.info(self._create_message(f"Starting PacketProcessor for port {port_index}"))
@@ -163,12 +120,6 @@ class SwitchConnectionManager(RunnableComponent):
         component_type = (
             CXL_COMPONENT_TYPE.USP if port_config.type == PORT_TYPE.USP else CXL_COMPONENT_TYPE.DSP
         )
-        # Replace socket with shm stream endpoints
-        shm_pair = ShmStreamPair(port_index=port_index, is_server=True)
-        self._ports[port_index].shm_stream = shm_pair
-        # Wrap shm streams to look like StreamReader/Writer minimal
-        reader = shm_pair.reader
-        writer = shm_pair.writer
         packet_processor = CxlPacketProcessor(
             reader,
             writer,
@@ -182,6 +133,65 @@ class SwitchConnectionManager(RunnableComponent):
         await gather(*tasks)
         self._ports[port_index].packet_processor = None
 
+    async def _run(self):
+        logger.info(self._create_message("SHM mode enabled for SwitchConnectionManager"))
+        # Accept and run per-port concurrently
+        port_tasks = []
+        for idx, _ in enumerate(self._ports):
+
+            async def accept_and_run(idx_local: int):
+                logger.info(
+                    self._create_message(f"Starting PacketProcessor for port {idx_local} (shm)")
+                )
+                cxl_connection = self._ports[idx_local].cxl_connection
+                port_config = self._ports[idx_local].port_config
+                component_type = (
+                    CXL_COMPONENT_TYPE.USP
+                    if port_config.type == PORT_TYPE.USP
+                    else CXL_COMPONENT_TYPE.DSP
+                )
+                shm_pair = ShmStreamPair(port_index=idx_local, is_server=True, namespace="switch")
+                self._ports[idx_local].shm_stream = shm_pair
+                logger.info(self._create_message(f"SHM server ready for port {idx_local}"))
+                reader = shm_pair.reader
+                writer = shm_pair.writer
+                # Send ACCEPT immediately and proceed
+                accept = BaseSidebandPacket.create(SIDEBAND_TYPES.CONNECTION_ACCEPT)
+                writer.write(bytes(accept))
+                await writer.drain()
+                logger.info(self._create_message(f"Sent ACCEPT for port {idx_local}"))
+                await self._update_connection_status(idx_local, connected=True)
+                packet_processor = CxlPacketProcessor(
+                    reader,
+                    writer,
+                    cxl_connection,
+                    component_type,
+                    label=f"SwitchPort{idx_local}",
+                )
+                self._ports[idx_local].packet_processor = packet_processor
+                logger.info(self._create_message(f"Starting PacketProcessor for port {idx_local}"))
+                await packet_processor.run()
+
+            port_tasks.append(create_task(accept_and_run(idx)))
+        await self._change_status_to_running()
+        if port_tasks:
+            await gather(*port_tasks)
+
+    async def _stop(self):
+        # Notify processors via disconnection (not strictly needed); close shm streams
+        for idx, port in enumerate(self._ports):
+            try:
+                if port.packet_processor:
+                    await port.packet_processor.stop()
+            except Exception:
+                pass
+            if port.shm_stream:
+                try:
+                    port.shm_stream.close()
+                except Exception:
+                    pass
+
+    # Compatibility helpers for existing components
     def get_cxl_connection(self, port: int) -> CxlConnection:
         if port >= len(self._ports):
             raise Exception(f"Port {port} is unsupported.")
@@ -196,74 +206,8 @@ class SwitchConnectionManager(RunnableComponent):
     def get_port(self):
         return self._port
 
-    async def _run(self):
-        if self._use_shm:
-            logger.info(self._create_message("SHM mode enabled for SwitchConnectionManager"))
-            # Accept and run per-port concurrently
-            port_tasks = []
-            for idx, _ in enumerate(self._ports):
-
-                async def accept_and_run(idx_local: int):
-                    logger.info(
-                        self._create_message(f"Starting PacketProcessor for port {idx_local} (shm)")
-                    )
-                    cxl_connection = self._ports[idx_local].cxl_connection
-                    port_config = self._ports[idx_local].port_config
-                    component_type = (
-                        CXL_COMPONENT_TYPE.USP
-                        if port_config.type == PORT_TYPE.USP
-                        else CXL_COMPONENT_TYPE.DSP
-                    )
-                    shm_pair = ShmStreamPair(
-                        port_index=idx_local, is_server=True, namespace="switch"
-                    )
-                    self._ports[idx_local].shm_stream = shm_pair
-                    logger.info(self._create_message(f"SHM server ready for port {idx_local}"))
-                    reader = shm_pair.reader
-                    writer = shm_pair.writer
-                    # Send ACCEPT immediately and proceed
-                    accept = BaseSidebandPacket.create(SIDEBAND_TYPES.CONNECTION_ACCEPT)
-                    writer.write(bytes(accept))
-                    await writer.drain()
-                    logger.info(self._create_message(f"Sent ACCEPT for port {idx_local}"))
-                    await self._update_connection_status(idx_local, connected=True)
-                    packet_processor = CxlPacketProcessor(
-                        reader,
-                        writer,
-                        cxl_connection,
-                        component_type,
-                        label=f"SwitchPort{idx_local}",
-                    )
-                    self._ports[idx_local].packet_processor = packet_processor
-                    logger.info(
-                        self._create_message(f"Starting PacketProcessor for port {idx_local}")
-                    )
-                    await packet_processor.run()
-
-                port_tasks.append(create_task(accept_and_run(idx)))
-            await self._change_status_to_running()
-            if port_tasks:
-                await gather(*port_tasks)
-        else:
-            server_task = create_task(self._server_component.run())
-            await self._server_component.wait_for_ready()
-            self._port = self._server_component.get_port()
-            await self._change_status_to_running()
-            await server_task
-
-    async def _stop(self):
-        if self._use_shm:
-            # Notify processors via disconnection (not strictly needed); close shm streams
-            for idx, port in enumerate(self._ports):
-                try:
-                    if port.packet_processor:
-                        await port.packet_processor.stop()
-                except Exception:
-                    pass
-                if port.shm_stream:
-                    try:
-                        port.shm_stream.close()
-                    except Exception:
-                        pass
-        else:
-            await self._server_component.stop()
+    async def _update_connection_status(self, port_id: int, connected: bool):
+        self._ports[port_id].connected = connected
+        if not self._event_handler:
+            return
+        await self._event_handler(PortUpdateEvent(port_id=port_id, connected=connected))
