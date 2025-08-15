@@ -14,7 +14,6 @@ here = os.path.abspath(os.path.dirname(__file__))
 
 common_cflags = [
     "-O3",
-    "-g",
     "-fno-omit-frame-pointer",
     "-march=native",
 ]
@@ -25,26 +24,28 @@ ext_modules = cythonize(
             "packet_structs",
             [os.path.join(here, "packet_structs.pyx")],
             extra_compile_args=common_cflags,
-            extra_link_args=["-g"],
+            extra_link_args=[],
         ),
         Extension(
             "shm_ring",
             [os.path.join(here, "shm_ring.pyx")],
             extra_compile_args=common_cflags,
-            extra_link_args=["-g"],
+            extra_link_args=[],
         ),
         Extension(
             "c_mmap",
             [os.path.join(here, "c_mmap.pyx")],
             extra_compile_args=common_cflags,
-            extra_link_args=["-g"],
+            extra_link_args=[],
         ),
     ],
-    gdb_debug=True,
+    gdb_debug=False,
     compiler_directives={
-        "boundscheck": True,
-        "wraparound": True,
-        "nonecheck": True,
+        "boundscheck": False,
+        "wraparound": False,
+        "nonecheck": False,
+        "initializedcheck": False,
+        "language_level": 3,
     },
 )
 

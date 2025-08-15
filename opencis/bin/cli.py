@@ -295,7 +295,7 @@ def child_process_wrapper(target):
     # Enable per-process file logging for comprehensive tracing
     # try:
     #     from opencis.util.logger import logger as _logger
-
+    #
     #     _logger.create_log_file(
     #         filename=f"logs/proc-{os.getpid()}.log",
     #         loglevel="WARNING",
@@ -306,8 +306,31 @@ def child_process_wrapper(target):
     #     _logger.info(f"Child logger initialized for pid {os.getpid()}")
     # except Exception:
     #     pass
-
-    target()
+    if os.getenv("OPEN_CIS_PROFILE"):
+        try:
+            import cProfile
+            import pstats  # noqa: F401
+        except Exception:
+            target()
+            return
+        profile = cProfile.Profile()
+        try:
+            profile.enable()
+            target()
+        finally:
+            profile.disable()
+            # Ensure logs directory exists and dump stats per process
+            try:
+                os.makedirs("logs", exist_ok=True)
+            except Exception:
+                pass
+            out_path = os.path.join("logs", f"profile-{os.getpid()}.prof")
+            try:
+                profile.dump_stats(out_path)
+            except Exception:
+                pass
+    else:
+        target()
 
 
 def spawn_process(target):

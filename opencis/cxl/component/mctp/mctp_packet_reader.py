@@ -30,6 +30,8 @@ class MctpPacketReader(LabeledComponent):
         self._reader = reader
         self._aborted = False
         self._task = None
+        self._hdr_buf = bytearray(SystemHeader.get_size())
+        self._payload_buf = bytearray(2048)
 
     async def get_packet(self) -> CciMessagePacket:
         if self._aborted:
@@ -63,25 +65,26 @@ class MctpPacketReader(LabeledComponent):
         return packet
 
     async def _get_payload(self):
-        logger.debug(self._create_message("Waiting Packet"))
-        header_bytes = await self._read_payload(SystemHeader.get_size())
-        base_packet = BasePacket(bytearray(header_bytes))
+        # logger.debug(self._create_message("Waiting Packet"))
+        await self._readinto_exactly(self._hdr_buf, SystemHeader.get_size())
+        base_packet = BasePacket(self._hdr_buf)
         remaining_length = base_packet.system_header.payload_length - len(base_packet)
         if remaining_length < 0:
             raise Exception("remaining length is less than 0")
-        payload = header_bytes + await self._read_payload(remaining_length)
-        logger.debug(self._create_message("Received Packet"))
+        total_len = len(self._hdr_buf) + remaining_length
+        if total_len > len(self._payload_buf):
+            self._payload_buf = bytearray(total_len)
+        payload = self._payload_buf[:total_len]
+        payload[: len(self._hdr_buf)] = self._hdr_buf
+        if remaining_length:
+            await self._readinto_exactly(payload[len(self._hdr_buf) :], remaining_length)
+        # logger.debug(self._create_message("Received Packet"))
         return base_packet, payload
 
-    async def _get_cci_message_header(self) -> CciMessagePacket:
-        logger.debug(self._create_message("Waiting for CCI Message Header"))
-        payload = await self._read_payload(CciMessagePacket.get_size())
-        message_header = CciMessagePacket(payload)
-        logger.debug(self._create_message("Received CCI Message Header"))
-        return message_header
-
-    async def _read_payload(self, size: int) -> bytes:
-        payload = await self._reader.read(size)
-        if not payload:
-            raise Exception("Connection disconnected")
-        return payload
+    async def _readinto_exactly(self, buf: bytearray, n: int) -> None:
+        reader = self._reader
+        if hasattr(reader, "readinto_exactly"):
+            await reader.readinto_exactly(buf, n)  # type: ignore[attr-defined]
+            return
+        data = await reader.readexactly(n)
+        memoryview(buf)[:n] = data

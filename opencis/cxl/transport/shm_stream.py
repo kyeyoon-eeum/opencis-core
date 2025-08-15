@@ -8,13 +8,14 @@ import asyncio
 import os
 import struct
 from typing import Optional
+from collections import deque
 
 from opencis.cxl.transport import shm_ring as _shm
 from opencis.util.logger import logger
 
 
-DEFAULT_ELEM_SIZE = 256
-DEFAULT_CAPACITY = 4096
+DEFAULT_ELEM_SIZE = 65536
+DEFAULT_CAPACITY = 256
 HEADER_SIZE = 4
 MAX_PAYLOAD = DEFAULT_ELEM_SIZE - HEADER_SIZE
 
@@ -68,86 +69,114 @@ class ShmStreamReader:
     async def read(self, n: int) -> bytes:
         if n <= 0:
             return b""
-        # Ensure there is at least some data; if buffer empty, try to pull a frame
         if not self._buf:
+            delay = 1e-6
             while True:
-                frame = self._ep._in_ring.try_pop()
-                if frame is None:
-                    await asyncio.sleep(0)
+                payload = self._ep._in_ring.try_pop_frame()
+                if payload is None or not payload:
+                    await asyncio.sleep(delay)
+                    delay = delay * 2 if delay < 0.001 else 0.001
                     continue
-                if len(frame) != DEFAULT_ELEM_SIZE:
-                    continue
-                (length,) = struct.unpack_from("<I", frame, 0)
-                if length:
-                    payload = frame[HEADER_SIZE : HEADER_SIZE + min(length, MAX_PAYLOAD)]
-                    self._buf.extend(payload)
+                self._buf.extend(payload)
                 self._debug_reads += 1
                 if self._debug_reads <= 3:
-                    logger.debug(f"[ShmStreamReader] read frame bytes={length}")
+                    logger.debug(f"[ShmStreamReader] read frame bytes={len(payload)}")
                 break
-        # Return up to n bytes
         out_len = min(n, len(self._buf))
         out = self._buf[:out_len]
         del self._buf[:out_len]
         return bytes(out)
 
     async def readexactly(self, n: int) -> bytes:
+        spins = 0
         while len(self._buf) < n:
-            frame = self._ep._in_ring.try_pop()
-            if frame is None:
-                await asyncio.sleep(0)
+            payload = self._ep._in_ring.try_pop_frame()
+            if payload is None or not payload:
+                await asyncio.sleep(1e-6)
                 continue
-            if len(frame) != DEFAULT_ELEM_SIZE:
-                # Skip malformed frames
-                continue
-            (length,) = struct.unpack_from("<I", frame, 0)
-            if length:
-                payload = frame[HEADER_SIZE : HEADER_SIZE + min(length, MAX_PAYLOAD)]
-                self._buf.extend(payload)
+            self._buf.extend(payload)
             self._debug_reads += 1
             if self._debug_reads <= 3:
-                logger.debug(f"[ShmStreamReader] readexactly frame bytes={length}")
+                logger.debug(f"[ShmStreamReader] readexactly frame bytes={len(payload)}")
         out = self._buf[:n]
         del self._buf[:n]
         return bytes(out)
+
+    async def readinto_exactly(self, buf, n: int) -> None:
+        """Fill the provided writable buffer with exactly n bytes, minimizing allocations.
+
+        Copies any pending bytes from the internal buffer first, then pulls SHM frames and
+        copies directly into the destination. Any excess from the last frame is kept in the
+        internal buffer for subsequent reads.
+        """
+        if n <= 0:
+            return
+        mv = memoryview(buf)
+        if mv.readonly:
+            raise TypeError("destination buffer must be writable")
+        offset = 0
+        # Use any pending buffered bytes
+        if self._buf:
+            take = n if n <= len(self._buf) else len(self._buf)
+            mv[:take] = self._buf[:take]
+            del self._buf[:take]
+            offset += take
+        while offset < n:
+            payload = self._ep._in_ring.try_pop_frame()
+            if payload is None or not payload:
+                await asyncio.sleep(0)
+                continue
+            plen = len(payload)
+            need = n - offset
+            if plen <= need:
+                mv[offset : offset + plen] = payload
+                offset += plen
+            else:
+                mv[offset:n] = payload[:need]
+                self._buf.extend(payload[need:])
+                offset = n
 
 
 class ShmStreamWriter:
     def __init__(self, endpoint: ShmEndpoint):
         self._ep = endpoint
         self._debug_writes = 0
-        self._pending: list[bytes] = []
+        self._pending = deque()
 
     def write(self, data: bytes):
-        # Break into fixed-size frames and enqueue for async drain
+        if not isinstance(data, (bytes, bytearray)):
+            # Coerce once to avoid repeated conversions
+            data = memoryview(data).tobytes()
         offset = 0
         total = len(data)
         while offset < total:
             chunk = data[offset : offset + MAX_PAYLOAD]
-            length = len(chunk)
-            head = struct.pack("<I", length)
-            pad_len = DEFAULT_ELEM_SIZE - HEADER_SIZE - length
-            frame = head + chunk + (b"\x00" * pad_len)
-            if len(frame) != DEFAULT_ELEM_SIZE:
-                logger.error(
-                    f"[ShmStreamWriter] Invalid frame size: {len(frame)} (expected {DEFAULT_ELEM_SIZE}), chunk={length}"
-                )
-                raise RuntimeError("ShmStreamWriter frame size mismatch")
-            self._pending.append(frame)
-            offset += length
-
-    async def drain(self):
-        # Non-blocking flush of pending frames
-        while self._pending:
-            frame = self._pending[0]
-            if self._ep._out_ring.try_push(frame):
-                self._pending.pop(0)
+            # Try immediate push to avoid extra drain call
+            if not isinstance(chunk, (bytes, bytearray)):
+                chunk = bytes(chunk)
+            if not self._ep._out_ring.try_push_frame(chunk):
+                self._pending.append(chunk)
+            else:
                 self._debug_writes += 1
                 if self._debug_writes <= 3:
-                    (length,) = struct.unpack_from("<I", frame, 0)
-                    logger.debug(f"[ShmStreamWriter] wrote frame bytes={length}")
+                    logger.debug(f"[ShmStreamWriter] wrote frame bytes={len(chunk)} (inline)")
+            offset += len(chunk)
+
+    async def drain(self):
+        # Flush as many pending frames as the ring can accept
+        while self._pending:
+            payload = self._pending[0]
+            if not isinstance(payload, (bytes, bytearray)):
+                payload = bytes(payload)
+            if self._ep._out_ring.try_push_frame(payload):
+                self._pending.popleft()
+                self._debug_writes += 1
+                if self._debug_writes <= 3:
+                    logger.debug(f"[ShmStreamWriter] wrote frame bytes={len(payload)}")
             else:
+                # Ring is full; yield once and return
                 await asyncio.sleep(0)
+                return
 
     def close(self):
         self._ep.close()

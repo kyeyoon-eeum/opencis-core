@@ -366,6 +366,10 @@ def emit_composite(packet_name, descriptor, field_sizes):
         f"        return PyBytes_FromStringAndSize(<char *> self._buf, "
         f"{total_header_bytes} + self._data_length)\n"
     )
+    # efficient zero-copy view over the packet buffer
+    lines.append("    def get_view(self):")
+    lines.append("        cdef unsigned char[::1] v = self._buf")
+    lines.append(f"        return v[:{total_header_bytes} + self._data_length]\n")
 
     return "\n".join(lines)
 

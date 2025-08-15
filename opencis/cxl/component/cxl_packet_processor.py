@@ -238,15 +238,15 @@ class CxlPacketProcessor(RunnableComponent):
                         await self._notify_outgoing_processors(notification_packet)
                         break
                     # Ignore other sideband frames
-                    logger.debug(self._create_message("Received sideband; ignoring"))
-                    raise Exception("Received unexpected CXL.io packet")
+                    logger.debug("[%s] Received sideband; ignoring", self.get_message_label())
+                    continue
                 if packet.is_cxl_io():
                     cxl_io_packet = cast(CxlIoBasePacket, packet)
                     if cxl_io_packet.is_cpl() or cxl_io_packet.is_cpld():
                         logger.debug(
-                            self._create_message(
-                                f"Received {self._incoming_dir} CXL.io (CPL/CPLD) packet"
-                            )
+                            "[%s] Received %s CXL.io (CPL/CPLD) packet",
+                            self.get_message_label(),
+                            self._incoming_dir,
                         )
                         fifo_type = self._pop_tlp_table_entry(cxl_io_packet)
                         # Add MLD
@@ -263,9 +263,9 @@ class CxlPacketProcessor(RunnableComponent):
                                 await self._incoming.mmio.put(cxl_io_packet)
                     elif cxl_io_packet.is_cfg():
                         logger.debug(
-                            self._create_message(
-                                f"Received {self._incoming_dir} CXL.io (CFG_RD/CFG_WR) packet"
-                            )
+                            "[%s] Received %s CXL.io (CFG_RD/CFG_WR) packet",
+                            self.get_message_label(),
+                            self._incoming_dir,
                         )
                         self._push_tlp_table_entry(cxl_io_packet)
                         # Add MLD
@@ -276,9 +276,9 @@ class CxlPacketProcessor(RunnableComponent):
                             await self._incoming.cfg_space.put(cxl_io_packet)
                     elif cxl_io_packet.is_mmio():
                         logger.debug(
-                            self._create_message(
-                                f"Received {self._incoming_dir} CXL.io (MRD/MWR) packet"
-                            )
+                            "[%s] Received %s CXL.io (MRD/MWR) packet",
+                            self.get_message_label(),
+                            self._incoming_dir,
                         )
                         if cxl_io_packet.is_mem_write() is False:
                             self._push_tlp_table_entry(cxl_io_packet)
@@ -289,18 +289,24 @@ class CxlPacketProcessor(RunnableComponent):
                         else:
                             await self._incoming.mmio.put(cxl_io_packet)
                     else:
-                        logger.warning(self._create_message("Unexpected CXL.io packet"))
-                        logger.debug(self._create_message(packet.get_pretty_string()))
+                        logger.warning("[%s] Unexpected CXL.io packet", self.get_message_label())
+                        logger.debug(
+                            "[%s] %s", self.get_message_label(), packet.get_pretty_string()
+                        )
                         continue
                 elif packet.is_cxl_mem():
                     if (
                         self._component_type != CXL_COMPONENT_TYPE.LD
                         and self._incoming.cxl_mem is None
                     ):
-                        logger.error(self._create_message("Got CXL.mem packet on no CXL.mem FIFO"))
+                        logger.error(
+                            "[%s] Got CXL.mem packet on no CXL.mem FIFO", self.get_message_label()
+                        )
                         continue
                     logger.debug(
-                        self._create_message(f"Received {self._incoming_dir} CXL.mem packet")
+                        "[%s] Received %s CXL.mem packet",
+                        self.get_message_label(),
+                        self._incoming_dir,
                     )
                     cxl_mem_packet = cast(CxlMemBasePacket, packet)
                     if self._component_type == CXL_COMPONENT_TYPE.LD:
@@ -314,7 +320,9 @@ class CxlPacketProcessor(RunnableComponent):
                         elif cxl_mem_packet.is_s2mdrs():
                             ld_id = cxl_mem_packet.s2mdrs_header.ld_id
                         else:
-                            logger.warning(self._create_message("Unexpected CXL.mem packet"))
+                            logger.warning(
+                                "[%s] Unexpected CXL.mem packet", self.get_message_label()
+                            )
 
                         await self._incoming[ld_id].cxl_mem.put(cxl_mem_packet)
                     else:
@@ -323,23 +331,29 @@ class CxlPacketProcessor(RunnableComponent):
                 elif packet.is_cxl_cache():
                     if self._incoming.cxl_cache is None:
                         logger.error(
-                            self._create_message("Got CXL.cache packet on no CXL.cache FIFO")
+                            "[%s] Got CXL.cache packet on no CXL.cache FIFO",
+                            self.get_message_label(),
                         )
                         continue
                     logger.debug(
-                        self._create_message(f"Received {self._incoming_dir} CXL.cache packet")
+                        "[%s] Received %s CXL.cache packet",
+                        self.get_message_label(),
+                        self._incoming_dir,
                     )
                     cxl_cache_packet = cast(CxlCacheBasePacket, packet)
                     await self._incoming.cxl_cache.put(cxl_cache_packet)
                 elif packet.is_cci():
                     if self._component_type == CXL_COMPONENT_TYPE.D2:
                         logger.error(
-                            self._create_message("Got CCI packet on wrong device type - SLD")
+                            "[%s] Got CCI packet on wrong device type - SLD",
+                            self.get_message_label(),
                         )
                         raise Exception("Got CCI packet on wrong device type - SLD")
                     if self._component_type == CXL_COMPONENT_TYPE.LD:
                         if self._fmld.upstream_fifo is None:
-                            logger.error(self._create_message("Got CCI packet on no CCI FIFO"))
+                            logger.error(
+                                "[%s] Got CCI packet on no CCI FIFO", self.get_message_label()
+                            )
                             raise Exception("Got CCI packet on no CCI FIFO")
                         cci_packet = cast(CciRequestPacket, packet)
                         await self._fmld.upstream_fifo.host_to_target.put(cci_packet)
@@ -347,11 +361,11 @@ class CxlPacketProcessor(RunnableComponent):
                         await self._incoming.cci_fifo.put(packet)
                 else:
                     message = f"Received unexpected {self._incoming_dir} packet"
-                    logger.warning(self._create_message(message))
+                    logger.warning("[%s] %s", self.get_message_label(), message)
                     raise Exception(message)
             except Exception as e:
                 msg = str(e)
-                logger.debug(self._create_message(msg))
+                logger.debug("[%s] %s", self.get_message_label(), msg)
                 if "aborted" in msg or "cancelled" in msg or "Connection disconnected" in msg:
                     notification_packet = BaseSidebandPacket.create(
                         SIDEBAND_TYPES.CONNECTION_DISCONNECTED
@@ -359,9 +373,11 @@ class CxlPacketProcessor(RunnableComponent):
                     await self._notify_outgoing_processors(notification_packet)
                     break
                 # Otherwise, treat as recoverable and continue
-                logger.warning(self._create_message(f"Recoverable incoming error: {msg}"))
+                logger.warning("[%s] Recoverable incoming error: %s", self.get_message_label(), msg)
                 continue
-        logger.debug(self._create_message(f"Stopped {self._incoming_dir} packet processor"))
+        logger.debug(
+            "[%s] Stopped %s packet processor", self.get_message_label(), self._incoming_dir
+        )
 
     async def _notify_outgoing_processors(self, packet):
         await self._outgoing.cfg_space.put(packet)
@@ -387,17 +403,24 @@ class CxlPacketProcessor(RunnableComponent):
             cxl_io_packet = cast(CxlIoBasePacket, packet)
             if cxl_io_packet.is_cpl() or cxl_io_packet.is_cpld():
                 logger.debug(
-                    self._create_message(f"Received {self._outgoing_dir} CXL.io (CPL/CPLD) packet")
+                    "[%s] Received %s CXL.io (CPL/CPLD) packet",
+                    self.get_message_label(),
+                    self._outgoing_dir,
                 )
                 self._pop_tlp_table_entry(cxl_io_packet)
             else:
                 logger.debug(
-                    self._create_message(
-                        f"Received {self._outgoing_dir} CXL.io (CFG_RD/CFG_WR) packet"
-                    )
+                    "[%s] Received %s CXL.io (CFG_RD/CFG_WR) packet",
+                    self.get_message_label(),
+                    self._outgoing_dir,
                 )
                 self._push_tlp_table_entry(cxl_io_packet)
-            self._writer.write(bytes(packet))
+            # zero-copy write path
+            try:
+                view = packet.get_view()  # type: ignore[attr-defined]
+            except Exception:
+                view = bytes(packet)
+            self._writer.write(view)
             await self._writer.drain()
         logger.debug(self._create_message("Stopped outgoing CFG FIFO processor"))
 
@@ -410,16 +433,25 @@ class CxlPacketProcessor(RunnableComponent):
             cxl_io_packet = cast(CxlIoBasePacket, packet)
             if cxl_io_packet.is_cpl() or cxl_io_packet.is_cpld():
                 logger.debug(
-                    self._create_message(f"Received {self._outgoing_dir} CXL.io (CPL/CPLD) packet")
+                    "[%s] Received %s CXL.io (CPL/CPLD) packet",
+                    self.get_message_label(),
+                    self._outgoing_dir,
                 )
                 self._pop_tlp_table_entry(cxl_io_packet)
             else:
                 logger.debug(
-                    self._create_message(f"Received {self._outgoing_dir} CXL.io (MRD/MWR) packet")
+                    "[%s] Received %s CXL.io (MRD/MWR) packet",
+                    self.get_message_label(),
+                    self._outgoing_dir,
                 )
                 if cxl_io_packet.is_mem_write() is False:
                     self._push_tlp_table_entry(cxl_io_packet)
-            self._writer.write(bytes(packet))
+            # zero-copy write path
+            try:
+                view = packet.get_view()  # type: ignore[attr-defined]
+            except Exception:
+                view = bytes(packet)
+            self._writer.write(view)
             await self._writer.drain()
         logger.debug(self._create_message("Stopped outgoing MMIO FIFO processor"))
 
@@ -429,7 +461,11 @@ class CxlPacketProcessor(RunnableComponent):
             packet = await self._outgoing.cxl_mem.get()
             if self._is_disconnection_notification(packet):
                 break
-            self._writer.write(bytes(packet))
+            try:
+                view = packet.get_view()  # type: ignore[attr-defined]
+            except Exception:
+                view = bytes(packet)
+            self._writer.write(view)
             await self._writer.drain()
         logger.debug(self._create_message("Stopped outgoing CXL.mem FIFO processor"))
 
@@ -439,7 +475,11 @@ class CxlPacketProcessor(RunnableComponent):
             packet = await self._outgoing.cxl_cache.get()
             if self._is_disconnection_notification(packet):
                 break
-            self._writer.write(bytes(packet))
+            try:
+                view = packet.get_view()  # type: ignore[attr-defined]
+            except Exception:
+                view = bytes(packet)
+            self._writer.write(view)
             await self._writer.drain()
         logger.debug(self._create_message("Stopped outgoing CXL.cache FIFO processor"))
 
@@ -455,15 +495,27 @@ class CxlPacketProcessor(RunnableComponent):
                 logger.info(self._create_message(f"Received CCI packet with opcode {opcode:x}"))
                 if opcode == CCI_FM_API_COMMAND_OPCODE.GET_LD_INFO:
                     packet = cast(GetLdInfoResponsePacket, packet)
-                    self._writer.write(bytes(packet))
+                    try:
+                        view = packet.get_view()  # type: ignore[attr-defined]
+                    except Exception:
+                        view = bytes(packet)
+                    self._writer.write(view)
                     await self._writer.drain()
                 elif opcode == CCI_FM_API_COMMAND_OPCODE.GET_LD_ALLOCATIONS:
                     packet = cast(GetLdAllocationsResponsePacket, packet)
-                    self._writer.write(bytes(packet))
+                    try:
+                        view = packet.get_view()  # type: ignore[attr-defined]
+                    except Exception:
+                        view = bytes(packet)
+                    self._writer.write(view)
                     await self._writer.drain()
                 elif opcode == CCI_FM_API_COMMAND_OPCODE.SET_LD_ALLOCATIONS:
                     packet = cast(SetLdAllocationsResponsePacket, packet)
-                    self._writer.write(bytes(packet))
+                    try:
+                        view = packet.get_view()  # type: ignore[attr-defined]
+                    except Exception:
+                        view = bytes(packet)
+                    self._writer.write(view)
                     await self._writer.drain()
                 else:
                     logger.warning(self._create_message("Unsupported CCI packet"))
@@ -471,7 +523,11 @@ class CxlPacketProcessor(RunnableComponent):
                 packet = await self._outgoing.cci_fifo.get()
                 if self._is_disconnection_notification(packet):
                     break
-                self._writer.write(bytes(packet))
+                try:
+                    view = packet.get_view()  # type: ignore[attr-defined]
+                except Exception:
+                    view = bytes(packet)
+                self._writer.write(view)
                 await self._writer.drain()
             else:
                 break
