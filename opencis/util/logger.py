@@ -91,7 +91,7 @@ class MyLogger(logging.getLoggerClass()):
         # Allow filter to decide what to emit; keep handler at NOTSET to not block INFO RESULTS
         self._stdout_hdlr.setLevel(logging.NOTSET)
         # Ensure only warnings/errors or RESULTS lines make it to stdout
-        self._stdout_hdlr.addFilter(_ResultsOrWarningsFilter())
+        # self._stdout_hdlr.addFilter(_ResultsOrWarningsFilter())
         self._stdout_hdlr.setFormatter(formatter)
         self.addHandler(self._stdout_hdlr)
 
