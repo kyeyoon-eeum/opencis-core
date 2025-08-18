@@ -12,23 +12,6 @@ from os import getcwd, makedirs
 from os.path import join, dirname, exists
 
 
-class _ResultsOrWarningsFilter(logging.Filter):
-    def filter(self, record: logging.LogRecord) -> bool:  # type: ignore[override]
-        # Fast-path: warnings/errors always pass; avoid formatting for others
-        if record.levelno >= logging.WARNING:
-            return True
-        # Avoid record.getMessage() to skip expensive formatting
-        msg_obj = record.msg
-        if isinstance(msg_obj, str):
-            if (
-                ("RESULTS:" in msg_obj)
-                or ("Write RESULTS" in msg_obj)
-                or ("Read RESULTS" in msg_obj)
-            ):
-                return True
-        return False
-
-
 class MyLogger(logging.getLoggerClass()):
     def __init__(self):
         super().__init__(name="mylogger")
@@ -38,7 +21,7 @@ class MyLogger(logging.getLoggerClass()):
         # reset root logger log level
         logging.getLogger().setLevel(logging.NOTSET)
 
-        # init stdout with defaults (minimal I/O, preserve RESULTS)
+        # init stdout with defaults
         self.set_stdout_levels()
 
     def _get_formatter(self, show_timestamp: bool, show_loglevel: bool, show_linenumber: bool):
@@ -84,26 +67,8 @@ class MyLogger(logging.getLoggerClass()):
         show_linenumber: bool = False,
     ):
         formatter = self._get_formatter(show_timestamp, show_loglevel, show_linenumber)
-        # Set logger level to suppress debug processing overhead
-        level = self._name_to_level.get(loglevel.upper(), logging.WARNING)
-        self.setLevel(level)
         self.removeHandler(self._stdout_hdlr)
-        # Allow filter to decide what to emit; keep handler at NOTSET to not block INFO RESULTS
-        self._stdout_hdlr.setLevel(logging.NOTSET)
-        # Reset existing filters so previous restrictive filters don't persist across reconfig
-        try:
-            self._stdout_hdlr.filters.clear()
-        except Exception:
-            for f in list(self._stdout_hdlr.filters):
-                try:
-                    self._stdout_hdlr.removeFilter(f)
-                except Exception:
-                    pass
-
-        # Only apply restrictive RESULTS/warnings filter when level is WARNING or higher.
-        # For INFO/DEBUG, allow all messages to flow to stdout.
-        if level >= logging.WARNING:
-            self._stdout_hdlr.addFilter(_ResultsOrWarningsFilter())
+        self._stdout_hdlr.setLevel(self._name_to_level[loglevel])
         self._stdout_hdlr.setFormatter(formatter)
         self.addHandler(self._stdout_hdlr)
 
