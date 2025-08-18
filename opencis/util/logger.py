@@ -90,8 +90,20 @@ class MyLogger(logging.getLoggerClass()):
         self.removeHandler(self._stdout_hdlr)
         # Allow filter to decide what to emit; keep handler at NOTSET to not block INFO RESULTS
         self._stdout_hdlr.setLevel(logging.NOTSET)
-        # Ensure only warnings/errors or RESULTS lines make it to stdout
-        # self._stdout_hdlr.addFilter(_ResultsOrWarningsFilter())
+        # Reset existing filters so previous restrictive filters don't persist across reconfig
+        try:
+            self._stdout_hdlr.filters.clear()
+        except Exception:
+            for f in list(self._stdout_hdlr.filters):
+                try:
+                    self._stdout_hdlr.removeFilter(f)
+                except Exception:
+                    pass
+
+        # Only apply restrictive RESULTS/warnings filter when level is WARNING or higher.
+        # For INFO/DEBUG, allow all messages to flow to stdout.
+        if level >= logging.WARNING:
+            self._stdout_hdlr.addFilter(_ResultsOrWarningsFilter())
         self._stdout_hdlr.setFormatter(formatter)
         self.addHandler(self._stdout_hdlr)
 

@@ -225,7 +225,7 @@ def start(
 ):
     """Start components"""
 
-    log_level = log_level if not None else "INFO"
+    log_level = log_level if (log_level is not None) else "INFO"
     config_components = ["switch", "sld-group", "mld-group", "host-group"]
     comp = list(comp)
 
@@ -242,6 +242,14 @@ def start(
             show_loglevel=show_loglevel,
             show_linenumber=show_linenumber,
         )
+    # Propagate logging options to child processes via env
+    try:
+        os.environ["OPEN_CIS_LOG_LEVEL"] = log_level or "INFO"
+        os.environ["OPEN_CIS_SHOW_TS"] = "1" if show_timestamp else "0"
+        os.environ["OPEN_CIS_SHOW_LEVEL"] = "1" if show_loglevel else "0"
+        os.environ["OPEN_CIS_SHOW_LINE"] = "1" if show_linenumber else "0"
+    except Exception:
+        pass
 
     if log_file:
         logger.create_log_file(
@@ -292,6 +300,22 @@ def child_process_wrapper(target):
     # Create a new process group for this child process
     os.setpgrp()
     setup_child_signal_handlers()
+    # Initialize child logger from environment-propagated settings
+    try:
+        from opencis.util.logger import logger as _logger
+
+        child_level = os.getenv("OPEN_CIS_LOG_LEVEL", "INFO")
+        child_ts = os.getenv("OPEN_CIS_SHOW_TS", "0") == "1"
+        child_lvl = os.getenv("OPEN_CIS_SHOW_LEVEL", "0") == "1"
+        child_line = os.getenv("OPEN_CIS_SHOW_LINE", "0") == "1"
+        _logger.set_stdout_levels(
+            loglevel=child_level,
+            show_timestamp=child_ts,
+            show_loglevel=child_lvl,
+            show_linenumber=child_line,
+        )
+    except Exception:
+        pass
     # Enable per-process file logging for comprehensive tracing
     # try:
     #     from opencis.util.logger import logger as _logger
