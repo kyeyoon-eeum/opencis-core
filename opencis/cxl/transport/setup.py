@@ -40,7 +40,7 @@ ext_modules = cythonize(
         ),
         Extension(
             "packet_reader_c",
-            [os.path.join(here, "../component/packet_reader_c.pyx")],
+            [os.path.join(here, "packet_reader_c.pyx")],
             extra_compile_args=common_cflags,
             extra_link_args=[],
         ),

@@ -94,7 +94,7 @@ cdef class ShmRing:
         if self.mm is None:
             raise RuntimeError("ShmRing not initialized")
         cdef Py_ssize_t data_len = len(data)
-        if data_len > self.elem_size:
+        if <size_t>data_len > self.elem_size:
             raise ValueError("Invalid element size")
         cdef unsigned long long head = self._read_u64(16)
         cdef unsigned long long tail = self._read_u64(24)
@@ -126,7 +126,7 @@ cdef class ShmRing:
         if self.mm is None:
             raise RuntimeError("ShmRing not initialized")
         cdef Py_ssize_t payload_len = len(payload)
-        if payload_len + 4 > self.elem_size:
+        if <size_t>(payload_len + 4) > self.elem_size:
             raise ValueError("Frame too large for element")
         cdef unsigned long long head = self._read_u64(16)
         cdef unsigned long long tail = self._read_u64(24)
