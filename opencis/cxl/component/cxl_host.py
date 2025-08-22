@@ -33,7 +33,7 @@ class CxlHostConfig:
     irq_port: int = 8500
     host_conn_host: str = "0.0.0.0"
     host_conn_port: int = 8300
-    enable_hm: bool = True
+    enable_hm: bool = False
 
 
 class CxlHost(RunnableComponent):
