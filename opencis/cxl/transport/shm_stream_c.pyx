@@ -63,13 +63,12 @@ cdef class ShmStreamReader:
     async def readinto_exactly(self, buf, int n):
         if n <= 0:
             return None
-        mv = memoryview(buf)
-        if mv.readonly:
-            raise TypeError("destination buffer must be writable")
-        offset = 0
+        cdef Py_ssize_t offset = 0
+        cdef Py_ssize_t take, plen, need
+        # Consume from internal buffer first
         if self._buf:
             take = n if n <= len(self._buf) else len(self._buf)
-            mv[:take] = self._buf[:take]
+            buf[0:take] = self._buf[:take]
             del self._buf[:take]
             offset += take
         while offset < n:
@@ -80,10 +79,10 @@ cdef class ShmStreamReader:
             plen = len(payload)
             need = n - offset
             if plen <= need:
-                mv[offset : offset + plen] = payload
+                buf[offset : offset + plen] = payload
                 offset += plen
             else:
-                mv[offset:n] = payload[:need]
+                buf[offset:n] = payload[:need]
                 self._buf.extend(payload[need:])
                 offset = n
         return None
@@ -92,13 +91,12 @@ cdef class ShmStreamReader:
         if n <= 0:
             return
         cdef Py_ssize_t off = 0
-        cdef const unsigned char[::1] mv
-        cdef Py_ssize_t take, plen
+        cdef Py_ssize_t take, plen, i
         # Consume leftover slice first
         if self._left_payload is not None and self._left_len > 0:
-            mv = self._left_payload
             take = n if n <= self._left_len else self._left_len
-            memcpy(dst + 0, &mv[self._left_off], <size_t>take)
+            for i in range(take):
+                dst[i] = self._left_payload[self._left_off + i]
             self._left_off += take
             self._left_len -= take
             if self._left_len == 0:
@@ -110,14 +108,15 @@ cdef class ShmStreamReader:
             payload = self._in_ring.pop_frame_wait(100)
             if payload is None:
                 continue
-            mv = payload
-            plen = mv.shape[0]
+            plen = <Py_ssize_t> len(payload)
             take = n - off
             if plen <= take:
-                memcpy(dst + off, &mv[0], <size_t>plen)
+                for i in range(plen):
+                    dst[off + i] = payload[i]
                 off += plen
             else:
-                memcpy(dst + off, &mv[0], <size_t>take)
+                for i in range(take):
+                    dst[off + i] = payload[i]
                 self._left_payload = payload
                 self._left_off = take
                 self._left_len = plen - take
@@ -133,7 +132,7 @@ cdef class ShmStreamWriter:
 
     def write(self, data):
         if not isinstance(data, (bytes, bytearray)):
-            data = memoryview(data).tobytes()
+            data = bytes(data)
         cdef Py_ssize_t offset = 0
         cdef Py_ssize_t total = len(data)
         while offset < total:
