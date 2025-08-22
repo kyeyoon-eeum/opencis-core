@@ -36,7 +36,7 @@ class PacketReader(LabeledComponent):
         if ep is None or getattr(ep, "_in_ring", None) is None:
             raise TypeError("ShmStreamReader is missing underlying ring")
         self._ring = ep._in_ring
-        self._reader = _prc.ShmPacketReader(self._ring)
+        self._reader = _prc.ShmPacketReader(reader)
         self._aborted = False
 
     async def get_packet(self):

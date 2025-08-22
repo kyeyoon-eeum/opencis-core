@@ -1,96 +1,44 @@
 # cython: language_level=3
 # cython: boundscheck=False, wraparound=False, nonecheck=False, initializedcheck=False
 
-from libc.string cimport memcpy
-from libc.stddef cimport size_t
-from cpython.bytes cimport PyBytes_FromStringAndSize
+from libc.stdint cimport uint16_t
+from shm_stream_c cimport ShmStreamReader
+
 
 cdef class ShmPacketReader:
-    cdef object _ring
     cdef bint _aborted
-    cdef object _left_payload
-    cdef Py_ssize_t _left_off
-    cdef Py_ssize_t _left_len
+    cdef ShmStreamReader _reader
+    cdef unsigned char _packet_buffer[256]
 
-    def __cinit__(self, object ring):
-        self._ring = ring
+    def __cinit__(self, object reader):
         self._aborted = False
-        self._left_payload = None
-        self._left_off = 0
-        self._left_len = 0
+        self._reader = <ShmStreamReader> reader
 
     cpdef void abort(self):
         self._aborted = True
 
-    cdef void _readinto_exactly(self, unsigned char* dst, Py_ssize_t n):
+    cdef void _read_exactly(self, unsigned char* dst, Py_ssize_t n):
         if self._aborted:
             raise RuntimeError("PacketReader is aborted")
         if n <= 0:
             return
+        self._reader._readinto_exactly_blocking(dst, n)
 
-        cdef Py_ssize_t off = 0
-        cdef const unsigned char[::1] mv
-        cdef Py_ssize_t take, plen
+    cdef Py_ssize_t _read_one_packet_bytes(self):
+        # SystemHeader: payload_type (4 bits) + payload_length (12 bits)
+        cdef Py_ssize_t hdr_size = 2
+        self._read_exactly(self._packet_buffer, hdr_size)
 
-        # Consume leftover slice from previous frame (zero-copy; no Python realloc)
-        if self._left_payload is not None and self._left_len > 0:
-            mv = self._left_payload
-            take = n if n <= self._left_len else self._left_len
-            memcpy(dst + 0, &mv[self._left_off], <size_t>take)
-            self._left_off += take
-            self._left_len -= take
-            if self._left_len == 0:
-                self._left_payload = None
-                self._left_off = 0
-            off += take
-
-        # Pull frames until exactly n bytes are filled
-        while off < n:
-            if self._aborted:
-                raise RuntimeError("PacketReader is aborted")
-            # Blocks in C until a frame arrives (your ring handles backoff/sleep)
-            payload = self._ring.pop_frame_wait(100)
-            if payload is None:
-                continue  # still empty; keep waiting in Cython (no Python allocations)
-            mv = payload
-            plen = mv.shape[0]
-            take = n - off
-            if plen <= take:
-                memcpy(dst + off, &mv[0], <size_t>plen)
-                off += plen
-            else:
-                memcpy(dst + off, &mv[0], <size_t>take)
-                # Cache leftover slice for next call (no bytearray.extend/del)
-                self._left_payload = payload
-                self._left_off = take
-                self._left_len = plen - take
-                off = n
-
-    cdef bytearray _read_one_packet_bytes(self):
-        # 1. Read just the SystemHeader (small scratch on stack, one copy)
-        from opencis.cxl.transport.packet_structs import SystemHeader
-        from opencis.cxl.transport.common import BasePacket
-        cdef Py_ssize_t hdr_size = SystemHeader.get_size()
-        cdef unsigned char hdr_buf[64]  # ensure >= max SystemHeader size
-        if hdr_size > 64:
-            raise RuntimeError("SystemHeader too large for scratch buffer")
-        self._readinto_exactly(hdr_buf, hdr_size)
-
-        # 2. Compute remaining payload length using existing Python parser (small cost)
-        cdef object hdr_py = PyBytes_FromStringAndSize(<char*>hdr_buf, hdr_size)
-        cdef object base_header = BasePacket(hdr_py)
-        cdef Py_ssize_t remaining = base_header.system_header.payload_length - len(base_header)
+        cdef uint16_t hdr_bytes = (<uint16_t*>self._packet_buffer)[0]
+        cdef Py_ssize_t total_len = <Py_ssize_t>((hdr_bytes >> 4) & 0x0FFF)
+        cdef Py_ssize_t remaining = total_len - hdr_size
         if remaining < 0:
             raise RuntimeError("remaining length is less than 0")
 
-        # 3. Allocate final buffer exactly once; copy header + read the rest directly
-        cdef Py_ssize_t total = hdr_size + remaining
-        cdef bytearray ba = bytearray(total)
-        cdef unsigned char[::1] mv = ba
-        memcpy(&mv[0], hdr_buf, <size_t>hdr_size)
-        if remaining:
-            self._readinto_exactly(&mv[hdr_size], remaining)
-        return ba
+        # Read the remaining data directly into the buffer
+        self._read_exactly(&self._packet_buffer[hdr_size], remaining)
+        
+        return total_len
 
     cpdef object get_packet(self):
         # Build packet view and pick concrete class
@@ -111,75 +59,76 @@ cdef class ShmPacketReader:
         from opencis.cxl.cci.common import CCI_FM_API_COMMAND_OPCODE
         from opencis.cxl.transport.sideband_packets import BaseSidebandPacket, SidebandConnectionRequestPacket
 
-        payload = self._read_one_packet_bytes()
-        base = BasePacket(payload)
+        packet_length = self._read_one_packet_bytes()
+        base = BasePacket(self._packet_buffer[:packet_length])
+
         if base.is_cxl_io():
-            b = CxlIoBasePacket(payload)
+            b = CxlIoBasePacket(self._packet_buffer[:packet_length])
             if b.is_cfg_read():
-                return CxlIoCfgRdPacket(payload)
+                return CxlIoCfgRdPacket(self._packet_buffer[:packet_length])
             elif b.is_cfg_write():
-                return CxlIoCfgWrPacket(payload)
+                return CxlIoCfgWrPacket(self._packet_buffer[:packet_length])
             elif b.is_mem_read():
-                return CxlIoMemRdPacket(payload)
+                return CxlIoMemRdPacket(self._packet_buffer[:packet_length])
             elif b.is_mem_write():
-                return CxlIoMemWrPacket(payload)
+                return CxlIoMemWrPacket(self._packet_buffer[:packet_length])
             elif b.is_cpl() or b.is_cpld():
-                return CxlIoCompletionPacket(payload)
+                return CxlIoCompletionPacket(self._packet_buffer[:packet_length])
             raise RuntimeError(f"Unsupported CXL.IO protocol {b.cxl_io_header.fmt_type}")
         elif base.is_cxl_mem():
-            m = CxlMemBasePacket(payload)
+            m = CxlMemBasePacket(self._packet_buffer[:packet_length])
             if m.is_m2sreq():
-                return CxlMemM2SReqPacket(payload)
+                return CxlMemM2SReqPacket(self._packet_buffer[:packet_length])
             elif m.is_m2srwd():
-                return CxlMemM2SRwDPacket(payload)
+                return CxlMemM2SRwDPacket(self._packet_buffer[:packet_length])
             elif m.is_m2sbirsp():
-                return CxlMemM2SBIRspPacket(payload)
+                return CxlMemM2SBIRspPacket(self._packet_buffer[:packet_length])
             elif m.is_s2mbisnp():
-                return CxlMemS2MBISnpPacket(payload)
+                return CxlMemS2MBISnpPacket(self._packet_buffer[:packet_length])
             elif m.is_s2mndr():
-                return CxlMemS2MNDRPacket(payload)
+                return CxlMemS2MNDRPacket(self._packet_buffer[:packet_length])
             elif m.is_s2mdrs():
-                return CxlMemS2MDRSPacket(payload)
+                return CxlMemS2MDRSPacket(self._packet_buffer[:packet_length])
             raise RuntimeError(f"Unsupported CXL.MEM message class: {m.cxl_mem_header.msg_class}")
         elif base.is_cxl_cache():
-            c = CxlCacheBasePacket(payload)
+            c = CxlCacheBasePacket(self._packet_buffer[:packet_length])
             if c.is_d2hreq():
-                return CxlCacheCacheD2HReqPacket(payload)
+                return CxlCacheCacheD2HReqPacket(self._packet_buffer[:packet_length])
             elif c.is_d2hrsp():
-                return CxlCacheCacheD2HRspPacket(payload)
+                return CxlCacheCacheD2HRspPacket(self._packet_buffer[:packet_length])
             elif c.is_d2hdata():
-                return CxlCacheCacheD2HDataPacket(payload)
+                return CxlCacheCacheD2HDataPacket(self._packet_buffer[:packet_length])
             elif c.is_h2dreq():
-                return CxlCacheCacheH2DReqPacket(payload)
+                return CxlCacheCacheH2DReqPacket(self._packet_buffer[:packet_length])
             elif c.is_h2drsp():
-                return CxlCacheCacheH2DRspPacket(payload)
+                return CxlCacheCacheH2DRspPacket(self._packet_buffer[:packet_length])
             elif c.is_h2ddata():
-                return CxlCacheCacheH2DDataPacket(payload)
+                return CxlCacheCacheH2DDataPacket(self._packet_buffer[:packet_length])
             raise RuntimeError(f"Unsupported CXL.CACHE message class: {c.cxl_cache_header.msg_class}")
         elif base.is_sideband():
-            sb = BaseSidebandPacket(payload)
+            sb = BaseSidebandPacket(self._packet_buffer[:packet_length])
             if sb.is_connection_request():
-                return SidebandConnectionRequestPacket(payload)
+                return SidebandConnectionRequestPacket(self._packet_buffer[:packet_length])
             return sb
         elif base.is_cci():
-            cb = CciBasePacket(payload)
+            cb = CciBasePacket(self._packet_buffer[:packet_length])
             if cb.is_req():
-                r = CciRequestPacket(payload)
+                r = CciRequestPacket(self._packet_buffer[:packet_length])
                 if r.get_command_opcode() == CCI_FM_API_COMMAND_OPCODE.GET_LD_INFO:
-                    return GetLdInfoResponsePacket(payload)
+                    return GetLdInfoResponsePacket(self._packet_buffer[:packet_length])
                 elif r.get_command_opcode() == CCI_FM_API_COMMAND_OPCODE.GET_LD_ALLOCATIONS:
-                    return GetLdAllocationsResponsePacket(payload)
+                    return GetLdAllocationsResponsePacket(self._packet_buffer[:packet_length])
                 elif r.get_command_opcode() == CCI_FM_API_COMMAND_OPCODE.SET_LD_ALLOCATIONS:
-                    return SetLdAllocationsResponsePacket(payload)
+                    return SetLdAllocationsResponsePacket(self._packet_buffer[:packet_length])
                 raise RuntimeError("Unsupported CCI packet")
             elif cb.is_rsp():
-                rsp = CciResponsePacket(payload)
+                rsp = CciResponsePacket(self._packet_buffer[:packet_length])
                 if rsp.get_command_opcode() == CCI_FM_API_COMMAND_OPCODE.GET_LD_INFO:
-                    return GetLdInfoResponsePacket(payload)
+                    return GetLdInfoResponsePacket(self._packet_buffer[:packet_length])
                 elif rsp.get_command_opcode() == CCI_FM_API_COMMAND_OPCODE.GET_LD_ALLOCATIONS:
-                    return GetLdAllocationsResponsePacket(payload)
+                    return GetLdAllocationsResponsePacket(self._packet_buffer[:packet_length])
                 elif rsp.get_command_opcode() == CCI_FM_API_COMMAND_OPCODE.SET_LD_ALLOCATIONS:
-                    return SetLdAllocationsResponsePacket(payload)
+                    return SetLdAllocationsResponsePacket(self._packet_buffer[:packet_length])
                 raise RuntimeError("Unsupported CCI packet")
             raise RuntimeError("Unsupported CCI packet")
-        raise RuntimeError("Unsupported packet") 
+        raise RuntimeError("Unsupported packet")

@@ -44,6 +44,12 @@ ext_modules = cythonize(
             extra_compile_args=common_cflags,
             extra_link_args=[],
         ),
+        Extension(
+            "shm_stream_c",
+            [os.path.join(here, "shm_stream_c.pyx")],
+            extra_compile_args=common_cflags,
+            extra_link_args=[],
+        ),
     ],
     gdb_debug=False,
     compiler_directives={

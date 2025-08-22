@@ -78,7 +78,7 @@ class SwitchConnectionManager(RunnableComponent):
 
     async def _wait_for_connection_request(self, reader: ShmStreamReader) -> int:
         logger.debug(self._create_message("Waiting for a connection request (shm)"))
-        pr = _prc.ShmPacketReader(getattr(reader, "_ep")._in_ring)
+        pr = _prc.ShmPacketReader(reader)
         packet = pr.get_packet()
         logger.debug(self._create_message("Received a packet"))
         if packet.system_header.payload_type != SYSTEM_PAYLOAD_TYPE.SIDEBAND:

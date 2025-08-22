@@ -14,6 +14,7 @@ cdef extern from "time.h":
         long tv_nsec
     int nanosleep(timespec* req, timespec* rem) nogil
 
+
 cdef class ShmRing:
     cdef object mm
     cdef uint8_t[:] buf
@@ -259,4 +260,4 @@ cdef class ShmRing:
             finally:
                 self.mm.close()
                 self.mm = None
-                self.buf = None 
+                self.buf = None

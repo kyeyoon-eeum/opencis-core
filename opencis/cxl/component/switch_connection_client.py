@@ -102,7 +102,7 @@ class SwitchConnectionClient(RunnableComponent):
         writer.write(bytes(sb_req))
         await writer.drain()
         logger.info(self._create_message("Sent CONNECTION_REQUEST; waiting for ACCEPT"))
-        pr = _prc.ShmPacketReader(getattr(reader, "_ep")._in_ring)
+        pr = _prc.ShmPacketReader(reader)
         packet = await asyncio.to_thread(pr.get_packet)
         if packet.system_header.payload_type != SYSTEM_PAYLOAD_TYPE.SIDEBAND:
             raise Exception(self._create_message("Handshake Error: non-sideband"))

@@ -82,11 +82,7 @@ class CxlPacketProcessor(RunnableComponent):
         if not isinstance(reader, ShmStreamReader):
             raise TypeError("CxlPacketProcessor requires ShmStreamReader")
         # Construct Cython ShmPacketReader directly
-        ep = getattr(reader, "_ep", None)
-        if ep is None or getattr(ep, "_in_ring", None) is None:
-            raise TypeError("ShmStreamReader is missing underlying ring")
-        ring = ep._in_ring
-        self._reader = _prc.ShmPacketReader(ring)
+        self._reader = _prc.ShmPacketReader(reader)
         self._writer = writer
         self._tlp_table: Dict[int, CXL_IO_FIFO_TYPE] = {}
         self._cxl_connection = cxl_connection
