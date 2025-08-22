@@ -21,6 +21,7 @@ from opencis.util.logger import logger
 
 # from opencis.util.server import ServerComponent
 from opencis.cxl.transport.shm_stream import ShmStreamPair
+import os
 from opencis.cxl.transport.stream_types import StreamReaderLike, StreamWriterLike
 
 
@@ -184,7 +185,7 @@ class ShortMsgConn(RunnableComponent):
         await writer.drain()
 
     async def start_connection(self):
-        logger.info(self._create_message("ShortMsg client starting SHM connection"))
+        logger.info(self._create_message("ShortMsg client starting shm connection"))
         shm = ShmStreamPair(port_index=self._port, is_server=False, namespace="shortmsg")
         reader, writer = shm.reader, shm.writer
         writer.write(int.to_bytes(self._device_id, 16, "little"))
@@ -208,7 +209,7 @@ class ShortMsgConn(RunnableComponent):
                 await self._end_signal.wait()
                 return
             if self._server:
-                logger.info(self._create_message("ShortMsg server starting SHM listener"))
+                logger.info(self._create_message("ShortMsg server starting shm listener"))
                 shm = ShmStreamPair(port_index=self._port, is_server=True, namespace="shortmsg")
                 reader, writer = shm.reader, shm.writer
                 self._run_status = True

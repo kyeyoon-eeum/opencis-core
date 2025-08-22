@@ -28,6 +28,7 @@ from opencis.util.component import RunnableComponent
 from opencis.util.logger import logger
 from opencis.util.server import ServerComponent
 from opencis.cxl.transport.shm_stream import ShmStreamPair, ShmStreamReader
+import os
 
 try:
     from opencis.cxl.transport import packet_reader_c as _prc
@@ -134,7 +135,8 @@ class SwitchConnectionManager(RunnableComponent):
         self._ports[port_index].packet_processor = None
 
     async def _run(self):
-        logger.info(self._create_message("SHM mode enabled for SwitchConnectionManager"))
+        transport = "shm"
+        logger.info(self._create_message("Transport mode: shm"))
         # Accept and run per-port concurrently
         port_tasks = []
         for idx, _ in enumerate(self._ports):

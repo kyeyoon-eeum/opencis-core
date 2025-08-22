@@ -32,6 +32,8 @@ class ShmEndpoint:
             # Server creates rings
             self._in_ring.create(c2s, DEFAULT_CAPACITY, DEFAULT_ELEM_SIZE)
             self._out_ring.create(s2c, DEFAULT_CAPACITY, DEFAULT_ELEM_SIZE)
+            # Server binds notify socket for inbound ring
+            self._in_ring.setup_unix_notify(True)
             logger.debug(f"[ShmEndpoint] created rings: in={c2s}, out={s2c}")
         else:
             # Client opens existing rings (single try; caller should retry asynchronously if needed)
@@ -39,6 +41,8 @@ class ShmEndpoint:
             try:
                 self._in_ring.open(s2c)
                 self._out_ring.open(c2s)
+                # Client configures TX notify to server's inbound ring path
+                self._out_ring.setup_unix_notify(False)
                 logger.debug("[ShmEndpoint] opened rings successfully")
             except Exception as e:
                 logger.debug("[ShmEndpoint] rings not ready yet")
@@ -46,10 +50,18 @@ class ShmEndpoint:
 
     def close(self):
         try:
+            try:
+                self._in_ring.teardown_unix_notify()
+            except Exception:
+                pass
             self._in_ring.close()
         except Exception:
             pass
         try:
+            try:
+                self._out_ring.teardown_unix_notify()
+            except Exception:
+                pass
             self._out_ring.close()
         except Exception:
             pass

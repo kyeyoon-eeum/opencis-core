@@ -8,6 +8,27 @@ from libc.stdint cimport uint8_t
 from cpython.bytes cimport PyBytes_FromStringAndSize
 from libc.string cimport memcpy
 
+cdef extern from "sys/socket.h":
+    cdef int AF_UNIX
+    cdef int SOCK_DGRAM
+    int socket(int domain, int type, int protocol)
+    int bind(int sockfd, const void* addr, unsigned int addrlen)
+    ssize_t sendto(int sockfd, const void* buf, size_t len, int flags, const void* dest_addr, unsigned int addrlen) nogil
+    ssize_t recv(int sockfd, void* buf, size_t len, int flags) nogil
+
+cdef extern from "sys/un.h":
+    ctypedef unsigned short sa_family_t
+    cdef struct sockaddr_un:
+        sa_family_t sun_family
+        char sun_path[108]
+
+cdef extern from "unistd.h":
+    int close(int fd)
+
+cdef extern from "errno.h":
+    int errno
+    int EINTR
+
 cdef extern from "time.h":
     cdef struct timespec:
         long tv_sec
@@ -22,6 +43,10 @@ cdef class ShmRing:
     cdef size_t elem_size
     cdef size_t region_size
     cdef str path
+    cdef int notify_fd_rx
+    cdef int notify_fd_tx
+    cdef bint notify_is_server
+    cdef object notify_path  # python str
 
     def __cinit__(self):
         self.mm = None
@@ -30,6 +55,10 @@ cdef class ShmRing:
         self.elem_size = 0
         self.region_size = 0
         self.path = ""
+        self.notify_fd_rx = -1
+        self.notify_fd_tx = -1
+        self.notify_is_server = False
+        self.notify_path = None
 
     def create(self, str path, size_t capacity, size_t elem_size):
         """Create or truncate a shared ring buffer file and mmap it."""
@@ -65,6 +94,44 @@ cdef class ShmRing:
         self.elem_size = <size_t> self._read_u64(8)
         self.region_size = <size_t> os.path.getsize(path)
 
+    cpdef void setup_unix_notify(self, bint is_server):
+        """
+        Configure a UNIX DGRAM socket used only to wake a peer when an empty ring becomes non-empty.
+        Server binds to path ":.notify"; client sends datagrams to that path.
+        """
+        if not self.path:
+            return
+        self.notify_is_server = is_server
+        cdef str npath = self.path + ".notify"
+        self.notify_path = npath
+        cdef int fd = socket(AF_UNIX, SOCK_DGRAM, 0)
+        cdef sockaddr_un addr
+        cdef bytes pb
+        cdef Py_ssize_t l
+        if fd < 0:
+            return
+        if is_server:
+            try:
+                os.unlink(npath)
+            except Exception:
+                pass
+            addr.sun_family = <sa_family_t>AF_UNIX
+            pb = npath.encode("utf-8")
+            l = pb.__len__()
+            if l > 107:
+                l = 107
+            # fill sun_path with zeros then copy
+            for i in range(108):
+                addr.sun_path[i] = '\x00'
+            for i in range(l):
+                addr.sun_path[i] = <char>pb[i]
+            if bind(fd, <const void*>&addr, <unsigned int>(sizeof(sockaddr_un))) != 0:
+                close(fd)
+                return
+            self.notify_fd_rx = fd
+        else:
+            self.notify_fd_tx = fd
+
     cdef inline unsigned long long _read_u64(self, size_t off):
         return (<unsigned long long*> (&self.buf[0] + off))[0]
 
@@ -91,6 +158,11 @@ cdef class ShmRing:
             raise ValueError("Invalid element size")
         cdef unsigned long long head = self._read_u64(16)
         cdef unsigned long long tail = self._read_u64(24)
+        cdef bint was_empty = (head == tail)
+        cdef sockaddr_un addr
+        cdef bytes pb
+        cdef Py_ssize_t l
+        cdef char b
         if head - tail >= self.capacity:
             return False
         cdef unsigned long long idx = head % self.capacity
@@ -98,6 +170,19 @@ cdef class ShmRing:
         # Write payload only (no zero-padding)
         self.mm[off:off + data_len] = data
         self._write_u64(16, head + 1)
+        if was_empty and self.notify_fd_tx >= 0 and self.notify_path is not None:
+            addr.sun_family = <sa_family_t>AF_UNIX
+            pb = (<str>self.notify_path).encode("utf-8")
+            l = pb.__len__()
+            if l > 107:
+                l = 107
+            for i in range(108):
+                addr.sun_path[i] = '\x00'
+            for i in range(l):
+                addr.sun_path[i] = <char>pb[i]
+            b = '\x01'
+            with nogil:
+                sendto(self.notify_fd_tx, &b, 1, 0, <const void*>&addr, <unsigned int>(sizeof(sockaddr_un)))
         return True
 
     def try_pop(self):
@@ -123,6 +208,11 @@ cdef class ShmRing:
             raise ValueError("Frame too large for element")
         cdef unsigned long long head = self._read_u64(16)
         cdef unsigned long long tail = self._read_u64(24)
+        cdef bint was_empty = (head == tail)
+        cdef sockaddr_un addr2
+        cdef bytes pb2
+        cdef Py_ssize_t l2
+        cdef char one
         if head - tail >= self.capacity:
             return False
         cdef unsigned long long idx = head % self.capacity
@@ -132,6 +222,19 @@ cdef class ShmRing:
         off += 4
         self.mm[off:off + payload_len] = payload
         self._write_u64(16, head + 1)
+        if was_empty and self.notify_fd_tx >= 0 and self.notify_path is not None:
+            addr2.sun_family = <sa_family_t>AF_UNIX
+            pb2 = (<str>self.notify_path).encode("utf-8")
+            l2 = pb2.__len__()
+            if l2 > 107:
+                l2 = 107
+            for i in range(108):
+                addr2.sun_path[i] = '\x00'
+            for i in range(l2):
+                addr2.sun_path[i] = <char>pb2[i]
+            one = '\x01'
+            with nogil:
+                sendto(self.notify_fd_tx, &one, 1, 0, <const void*>&addr2, <unsigned int>(sizeof(sockaddr_un)))
         return True
 
     def try_pop_frame(self):
@@ -214,6 +317,7 @@ cdef class ShmRing:
         cdef unsigned int step = 100  # 100 ns minimal backoff
         cdef timespec ts
         cdef unsigned int payload_len
+        cdef char sink
         while True:
             head = self._read_u64(16)
             tail = self._read_u64(24)
@@ -228,6 +332,14 @@ cdef class ShmRing:
                 mv = self.buf[off:off + payload_len]
                 self._write_u64(24, tail + 1)
                 return mv
+            # If notify socket is configured, block until a wake arrives
+            if self.notify_fd_rx >= 0:
+                with nogil:
+                    while recv(self.notify_fd_rx, &sink, 1, 0) < 0:
+                        if errno != EINTR:
+                            break
+                # loop to re-check ring
+                continue
             if slept_ns >= max_sleep_ns:
                 return None
             ts.tv_sec = 0
@@ -261,3 +373,25 @@ cdef class ShmRing:
                 self.mm.close()
                 self.mm = None
                 self.buf = None
+
+    cpdef str get_path(self):
+        return self.path
+
+    cpdef void teardown_unix_notify(self):
+        if self.notify_fd_rx >= 0:
+            try:
+                close(self.notify_fd_rx)
+            except Exception:
+                pass
+            self.notify_fd_rx = -1
+            if self.notify_is_server and self.notify_path is not None:
+                try:
+                    os.unlink(<str>self.notify_path)
+                except Exception:
+                    pass
+        if self.notify_fd_tx >= 0:
+            try:
+                close(self.notify_fd_tx)
+            except Exception:
+                pass
+            self.notify_fd_tx = -1

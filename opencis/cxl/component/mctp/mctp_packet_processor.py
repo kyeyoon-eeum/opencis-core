@@ -64,8 +64,12 @@ class MctpPacketProcessor(RunnableComponent):
             packet = await self._outgoing.get()
             if packet is None:
                 break
-            self._writer.write(bytes(packet))
-            await self._writer.drain()
+            try:
+                self._writer.write(bytes(packet))
+                await self._writer.drain()
+            except Exception as e:
+                logger.debug(self._create_message(str(e)))
+                break
         logger.debug(self._create_message("Stopped outgoing packet processor"))
 
     async def _run(self):

@@ -14,6 +14,7 @@ from opencis.cxl.component.mctp.mctp_packet_processor import (
 from opencis.util.component import RunnableComponent
 from opencis.util.logger import logger
 from opencis.cxl.transport.shm_stream import ShmStreamPair
+import os
 
 
 class MctpConnectionClient(RunnableComponent):
@@ -34,7 +35,7 @@ class MctpConnectionClient(RunnableComponent):
         self._running = False
 
     async def _connect(self):
-        # Use shared memory channel with fixed logical port index 0 for MCTP
+        # Force SHM for MCTP to ensure stable connection
         shm = ShmStreamPair(port_index=0, is_server=False, namespace="mctp")
         return (shm.reader, shm.writer)
 
@@ -49,7 +50,7 @@ class MctpConnectionClient(RunnableComponent):
         while self._running:
             try:
                 (reader, writer) = await self._connect()
-                logger.info(self._create_message("MCTP client connected via SHM"))
+                logger.info(self._create_message("MCTP client connected"))
                 self._packet_processor = MctpPacketProcessor(
                     reader,
                     writer,

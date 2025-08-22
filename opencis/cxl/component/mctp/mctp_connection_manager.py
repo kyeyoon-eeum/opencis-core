@@ -17,6 +17,7 @@ from opencis.cxl.component.mctp.mctp_packet_processor import (
 )
 from opencis.util.component import RunnableComponent
 from opencis.cxl.transport.shm_stream import ShmStreamPair
+import os
 from opencis.cxl.transport.stream_types import StreamReaderLike, StreamWriterLike
 
 # pylint: disable=duplicate-code
@@ -41,17 +42,19 @@ class MctpConnectionManager(RunnableComponent):
         self._port = port
         self._connection_timeout_ms = connection_timeout_ms
         self._switch_port = MctpPort()
-        # No TCP server; use shared memory stream pair at logical port 0
-        self._shm_pair = ShmStreamPair(port_index=0, is_server=True, namespace="mctp")
+        # No TCP server; use shared memory/UNIX stream pair at logical port 0
+        self._shm_pair = None
         self._server_component = None
 
     async def _run(self):
-        logger.info(self._create_message("MCTP SHM server initializing"))
+        # Force SHM for MCTP to ensure stable connection
+        logger.info(self._create_message("MCTP shm server initializing"))
+        self._shm_pair = ShmStreamPair(port_index=0, is_server=True, namespace="mctp")
         reader = self._shm_pair.reader
         writer = self._shm_pair.writer
         self._switch_port.connected = True
         await self._change_status_to_running()
-        logger.info(self._create_message("MCTP SHM server RUNNING; starting processor"))
+        logger.info(self._create_message("MCTP server RUNNING; starting processor"))
         await self._start_packet_processor(reader, writer)
 
     async def _stop_callback(self):

@@ -81,8 +81,8 @@ class CxlPacketProcessor(RunnableComponent):
         super().__init__(label)
         if not isinstance(reader, ShmStreamReader):
             raise TypeError("CxlPacketProcessor requires ShmStreamReader")
-        # Construct Cython ShmPacketReader directly
         self._reader = _prc.ShmPacketReader(reader)
+        self._reader_is_async = False
         self._writer = writer
         self._tlp_table: Dict[int, CXL_IO_FIFO_TYPE] = {}
         self._cxl_connection = cxl_connection
