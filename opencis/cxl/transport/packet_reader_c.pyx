@@ -49,7 +49,7 @@ cdef class ShmPacketReader:
             if self._aborted:
                 raise RuntimeError("PacketReader is aborted")
             # Blocks in C until a frame arrives (your ring handles backoff/sleep)
-            payload = self._ring.pop_frame_wait(1000000)
+            payload = self._ring.pop_frame_wait(100)
             if payload is None:
                 continue  # still empty; keep waiting in Cython (no Python allocations)
             mv = payload

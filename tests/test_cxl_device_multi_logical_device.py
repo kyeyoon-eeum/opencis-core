@@ -106,9 +106,7 @@ async def test_multi_logical_device_ld_id():
         assert packet.tlp_prefix.ld_id == target_ld_id
         assert is_cxl_io_completion_status_sc(packet)
 
-    async def test_config_space(
-        target_ld_id: int, reader, writer
-    ):
+    async def test_config_space(target_ld_id: int, reader, writer):
         # pylint: disable=duplicate-code
         packet_reader = PacketReader(reader, label="test_config_space")
         packet_writer = writer

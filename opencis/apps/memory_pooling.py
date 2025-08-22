@@ -321,6 +321,7 @@ async def sample_app(keepalive: bool, **kwargs):
     logger.info(f"0x{val:X}")
 
     BYTE_COUNT = 0x1000
+    logger.info("PERF_START")
     start = time.time()
     for offset in range(0, BYTE_COUNT, 0x40):
         await cpu.store(0x100000000000 + offset, 0x40, 0xDEADBEEF)
@@ -336,6 +337,7 @@ async def sample_app(keepalive: bool, **kwargs):
     rd_time = end - start
     rd_throughput = (BYTE_COUNT / (1024 * 1024)) / rd_time
     logger.info(f"Read RESULTS: {rd_throughput} MB/s")
+    logger.info("PERF_END")
 
     if keepalive:
         await asyncio.Event().wait()

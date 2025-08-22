@@ -65,18 +65,10 @@ cdef class ShmRing:
         self.region_size = <size_t> os.path.getsize(path)
 
     cdef inline unsigned long long _read_u64(self, size_t off):
-        cdef unsigned long long result = 0
-        cdef int i
-        for i in range(7, -1, -1):
-            result = (result << 8) | self.buf[off + i]
-        return result
+        return (<unsigned long long*> (&self.buf[0] + off))[0]
 
-    cdef inline void _write_u64(self, size_t off, unsigned long long val):
-        cdef size_t i
-        cdef unsigned long long v = val
-        for i in range(8):
-            self.buf[off + i] = <uint8_t> (v & 0xFF)
-            v >>= 8
+    cdef inline void _write_u64(self, size_t off, unsigned long long v):
+        (<unsigned long long*> (&self.buf[0] + off))[0] = v
 
     cdef inline unsigned int _read_u32(self, size_t off):
         cdef unsigned int result = 0

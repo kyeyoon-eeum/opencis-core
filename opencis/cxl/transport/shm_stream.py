@@ -5,23 +5,20 @@ Each ring element is a frame: [len:4][payload:<=max_payload][padding].
 """
 
 import asyncio
-import os
-import struct
-from typing import Optional
 from collections import deque
 
 from opencis.cxl.transport import shm_ring as _shm
 from opencis.util.logger import logger
 
 
-DEFAULT_ELEM_SIZE = 65536
-DEFAULT_CAPACITY = 256
+DEFAULT_ELEM_SIZE = 256
+DEFAULT_CAPACITY = 8192
 HEADER_SIZE = 4
 MAX_PAYLOAD = DEFAULT_ELEM_SIZE - HEADER_SIZE
 
 
 def _paths_for_port(port_index: int, namespace: str):
-    base = f"/tmp/opencis_shm_{namespace}_port{port_index}"
+    base = f"/dev/shm/opencis_shm_{namespace}_port{port_index}"
     return base + ".c2s", base + ".s2c"
 
 
