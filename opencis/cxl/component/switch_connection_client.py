@@ -103,12 +103,14 @@ class SwitchConnectionClient(RunnableComponent):
         await writer.drain()
         logger.info(self._create_message("Sent CONNECTION_REQUEST; waiting for ACCEPT"))
         pr = _prc.ShmPacketReader(reader)
-        packet = await asyncio.to_thread(pr.get_packet)
-        if packet.system_header.payload_type != SYSTEM_PAYLOAD_TYPE.SIDEBAND:
-            raise Exception(self._create_message("Handshake Error: non-sideband"))
-        base_sideband_packet = cast(BaseSidebandPacket, packet)
-        if base_sideband_packet.sideband_header.type != SIDEBAND_TYPES.CONNECTION_ACCEPT:
-            raise Exception(self._create_message("Handshake Error: not accepted"))
+        # Read until we get ACCEPT; ignore any out-of-order frames
+        while True:
+            packet = await asyncio.to_thread(pr.get_packet)
+            if packet.system_header.payload_type != SYSTEM_PAYLOAD_TYPE.SIDEBAND:
+                continue
+            base_sideband_packet = cast(BaseSidebandPacket, packet)
+            if base_sideband_packet.sideband_header.type == SIDEBAND_TYPES.CONNECTION_ACCEPT:
+                break
         logger.info(self._create_message("Handshake accepted by server"))
 
         logger.info(self._create_message("Connected to switch using shm"))

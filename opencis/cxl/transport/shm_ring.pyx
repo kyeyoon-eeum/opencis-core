@@ -4,7 +4,7 @@
 import os
 from libc.stddef cimport size_t
 from libc.stdint cimport uint8_t
-from cpython.bytes cimport PyBytes_FromStringAndSize
+from cpython.bytes cimport PyBytes_FromStringAndSize, PyBytes_AsString
 from libc.string cimport memcpy
 from libc.stdlib cimport malloc, free
 
@@ -44,15 +44,6 @@ cdef extern from "sys/mman.h":
 
 
 cdef class ShmRing:
-    cdef unsigned char* base
-    cdef size_t capacity
-    cdef size_t elem_size
-    cdef size_t region_size
-    cdef str path
-    cdef int notify_fd_rx
-    cdef int notify_fd_tx
-    cdef bint notify_is_server
-    cdef object notify_path  # python str
 
     def __cinit__(self):
         self.base = NULL
@@ -176,10 +167,9 @@ cdef class ShmRing:
             return False
         cdef unsigned long long idx = head % self.capacity
         cdef size_t off = 32 + idx * self.elem_size
-        # Write payload only (no zero-padding) without PyBytes_AS_STRING
-        cdef Py_ssize_t i
-        for i in range(data_len):
-            self.base[off + i] = data[i]
+        # Write payload only (no zero-padding)
+        cdef const char* src = PyBytes_AsString(data)
+        memcpy(<void*>(self.base + off), <const void*>src, <size_t>data_len)
         self._write_u64(16, head + 1)
         if was_empty and self.notify_fd_tx >= 0 and self.notify_path is not None:
             addr.sun_family = <sa_family_t>AF_UNIX
@@ -231,9 +221,48 @@ cdef class ShmRing:
         # write header and payload
         self._write_u32(off, <unsigned int> payload_len)
         off += 4
-        cdef Py_ssize_t i
-        for i in range(payload_len):
-            self.base[off + i] = payload[i]
+        cdef const char* src2 = PyBytes_AsString(payload)
+        memcpy(<void*>(self.base + off), <const void*>src2, <size_t>payload_len)
+        self._write_u64(16, head + 1)
+        if was_empty and self.notify_fd_tx >= 0 and self.notify_path is not None:
+            addr2.sun_family = <sa_family_t>AF_UNIX
+            pb2 = (<str>self.notify_path).encode("utf-8")
+            l2 = pb2.__len__()
+            if l2 > 107:
+                l2 = 107
+            for i in range(108):
+                addr2.sun_path[i] = '\x00'
+            for i in range(l2):
+                addr2.sun_path[i] = <char>pb2[i]
+            one = '\x01'
+            with nogil:
+                sendto(self.notify_fd_tx, &one, 1, 0, <const void*>(&addr2), <unsigned int>(sizeof(sockaddr_un)))
+        return True
+
+    cpdef bint try_push_frame_from(self, const unsigned char* src, size_t payload_len):
+        """Non-blocking push (header + payload) directly from a raw pointer.
+        Returns True on success, False if full.
+        """
+        if self.base == NULL:
+            raise RuntimeError("ShmRing not initialized")
+        if payload_len > self.elem_size - 4:
+            raise ValueError("Frame too large for element")
+        cdef unsigned long long head = self._read_u64(16)
+        cdef unsigned long long tail = self._read_u64(24)
+        cdef bint was_empty = (head == tail)
+        cdef sockaddr_un addr2
+        cdef bytes pb2
+        cdef Py_ssize_t l2
+        cdef char one
+        if head - tail >= self.capacity:
+            return False
+        cdef unsigned long long idx = head % self.capacity
+        cdef size_t off = 32 + idx * self.elem_size
+        # header
+        self._write_u32(off, <unsigned int> payload_len)
+        off += 4
+        # payload (raw-pointer memcpy)
+        memcpy(<void*>(self.base + off), <const void*>src, <size_t>payload_len)
         self._write_u64(16, head + 1)
         if was_empty and self.notify_fd_tx >= 0 and self.notify_path is not None:
             addr2.sun_family = <sa_family_t>AF_UNIX
@@ -269,6 +298,28 @@ cdef class ShmRing:
         mv = PyBytes_FromStringAndSize(<char*>(self.base + off), payload_len)
         self._write_u64(24, tail + 1)
         return mv
+
+    cpdef Py_ssize_t try_pop_frame_into(self, unsigned char* dst, size_t dst_capacity):
+        """Non-blocking pop of a frame copied directly into dst.
+        Returns payload length (>0) on success, 0 if empty, or -1 if corrupted/invalid.
+        """
+        if self.base == NULL:
+            raise RuntimeError("ShmRing not initialized")
+        cdef unsigned long long head = self._read_u64(16)
+        cdef unsigned long long tail = self._read_u64(24)
+        if tail >= head:
+            return 0
+        cdef unsigned long long idx = tail % self.capacity
+        cdef size_t off = 32 + idx * self.elem_size
+        cdef unsigned int payload_len = self._read_u32(off)
+        if payload_len > self.elem_size - 4 or payload_len > dst_capacity:
+            # drop corrupted or too-large frame
+            self._write_u64(24, tail + 1)
+            return -1
+        off += 4
+        memcpy(<void*>dst, <const void*>(self.base + off), <size_t>payload_len)
+        self._write_u64(24, tail + 1)
+        return <Py_ssize_t>payload_len
 
     cpdef bytes read_up_to(self, size_t max_bytes):
         """Copy whole frames up to max_bytes into a bytes object; returns b"" if none."""
@@ -358,6 +409,51 @@ cdef class ShmRing:
                 continue
             if slept_ns >= max_sleep_ns:
                 return None
+            ts.tv_sec = 0
+            ts.tv_nsec = step
+            with nogil:
+                nanosleep(&ts, <timespec*>0)
+            slept_ns += step
+            if step < 1000000:
+                step <<= 1
+
+    cpdef Py_ssize_t pop_frame_wait_into(self, unsigned char* dst, size_t dst_capacity, unsigned int max_sleep_ns=1000):
+        """Blocking-ish wait up to max_sleep_ns for a frame and copy into dst.
+        Returns payload length (>0) on success, 0 if timed out, or -1 if corrupted/invalid.
+        """
+        if self.base == NULL:
+            raise RuntimeError("ShmRing not initialized")
+        cdef unsigned long long head
+        cdef unsigned long long tail
+        cdef unsigned long long idx
+        cdef size_t off
+        cdef unsigned int slept_ns = 0
+        cdef unsigned int step = 100
+        cdef timespec ts
+        cdef unsigned int payload_len
+        cdef char sink
+        while True:
+            head = self._read_u64(16)
+            tail = self._read_u64(24)
+            if tail < head:
+                idx = tail % self.capacity
+                off = 32 + idx * self.elem_size
+                payload_len = self._read_u32(off)
+                if payload_len > self.elem_size - 4 or payload_len > dst_capacity:
+                    self._write_u64(24, tail + 1)
+                    return -1
+                off += 4
+                memcpy(<void*>dst, <const void*>(self.base + off), <size_t>payload_len)
+                self._write_u64(24, tail + 1)
+                return <Py_ssize_t>payload_len
+            if self.notify_fd_rx >= 0:
+                with nogil:
+                    while recv(self.notify_fd_rx, &sink, 1, 0) < 0:
+                        if errno != EINTR:
+                            break
+                continue
+            if slept_ns >= max_sleep_ns:
+                return 0
             ts.tv_sec = 0
             ts.tv_nsec = step
             with nogil:

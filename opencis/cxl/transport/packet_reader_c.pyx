@@ -5,6 +5,7 @@ from libc.stdint cimport uint16_t
 from shm_stream_c cimport ShmStreamReader
 
 
+
 cdef class ShmPacketReader:
     cdef bint _aborted
     cdef ShmStreamReader _reader
