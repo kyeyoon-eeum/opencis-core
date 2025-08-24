@@ -6,6 +6,8 @@ See LICENSE for details.
 """
 
 from asyncio import create_task, gather
+import asyncio
+import threading
 from typing import Optional, cast, List
 from opencis.util.component import RunnableComponent
 from opencis.cxl.component.mctp.mctp_connection import MctpConnection
@@ -49,6 +51,11 @@ class MctpCciExecutor(RunnableComponent):
         self._cci_executor = CciExecutor(label="MCTP")
         self._switch_connection_manager = switch_connection_manager
         self._downstream_port_connections = {}
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._incoming_thread: threading.Thread | None = None
+        self._incoming_stop = threading.Event()
+        self._outgoing_threads: list[threading.Thread] = []
+        self._outgoing_stop = threading.Event()
 
         for port_index, port_config in enumerate(port_configs):
             if port_config.type == PORT_TYPE.DSP:
@@ -78,18 +85,15 @@ class MctpCciExecutor(RunnableComponent):
         await self._mctp_connection.ep_to_controller.put(response_packet_tmc)
 
     async def _process_incoming_requests(self):
-        logger.debug(self._create_message("Started processing incoming request"))
+        # Async fallback (unused in thread mode)
+        logger.debug(self._create_message("Started processing incoming request (async)"))
         while True:
-            # Wait for incoming packets from the MCTP connection
             packet = await self._mctp_connection.controller_to_ep.get()
             if packet is None:
-                logger.debug(self._create_message("Stopped processing incoming request"))
+                logger.debug(self._create_message("Stopped processing incoming request (async)"))
                 break
-
-            # Unpack
             cci_packet_tmc = cast(CciPayloadPacket, packet)
             port_index = cci_packet_tmc.cci_header.port_index
-
             cci_message = cci_packet_tmc.get_cci_message()
             command_opcode = cci_message.cci_msg_header.command_opcode
             opcodes_for_ld = [
@@ -98,11 +102,8 @@ class MctpCciExecutor(RunnableComponent):
                 CCI_FM_API_COMMAND_OPCODE.SET_LD_ALLOCATIONS,
             ]
             if command_opcode in opcodes_for_ld:
-                # Pass down to MLD
-                # ld_index = cci_packet_tmc.cci_header.port_index
                 message_tag = cci_message.cci_msg_header.message_tag
                 self._message_tag_list[message_tag] = port_index
-
                 packet = None
                 match command_opcode:
                     case CCI_FM_API_COMMAND_OPCODE.GET_LD_INFO:
@@ -113,55 +114,150 @@ class MctpCciExecutor(RunnableComponent):
                         packet = SetLdAllocationsRequestPacket.create_from_cci_message(cci_message)
                     case _:
                         break
-
                 await self._downstream_port_connections[port_index].cci_fifo.host_to_target.put(
                     packet
                 )
             else:
-                # Convert packet to CciRequest and send it to CciExecutor
                 request = self._packet_to_request(cci_message)
                 response = await self._cci_executor.execute_command(request)
                 await self._send_response(response, cci_message.cci_msg_header.message_tag)
 
     async def _process_outcoming_responses(self, downstream_connection: CxlConnection):
-        logger.debug(self._create_message("Started processing outcoming request"))
+        # Async fallback (unused in thread mode)
+        logger.debug(self._create_message("Started processing outcoming request (async)"))
         while True:
-            # Wait for incoming packets from the MCTP connection
             packet = await downstream_connection.cci_fifo.target_to_host.get()
             if packet is None:
-                logger.debug(self._create_message("Stopped processing outcoming request"))
+                logger.debug(self._create_message("Stopped processing outcoming request (async)"))
                 break
-
-            # set LD table
             opcode = packet.get_command_opcode()
             if opcode == CCI_FM_API_COMMAND_OPCODE.SET_LD_ALLOCATIONS:
                 logger.info(self._create_message("switch received SetLdAllocationsResponsePacket"))
                 port_index = self._message_tag_list.get(packet.cci_msg_header.message_tag, None)
                 if port_index is None:
                     raise ValueError("Invalid message tag")
-
             self._message_tag_list.pop(packet.cci_msg_header.message_tag)
-
             cci_packet = packet.get_cci_message()
             cci_packet_tmc = CciPayloadPacket.create(cci_packet)
-
             await self._mctp_connection.ep_to_controller.put(cci_packet_tmc)
 
+    def _incoming_worker(self) -> None:
+        assert self._loop is not None
+        logger.debug(self._create_message("Started processing incoming request (thread)"))
+        while not self._incoming_stop.is_set():
+            packet = asyncio.run_coroutine_threadsafe(
+                self._mctp_connection.controller_to_ep.get(), self._loop
+            ).result()
+            if packet is None:
+                break
+            cci_packet_tmc = cast(CciPayloadPacket, packet)
+            port_index = cci_packet_tmc.cci_header.port_index
+            cci_message = cci_packet_tmc.get_cci_message()
+            command_opcode = cci_message.cci_msg_header.command_opcode
+            opcodes_for_ld = [
+                CCI_FM_API_COMMAND_OPCODE.GET_LD_INFO,
+                CCI_FM_API_COMMAND_OPCODE.GET_LD_ALLOCATIONS,
+                CCI_FM_API_COMMAND_OPCODE.SET_LD_ALLOCATIONS,
+            ]
+            if command_opcode in opcodes_for_ld:
+                message_tag = cci_message.cci_msg_header.message_tag
+                self._message_tag_list[message_tag] = port_index
+                out_packet = None
+                if command_opcode == CCI_FM_API_COMMAND_OPCODE.GET_LD_INFO:
+                    out_packet = GetLdInfoRequestPacket.create_from_cci_message(cci_message)
+                elif command_opcode == CCI_FM_API_COMMAND_OPCODE.GET_LD_ALLOCATIONS:
+                    out_packet = GetLdAllocationsRequestPacket.create_from_cci_message(cci_message)
+                elif command_opcode == CCI_FM_API_COMMAND_OPCODE.SET_LD_ALLOCATIONS:
+                    out_packet = SetLdAllocationsRequestPacket.create_from_cci_message(cci_message)
+                asyncio.run_coroutine_threadsafe(
+                    self._downstream_port_connections[port_index].cci_fifo.host_to_target.put(
+                        out_packet
+                    ),
+                    self._loop,
+                ).result()
+            else:
+                request = self._packet_to_request(cci_message)
+                response = asyncio.run_coroutine_threadsafe(
+                    self._cci_executor.execute_command(request), self._loop
+                ).result()
+                asyncio.run_coroutine_threadsafe(
+                    self._send_response(response, cci_message.cci_msg_header.message_tag),
+                    self._loop,
+                ).result()
+        logger.debug(self._create_message("Stopped processing incoming request (thread)"))
+
+    def _outgoing_worker(self, downstream_connection: CxlConnection) -> None:
+        assert self._loop is not None
+        logger.debug(self._create_message("Started processing outcoming request (thread)"))
+        while not self._outgoing_stop.is_set():
+            packet = asyncio.run_coroutine_threadsafe(
+                downstream_connection.cci_fifo.target_to_host.get(), self._loop
+            ).result()
+            if packet is None:
+                break
+            opcode = packet.get_command_opcode()
+            if opcode == CCI_FM_API_COMMAND_OPCODE.SET_LD_ALLOCATIONS:
+                logger.info(self._create_message("switch received SetLdAllocationsResponsePacket"))
+                port_index = self._message_tag_list.get(packet.cci_msg_header.message_tag, None)
+                if port_index is None:
+                    raise ValueError("Invalid message tag")
+            self._message_tag_list.pop(packet.cci_msg_header.message_tag)
+            cci_packet = packet.get_cci_message()
+            cci_packet_tmc = CciPayloadPacket.create(cci_packet)
+            asyncio.run_coroutine_threadsafe(
+                self._mctp_connection.ep_to_controller.put(cci_packet_tmc), self._loop
+            ).result()
+        logger.debug(self._create_message("Stopped processing outcoming request (thread)"))
+
     async def _run(self):
-        tasks = [
-            create_task(self._process_incoming_requests()),
-            create_task(self._cci_executor.run()),
-        ]
+        self._loop = asyncio.get_running_loop()
+        # Start executor task
+        tasks = [create_task(self._cci_executor.run())]
+        # Start incoming worker thread
+        self._incoming_stop.clear()
+        self._incoming_thread = threading.Thread(
+            target=self._incoming_worker, name=f"{self.get_message_label()}-in", daemon=True
+        )
+        self._incoming_thread.start()
+        # Start outgoing worker threads
+        self._outgoing_stop.clear()
+        self._outgoing_threads = []
         for downstream_connection in self._downstream_port_connections.values():
-            tasks.append(create_task(self._process_outcoming_responses(downstream_connection)))
+            t = threading.Thread(
+                target=self._outgoing_worker,
+                args=(downstream_connection,),
+                name=f"{self.get_message_label()}-out",
+                daemon=True,
+            )
+            t.start()
+            self._outgoing_threads.append(t)
         await self._change_status_to_running()
         await gather(*tasks)
 
     async def _stop(self):
-        # Stop the executor
-        await self._mctp_connection.controller_to_ep.put(None)
+        # Stop worker threads
+        self._incoming_stop.set()
+        self._outgoing_stop.set()
+        try:
+            await self._mctp_connection.controller_to_ep.put(None)
+        except Exception:
+            pass
         for downstream_connection in self._downstream_port_connections.values():
-            await downstream_connection.cci_fifo.target_to_host.put(None)
+            try:
+                await downstream_connection.cci_fifo.target_to_host.put(None)
+            except Exception:
+                pass
+        try:
+            if self._incoming_thread is not None:
+                self._incoming_thread.join(timeout=1.0)
+        except Exception:
+            pass
+        for t in self._outgoing_threads:
+            try:
+                t.join(timeout=1.0)
+            except Exception:
+                pass
+        # Stop the executor
         await self._cci_executor.stop()
 
     async def get_background_command_status(self) -> CciBackgroundStatus:

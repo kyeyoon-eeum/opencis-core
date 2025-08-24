@@ -7,6 +7,7 @@ See LICENSE for details.
 
 from dataclasses import dataclass, field
 from asyncio import create_task, gather, sleep
+import threading
 from opencis.util.async_queue import AsyncQueue as Queue
 import asyncio
 from typing import cast
@@ -94,6 +95,11 @@ class HomeAgent(RunnableComponent):
 
         # emulated .mem s2m channels
         self._cxl_channel = HomeAgentCxlChannel()
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._demux_thread: threading.Thread | None = None
+        self._demux_stop = threading.Event()
+        self._main_thread: threading.Thread | None = None
+        self._main_stop = threading.Event()
 
     def _create_m2s_req_packet(
         self,
@@ -187,8 +193,15 @@ class HomeAgent(RunnableComponent):
                 )
                 break
             if packet.type == MEMORY_REQUEST_TYPE.WRITE:
+                logger.info(
+                    self._create_message(f"MC WRITE req addr=0x{packet.addr:x} size={packet.size}")
+                )
                 await self._write_memory(packet.addr, packet.size, packet.data)
+                logger.info(self._create_message("MC WRITE rsp OK"))
             elif packet.type == MEMORY_REQUEST_TYPE.READ:
+                logger.info(
+                    self._create_message(f"MC READ req addr=0x{packet.addr:x} size={packet.size}")
+                )
                 data = await self._read_memory(packet.addr, packet.size)
                 response = MemoryResponse(MEMORY_RESPONSE_STATUS.OK, data)
                 await self._memory_consumer_io_fifos.response.put(response)
@@ -212,6 +225,7 @@ class HomeAgent(RunnableComponent):
 
     # .mem s2m rsp handler
     async def _process_cxl_s2m_rsp_packet(self, s2mndr_packet: CxlMemS2MNDRPacket):
+        logger.info(self._create_message("Processing S2M NDR in HA"))
         if s2mndr_packet.s2mndr_header.opcode == CXL_MEM_S2MNDR_OPCODE.CMP_S:
             status = CACHE_RESPONSE_STATUS.RSP_S
         elif s2mndr_packet.s2mndr_header.opcode == CXL_MEM_S2MNDR_OPCODE.CMP_E:
@@ -237,6 +251,7 @@ class HomeAgent(RunnableComponent):
             cache_packet = CacheResponse(status, cxl_packet.get_data_as_int())
         else:
             cache_packet = CacheResponse(status)
+        logger.debug(self._create_message("HA posting CacheResponse for UNCACHED_READ"))
         await self._upstream_cache_to_home_agent_fifos.response.put(cache_packet)
         self._cur_state.state = COH_STATE_MACHINE.COH_STATE_INIT
 
@@ -244,7 +259,7 @@ class HomeAgent(RunnableComponent):
     # method is only used for non cacheable devices like memory expander
     async def _process_cxl_s2m_drs_packet(self, s2mdrs_packet: CxlMemS2MDRSPacket):
         assert s2mdrs_packet.s2mdrs_header.opcode == CXL_MEM_S2MDRS_OPCODE.MEM_DATA
-
+        logger.info(self._create_message("Processing S2M DRS in HA"))
         cache_packet = CacheResponse(CACHE_RESPONSE_STATUS.OK, s2mdrs_packet.get_data_as_int())
         await self._upstream_cache_to_home_agent_fifos.response.put(cache_packet)
         self._cur_state.state = COH_STATE_MACHINE.COH_STATE_INIT
@@ -326,11 +341,13 @@ class HomeAgent(RunnableComponent):
                 elif cache_packet.type == CACHE_REQUEST_TYPE.UNCACHED_WRITE:
                     meta_value = CXL_MEM_META_VALUE.ANY
 
+                logger.info(self._create_message(f"CXL.mem H2T WR req addr=0x{addr:x}"))
                 cxl_packet = self._create_m2s_rwd_packet(
                     opcode, meta_field, meta_value, snp_type, addr, data
                 )
                 packet = CacheResponse(CACHE_RESPONSE_STATUS.OK)
                 await self._upstream_cache_to_home_agent_fifos.response.put(packet)
+                logger.info(self._create_message("CXL.mem H2T WR ack to cache OK"))
             else:
                 # HDM-H Normal Read
                 if cache_packet.type == CACHE_REQUEST_TYPE.READ:
@@ -359,50 +376,84 @@ class HomeAgent(RunnableComponent):
                 else:
                     raise Exception(f"Invalid M2S Opcode Type: {cache_packet.type}")
 
+                logger.info(self._create_message(f"CXL.mem H2T RD req addr=0x{addr:x}"))
                 cxl_packet = self._create_m2s_req_packet(
                     opcode, meta_field, meta_value, snp_type, addr
                 )
 
-            self._cur_state.state = COH_STATE_MACHINE.COH_STATE_WAIT
+            # Original behavior: writes do not block; reads/snoop ops wait for response
+            if cache_packet.type in (
+                CACHE_REQUEST_TYPE.WRITE,
+                CACHE_REQUEST_TYPE.WRITE_BACK,
+                CACHE_REQUEST_TYPE.WRITE_BACK_CLEAN,
+                CACHE_REQUEST_TYPE.UNCACHED_WRITE,
+            ):
+                self._cur_state.state = COH_STATE_MACHINE.COH_STATE_INIT
+            else:
+                self._cur_state.state = COH_STATE_MACHINE.COH_STATE_WAIT
             await self._downstream_cxl_mem_fifos.host_to_target.put(cxl_packet)
 
     # .mem s2m packet process
-    async def _process_downstream_target_to_host_packets(self):
-        while True:
-            packet = await self._downstream_cxl_mem_fifos.target_to_host.get()
+    def _process_downstream_target_to_host_worker(self) -> None:
+        assert self._loop is not None
+        while not self._demux_stop.is_set():
+            packet = asyncio.run_coroutine_threadsafe(
+                self._downstream_cxl_mem_fifos.target_to_host.get(), self._loop
+            ).result()
             if packet is None:
-                logger.debug(
-                    self._create_message(
-                        "Stopped processing memory access requests from downstream packets"
-                    )
-                )
                 break
-
             base_packet = cast(BasePacket, packet)
             if not base_packet.is_cxl_mem():
                 raise Exception(f"Received unexpected packet: {base_packet.get_type()}")
-
-            # packets are distributed to s2m channels
             cxl_packet = cast(CxlMemBasePacket, packet)
             if cxl_packet.is_s2mndr():
-                await self._cxl_channel.s2m_ndr.put(cast(CxlMemS2MNDRPacket, packet))
+                logger.debug(self._create_message("HomeAgent demux: received S2M NDR"))
+                asyncio.run_coroutine_threadsafe(
+                    self._cxl_channel.s2m_ndr.put(cast(CxlMemS2MNDRPacket, packet)), self._loop
+                ).result()
             elif cxl_packet.is_s2mdrs():
-                await self._cxl_channel.s2m_drs.put(cast(CxlMemS2MDRSPacket, packet))
+                logger.debug(self._create_message("HomeAgent demux: received S2M DRS"))
+                asyncio.run_coroutine_threadsafe(
+                    self._cxl_channel.s2m_drs.put(cast(CxlMemS2MDRSPacket, packet)), self._loop
+                ).result()
             elif cxl_packet.is_s2mbisnp():
-                await self._cxl_channel.s2m_bisnp.put(cast(CxlMemS2MBISnpPacket, packet))
+                asyncio.run_coroutine_threadsafe(
+                    self._cxl_channel.s2m_bisnp.put(cast(CxlMemS2MBISnpPacket, packet)), self._loop
+                ).result()
             else:
                 raise Exception(f"Received unexpected packet: {cxl_packet.get_type()}")
 
     # process from host/device channels one by one in state machine
-    async def _home_agent_coherency_main_loop(self):
+    def _home_agent_coherency_main_worker(self) -> None:
+        assert self._loop is not None
         _stop_process = False
         _fc_run = False
         _fc_host_run = False
 
-        while not _stop_process:
-            await sleep(0)
+        while not _stop_process and not self._main_stop.is_set():
+            # yield to asyncio loop
+            asyncio.run_coroutine_threadsafe(sleep(0), self._loop).result()
+            # Response draining policy:
+            # - While waiting (one outstanding request), handle exactly one NDR per loop.
+            #   The NDR handler will consume its paired DRS when meta=ANY.
+            # - When idle (INIT), allow at most one stray DRS to be handled to avoid leftovers.
+            if self._cur_state.state == COH_STATE_MACHINE.COH_STATE_WAIT:
+                if not self._cxl_channel.s2m_ndr.empty():
+                    packet = asyncio.run_coroutine_threadsafe(
+                        self._cxl_channel.s2m_ndr.get(), self._loop
+                    ).result()
+                    asyncio.run_coroutine_threadsafe(
+                        self._process_cxl_s2m_rsp_packet(packet), self._loop
+                    ).result()
+            elif self._cur_state.state == COH_STATE_MACHINE.COH_STATE_INIT:
+                if not self._cxl_channel.s2m_drs.empty():
+                    packet = asyncio.run_coroutine_threadsafe(
+                        self._cxl_channel.s2m_drs.get(), self._loop
+                    ).result()
+                    asyncio.run_coroutine_threadsafe(
+                        self._process_cxl_s2m_drs_packet(packet), self._loop
+                    ).result()
             # flow control for host/device packets
-            # link state machine and function to the current request
             if self._cur_state.state == COH_STATE_MACHINE.COH_STATE_INIT:
                 _fc_run = False
                 if _fc_host_run is False:
@@ -422,9 +473,9 @@ class HomeAgent(RunnableComponent):
 
                 if _fc_run:
                     if _fc_host_run:
-                        self._cur_state.packet = (
-                            await self._upstream_cache_to_home_agent_fifos.request.get()
-                        )
+                        self._cur_state.packet = asyncio.run_coroutine_threadsafe(
+                            self._upstream_cache_to_home_agent_fifos.request.get(), self._loop
+                        ).result()
                         if self._cur_state.packet is None:
                             logger.debug(
                                 self._create_message(
@@ -434,30 +485,37 @@ class HomeAgent(RunnableComponent):
                             _stop_process = True
                         fn = self._process_upstream_host_to_target_packets
                     else:
-                        self._cur_state.packet = await self._cxl_channel.s2m_bisnp.get()
+                        self._cur_state.packet = asyncio.run_coroutine_threadsafe(
+                            self._cxl_channel.s2m_bisnp.get(), self._loop
+                        ).result()
                         fn = self._process_cxl_s2m_bisnp_packet
 
                     self._cur_state.state = COH_STATE_MACHINE.COH_STATE_START
 
             # run request processing and response checking code continuously until state changed
-            # drs packets are extracted and consumed in ndr processing code
             else:
-                await fn(self._cur_state.packet)
-
-                if not self._cxl_channel.s2m_ndr.empty():
-                    packet = await self._cxl_channel.s2m_ndr.get()
-                    await self._process_cxl_s2m_rsp_packet(packet)
-
-                if not self._cxl_channel.s2m_drs.empty():
-                    packet = await self._cxl_channel.s2m_drs.get()
-                    await self._process_cxl_s2m_drs_packet(packet)
+                asyncio.run_coroutine_threadsafe(fn(self._cur_state.packet), self._loop).result()
 
     async def _run(self):
+        self._loop = asyncio.get_running_loop()
+        self._demux_stop.clear()
+        self._demux_thread = threading.Thread(
+            target=self._process_downstream_target_to_host_worker,
+            name=f"{self.get_message_label()}-mem-demux",
+            daemon=True,
+        )
+        self._demux_thread.start()
+        # start main coherency worker thread
+        self._main_stop.clear()
+        self._main_thread = threading.Thread(
+            target=self._home_agent_coherency_main_worker,
+            name=f"{self.get_message_label()}-mem-main",
+            daemon=True,
+        )
+        self._main_thread.start()
         tasks = [
             create_task(self._process_memory_io_bridge_requests()),
             create_task(self._process_memory_coh_bridge_requests()),
-            create_task(self._process_downstream_target_to_host_packets()),
-            create_task(self._home_agent_coherency_main_loop()),
         ]
         await self._change_status_to_running()
         await gather(*tasks)
@@ -466,4 +524,11 @@ class HomeAgent(RunnableComponent):
         await self._memory_consumer_io_fifos.request.put(None)
         await self._memory_consumer_coh_fifos.request.put(None)
         await self._upstream_cache_to_home_agent_fifos.request.put(None)
+        self._demux_stop.set()
         await self._downstream_cxl_mem_fifos.target_to_host.put(None)
+        if self._demux_thread is not None:
+            self._demux_thread.join(timeout=1.0)
+        # stop main coherency worker
+        self._main_stop.set()
+        if self._main_thread is not None:
+            self._main_thread.join(timeout=1.0)

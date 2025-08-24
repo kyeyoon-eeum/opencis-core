@@ -66,6 +66,7 @@ class ShmEndpoint:
         except Exception:
             pass
 
+
 class ShmStreamPair:
     def __init__(self, port_index: int, is_server: bool, namespace: str = "switch"):
         self._endpoint = ShmEndpoint(port_index, is_server, namespace)

@@ -21,6 +21,8 @@ from asyncio import (
     Queue,
     timeout,
 )
+import asyncio
+import threading
 
 from opencis.util.bound_event import BoundEvent
 from opencis.util.logger import logger
@@ -95,6 +97,11 @@ class CxlCacheDcoh(PacketProcessor):
 
         # emulated .cache d2h channels
         self._cxl_channel = CacheDcohCxlChannel()
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._demux_thread: threading.Thread | None = None
+        self._demux_stop = threading.Event()
+        self._main_thread: threading.Thread | None = None
+        self._main_stop = threading.Event()
 
         self.device_entries: dict[int, Future] = (
             {}
@@ -438,58 +445,64 @@ class CxlCacheDcoh(PacketProcessor):
             self._cur_state.state = COH_STATE_MACHINE.COH_STATE_WAIT
 
     # .cache h2d host packet handler
-    async def _process_host_to_target(self):
-        # pylint: disable=duplicate-code
-        logger.debug(self._create_message("Started processing incoming fifo from host"))
-        while True:
-            packet = await self._upstream_fifo.host_to_target.get()
+    def _process_host_to_target_worker(self) -> None:
+        assert self._loop is not None
+        logger.debug(self._create_message("Started processing incoming fifo from host (thread)"))
+        while not self._demux_stop.is_set():
+            packet = asyncio.run_coroutine_threadsafe(
+                self._upstream_fifo.host_to_target.get(), self._loop
+            ).result()
             if packet is None:
-                logger.debug(self._create_message("Stopped processing incoming fifo from host"))
                 break
-
             base_packet = cast(BasePacket, packet)
             if not base_packet.is_cxl_cache():
                 raise Exception(f"Received unexpected packet: {base_packet.get_type()}")
-
             cxl_packet = cast(CxlCacheBasePacket, packet)
             if cxl_packet.is_h2dreq():
-                await self._cxl_channel.h2d_req.put(cast(CxlCacheH2DReqPacket, packet))
+                asyncio.run_coroutine_threadsafe(
+                    self._cxl_channel.h2d_req.put(cast(CxlCacheH2DReqPacket, packet)), self._loop
+                ).result()
             elif cxl_packet.is_h2drsp():
-                await self._cxl_channel.h2d_rsp.put(cast(CxlCacheH2DRspPacket, packet))
+                asyncio.run_coroutine_threadsafe(
+                    self._cxl_channel.h2d_rsp.put(cast(CxlCacheH2DRspPacket, packet)), self._loop
+                ).result()
             elif cxl_packet.is_h2ddata():
-                await self._cxl_channel.h2d_data.put(cast(CxlCacheH2DDataPacket, packet))
+                asyncio.run_coroutine_threadsafe(
+                    self._cxl_channel.h2d_data.put(cast(CxlCacheH2DDataPacket, packet)), self._loop
+                ).result()
             else:
                 raise Exception(f"Received unexpected packet: {cxl_packet.get_type()}")
 
     # process from host/device channels simultaneously
-    async def _cxl_cache_dcoh_main_loop(self):
-        _stop_process = False
-
-        while not _stop_process:
-            await sleep(0)
+    def _cxl_cache_dcoh_main_worker(self) -> None:
+        assert self._loop is not None
+        while not self._main_stop.is_set():
             # fetch device request packet
             if self._cur_state.state == COH_STATE_MACHINE.COH_STATE_INIT:
                 if not self._cache_to_coh_agent_fifo.request.empty():
-                    self._cur_state.packet = await self._cache_to_coh_agent_fifo.request.get()
+                    self._cur_state.packet = asyncio.run_coroutine_threadsafe(
+                        self._cache_to_coh_agent_fifo.request.get(), self._loop
+                    ).result()
                     if self._cur_state.packet is None:
-                        logger.debug(
-                            self._create_message("Stop processing cxl cache dcoh main loop")
-                        )
-                        _stop_process = True
+                        break
                     self._cur_state.state = COH_STATE_MACHINE.COH_STATE_START
-
-            # run request processing and response checking code continuously until state changed
-            # data packets are extracted and consumed in request processing code
             else:
-                await self._process_cache_to_dcoh(self._cur_state.packet)
-
+                asyncio.run_coroutine_threadsafe(
+                    self._process_cache_to_dcoh(self._cur_state.packet), self._loop
+                ).result()
                 if not self._cxl_channel.h2d_rsp.empty():
-                    packet = await self._cxl_channel.h2d_rsp.get()
-                    await self._process_cxl_h2d_rsp_packet(packet)
+                    packet = asyncio.run_coroutine_threadsafe(
+                        self._cxl_channel.h2d_rsp.get(), self._loop
+                    ).result()
+                    asyncio.run_coroutine_threadsafe(
+                        self._process_cxl_h2d_rsp_packet(packet), self._loop
+                    ).result()
 
             # process host request regardless of device processing state
             if not self._cxl_channel.h2d_req.empty():
-                packet = await self._cxl_channel.h2d_req.get()
+                packet = asyncio.run_coroutine_threadsafe(
+                    self._cxl_channel.h2d_req.get(), self._loop
+                ).result()
                 # corner case handling
                 if (
                     self._cur_state.state != COH_STATE_MACHINE.COH_STATE_INIT
@@ -503,19 +516,48 @@ class CxlCacheDcoh(PacketProcessor):
                         cxl_packet = CxlCacheCacheD2HRspPacket.create(
                             0, CXL_CACHE_D2HRSP_OPCODE.RSP_I_HIT_I
                         )
-                        await self._upstream_fifo.target_to_host.put(cxl_packet)
+                        asyncio.run_coroutine_threadsafe(
+                            self._upstream_fifo.target_to_host.put(cxl_packet), self._loop
+                        ).result()
                         continue
-                await self._process_cxl_h2d_req_packet(packet)
+                asyncio.run_coroutine_threadsafe(
+                    self._process_cxl_h2d_req_packet(packet), self._loop
+                ).result()
 
     # pylint: disable=duplicate-code
     async def _run(self):
-        tasks = [
-            create_task(self._process_host_to_target()),
-            create_task(self._cxl_cache_dcoh_main_loop()),
-        ]
+        self._loop = asyncio.get_running_loop()
+        self._demux_stop.clear()
+        self._demux_thread = threading.Thread(
+            target=self._process_host_to_target_worker,
+            name=f"{self.get_message_label()}-cache-demux",
+            daemon=True,
+        )
+        self._demux_thread.start()
+        self._main_stop.clear()
+        self._main_thread = threading.Thread(
+            target=self._cxl_cache_dcoh_main_worker,
+            name=f"{self.get_message_label()}-cache-main",
+            daemon=True,
+        )
+        self._main_thread.start()
         await self._change_status_to_running()
-        await gather(*tasks)
+        stopper = asyncio.Event()
+        try:
+            await stopper.wait()
+        except asyncio.CancelledError:
+            pass
 
     async def _stop(self):
+        self._demux_stop.set()
         await self._upstream_fifo.host_to_target.put(None)
+        if self._demux_thread is not None:
+            self._demux_thread.join(timeout=1.0)
+        self._main_stop.set()
+        try:
+            await self._cache_to_coh_agent_fifo.request.put(None)
+        except Exception:
+            pass
+        if self._main_thread is not None:
+            self._main_thread.join(timeout=1.0)
         await self._cache_to_coh_agent_fifo.request.put(None)

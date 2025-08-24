@@ -199,7 +199,20 @@ class PciBusDriver(LabeledComponent):
     # pylint: disable=duplicate-code
 
     async def read_config(self, bdf: int, offset: int, size: int) -> int:
-        return await self._root_complex.read_config(bdf, offset, size)
+        # Ensure reads do not cross a DWORD boundary by splitting if necessary
+        boundary_end = ((offset // 4) + 1) * 4
+        if offset + size <= boundary_end:
+            return await self._root_complex.read_config(bdf, offset, size)
+        first_len = boundary_end - offset
+        second_len = size - first_len
+        first_part = await self._root_complex.read_config(bdf, offset, first_len)
+        if first_part is None:
+            return None
+        second_part = await self._root_complex.read_config(bdf, offset + first_len, second_len)
+        if second_part is None:
+            return None
+        # Combine little-endian contiguous bytes
+        return first_part | (second_part << (8 * first_len))
 
     async def write_config(self, bdf: int, offset: int, size: int, value: int):
         await self._root_complex.write_config(bdf, offset, size, value)
@@ -324,7 +337,7 @@ class PciBusDriver(LabeledComponent):
         bdf: int,
     ) -> int:
         data = await self.read_config(bdf, BAR_OFFSETS.BAR0, BAR_REGISTER_SIZE)
-        if data == 0:
+        if data is None or data == 0:
             return data
         return 0xFFFFFFFF - data + 1
 
@@ -332,6 +345,9 @@ class PciBusDriver(LabeledComponent):
         logger.debug(self._create_message(f"Reading VID/DID from {bdf_to_string(bdf)}"))
         vid = await self.read_config(bdf, REG_ADDR.VENDOR_ID.START, REG_ADDR.VENDOR_ID.LEN)
         did = await self.read_config(bdf, REG_ADDR.DEVICE_ID.START, REG_ADDR.DEVICE_ID.LEN)
+        if vid is None or did is None:
+            logger.debug(self._create_message("VID/DID read returned None; skipping device"))
+            return None
         logger.debug(self._create_message(f"VID: 0x{vid:x}"))
         logger.debug(self._create_message(f"DID: 0x{did:x}"))
         if did == 0xFFFF and vid == 0xFFFF:
@@ -341,8 +357,8 @@ class PciBusDriver(LabeledComponent):
 
     async def _read_class_code(self, bdf: int) -> int:
         data = await self.read_config(bdf, REG_ADDR.CLASS_CODE.START, REG_ADDR.CLASS_CODE.LEN)
-        if data == 0xFFFF:
-            raise Exception("Failed to read class code")
+        if data is None or data == 0xFFFF:
+            return 0
         return data
 
     async def _read_bar(self, bdf, bar_id) -> int:

@@ -22,4 +22,6 @@ cdef class ShmRing:
     cpdef bytes read_up_to(self, size_t max_bytes)
     cpdef str get_path(self)
     cpdef void teardown_unix_notify(self)
+    cpdef bint wait_for_space(self, unsigned int max_sleep_ns=*)
+    cpdef bint push_frame_wait_from(self, const unsigned char* src, size_t payload_len, unsigned int max_sleep_ns=*)
 

@@ -113,12 +113,13 @@ async def my_sys_sw_app(ig: int = None, iw: int = None, host_fm_conn_port: int =
     pci_cfg_size = 0x10000000  # assume bus bits n = 8
     memory_base_tracker = MemoryBaseTracker(cxl_hpa_base_addr, pci_cfg_base_addr, mmio_base)
 
+    # Map CFG windows for bridges and MMIO BARs for ALL devices (bridges and endpoints)
     for device in pci_bus_driver.get_devices():
-        if not device.is_bridge:
-            continue
-
-        cxl_memory_hub.add_mem_range(memory_base_tracker.cfg_base, pci_cfg_size, MEM_ADDR_TYPE.CFG)
-        memory_base_tracker.cfg_base += pci_cfg_size
+        if device.is_bridge:
+            cxl_memory_hub.add_mem_range(
+                memory_base_tracker.cfg_base, pci_cfg_size, MEM_ADDR_TYPE.CFG
+            )
+            memory_base_tracker.cfg_base += pci_cfg_size
         for bar_info in device.bars:
             if bar_info.base_address == 0:
                 continue

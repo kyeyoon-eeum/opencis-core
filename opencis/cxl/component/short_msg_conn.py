@@ -5,6 +5,7 @@ This software is licensed under the terms of the Revised BSD License.
 See LICENSE for details.
 """
 
+import asyncio
 from asyncio import (
     Event,
     Task,
@@ -125,7 +126,7 @@ class ShortMsgConn(RunnableComponent):
                 logger.debug(self._create_message(f"{this_dev_name} _msg_handler exiting"))
                 return
 
-            msg = await reader.readexactly(self._msg_width)
+            msg = await asyncio.to_thread(reader.readexactly_blocking, self._msg_width)
             if not msg:
                 logger.debug(self._create_message(f"{this_dev_name} ShortMsg connection broken"))
                 return
@@ -164,7 +165,7 @@ class ShortMsgConn(RunnableComponent):
 
     async def _new_conn(self, reader: StreamReaderLike, writer: StreamWriterLike):
         logger.debug(self._create_message("New ShortMsg connection established"))
-        remote_dev_id = await reader.readexactly(16)
+        remote_dev_id = await asyncio.to_thread(reader.readexactly_blocking, 16)
         remote_dev_id_int = int.from_bytes(remote_dev_id, "little")
         self._connections[remote_dev_id_int] = (reader, writer)
         self._msg_handlers.append(create_task(self._msg_handler(reader, writer)))
@@ -182,14 +183,14 @@ class ShortMsgConn(RunnableComponent):
         _, writer = self._connections[device]
         val_w_dev_id = request.real_val << 8 | self._device_id
         writer.write(val_w_dev_id.to_bytes(length=self._msg_width))
-        await writer.drain()
+        await asyncio.to_thread(writer.drain_blocking)
 
     async def start_connection(self):
         logger.info(self._create_message("ShortMsg client starting shm connection"))
         shm = ShmStreamPair(port_index=self._port, is_server=False, namespace="shortmsg")
         reader, writer = shm.reader, shm.writer
         writer.write(int.to_bytes(self._device_id, 16, "little"))
-        await writer.drain()
+        await asyncio.to_thread(writer.drain_blocking)
         logger.info(self._create_message("ShortMsg client sent device ID"))
         self._connections[0] = (reader, writer)
         self._run_status = True
@@ -216,7 +217,7 @@ class ShortMsgConn(RunnableComponent):
 
                 # Accept connection and device ID in background so server can become READY immediately
                 async def _accept_first_client():
-                    remote_dev_id = await reader.readexactly(16)
+                    remote_dev_id = await asyncio.to_thread(reader.readexactly_blocking, 16)
                     remote_dev_id_int = int.from_bytes(remote_dev_id, "little")
                     logger.info(
                         self._create_message(

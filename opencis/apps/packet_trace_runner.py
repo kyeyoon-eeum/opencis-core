@@ -50,7 +50,6 @@ class PacketTraceRunner(LabeledComponent):
                     ):
                         logger.info(self._create_message(f"({n + 1}) Tx: 0x{data:x}"))
                         writer.write(data_bytes)
-                        await writer.drain()
                     elif (
                         tcp.sport == self._trace_switch_port
                         and tcp.dport == self._trace_device_port

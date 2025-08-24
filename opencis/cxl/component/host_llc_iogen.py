@@ -6,7 +6,10 @@ See LICENSE for details.
 """
 
 # pylint: disable=duplicate-code
-from asyncio import create_task, gather, sleep
+from asyncio import create_task, gather
+import asyncio
+import threading
+import time
 from dataclasses import dataclass
 from random import randrange
 
@@ -36,6 +39,9 @@ class HostLlcIoGen(RunnableComponent):
         self._memory_line = config.memory_size // 0x40
 
         self._internal_iogen = False
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._worker_thread: threading.Thread | None = None
+        self._worker_stop = threading.Event()
 
     # pylint: disable=duplicate-code
     async def load(self, address: int, size: int) -> MemoryResponse:
@@ -50,11 +56,10 @@ class HostLlcIoGen(RunnableComponent):
         packet = await self._processor_to_cache_fifo.response.get()
         return packet
 
-    async def _host_process_llc_iogen(self):
-        await sleep(5)
-        stop_process = False
-
-        while not stop_process:
+    def _host_process_llc_iogen_worker(self) -> None:
+        assert self._loop is not None
+        time.sleep(5)
+        while not self._worker_stop.is_set():
             if self._internal_iogen is True:
                 valid_addr = set()
                 for _ in range(10000):
@@ -63,19 +68,25 @@ class HostLlcIoGen(RunnableComponent):
                     valid_addr.add(addr)
 
                     logger.debug(f"[{self._host_name}] Write 0x{written_data:X} at 0x{addr:x}")
-                    packet = await self.store(addr, 0x40, written_data)
+                    packet = asyncio.run_coroutine_threadsafe(
+                        self.store(addr, 0x40, written_data), self._loop
+                    ).result()
                     if packet is None:
                         logger.debug(self._create_message("Stop processing host llc iogen"))
-                        stop_process = True
+                        self._worker_stop.set()
+                        break
                     assert packet.status == MEMORY_RESPONSE_STATUS.OK
 
                 logger.info(f"[{self._host_name}] Written Counts {len(valid_addr)}")
 
                 for _, addr in enumerate(valid_addr):
-                    packet = await self.load(addr, 0x40)
+                    packet = asyncio.run_coroutine_threadsafe(
+                        self.load(addr, 0x40), self._loop
+                    ).result()
                     if packet is None:
                         logger.debug(self._create_message("Stop processing host llc iogen"))
-                        stop_process = True
+                        self._worker_stop.set()
+                        break
                     assert packet.status == MEMORY_RESPONSE_STATUS.OK
 
                     read_data = packet.get_data_as_int()
@@ -85,17 +96,32 @@ class HostLlcIoGen(RunnableComponent):
                 logger.info(f"[{self._host_name}] Simple Test Done")
 
             else:
-                packet = await self._processor_to_cache_fifo.response.get()
+                packet = asyncio.run_coroutine_threadsafe(
+                    self._processor_to_cache_fifo.response.get(), self._loop
+                ).result()
                 if packet is None:
                     logger.debug(self._create_message("Stop processing host llc iogen"))
-                    stop_process = True
+                    self._worker_stop.set()
+                    break
 
     async def _run(self):
-        tasks = [
-            create_task(self._host_process_llc_iogen()),
-        ]
+        self._loop = asyncio.get_running_loop()
+        self._worker_stop.clear()
+        self._worker_thread = threading.Thread(
+            target=self._host_process_llc_iogen_worker,
+            name=f"{self.get_message_label()}-host-llc-iogen",
+            daemon=True,
+        )
+        self._worker_thread.start()
         await self._change_status_to_running()
-        await gather(*tasks)
+        stopper = asyncio.Event()
+        try:
+            await stopper.wait()
+        except asyncio.CancelledError:
+            pass
 
     async def _stop(self):
+        self._worker_stop.set()
         await self._processor_to_cache_fifo.response.put(None)
+        if self._worker_thread is not None:
+            self._worker_thread.join(timeout=1.0)

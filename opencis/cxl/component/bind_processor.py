@@ -5,8 +5,9 @@ This software is licensed under the terms of the Revised BSD License.
 See LICENSE for details.
 """
 
+import asyncio
+import threading
 from opencis.util.async_queue import AsyncQueue as Queue
-from asyncio import create_task, gather
 from dataclasses import dataclass
 
 from opencis.cxl.component.cxl_connection import CxlConnection
@@ -51,31 +52,49 @@ class GenericBindProcessor(RunnableComponent):
                 self._dsc.cxl_cache_fifo.target_to_host,
             ),
         ]
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._threads: list[threading.Thread] = []
+        self._stop_evt = threading.Event()
+        self._keepalive_evt: asyncio.Event | None = None
 
     def _create_message(self, message):
         message = f"[{self.__class__.__name__}] {message}"
         return message
 
-    # Similar code with pci_to_pci_bridge_device.py:*_process()
-    # pylint: disable=duplicate-code
-    async def _process(self, source: Queue, destination: Queue):
-        while True:
-            packet = await source.get()
+    # Similar logic to pci_to_pci_bridge_device.py but with thread bridging
+    def _process_worker(self, source: Queue, destination: Queue) -> None:
+        assert self._loop is not None
+        while not self._stop_evt.is_set():
+            packet = asyncio.run_coroutine_threadsafe(source.get(), self._loop).result()
             if packet is None:
                 break
-            await destination.put(packet)
+            asyncio.run_coroutine_threadsafe(destination.put(packet), self._loop).result()
 
     async def _run(self):
-        tasks = []
+        self._loop = asyncio.get_running_loop()
+        self._threads = []
+        self._stop_evt.clear()
         for pair in self._pairs:
-            task = create_task(self._process(pair.source, pair.destination))
-            tasks.append(task)
+            t = threading.Thread(
+                target=self._process_worker,
+                args=(pair.source, pair.destination),
+                name=f"{self.__class__.__name__}-bind",
+                daemon=True,
+            )
+            t.start()
+            self._threads.append(t)
+        self._keepalive_evt = asyncio.Event()
         await self._change_status_to_running()
-        await gather(*tasks)
+        await self._keepalive_evt.wait()
 
     async def _stop(self):
+        self._stop_evt.set()
         for pair in self._pairs:
             await pair.source.put(None)
+        for t in self._threads:
+            t.join(timeout=2)
+        if self._keepalive_evt is not None:
+            self._keepalive_evt.set()
 
 
 class PpbDspBindProcessor(GenericBindProcessor):

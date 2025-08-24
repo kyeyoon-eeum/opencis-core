@@ -130,6 +130,17 @@ cdef class ShmStreamReader:
                 self._left_len = plen - take
                 off = n
 
+    def readexactly_blocking(self, int n):
+        """Blocking read of exactly n bytes using ring's blocking pop path."""
+        cdef object out_bytes
+        cdef unsigned char* dst
+        if n <= 0:
+            return b""
+        out_bytes = PyBytes_FromStringAndSize(NULL, n)
+        dst = <unsigned char*> PyBytes_AsString(out_bytes)
+        self._readinto_exactly_blocking(dst, n)
+        return out_bytes
+
 
 cdef class ShmStreamWriter:
     def __cinit__(self, object endpoint):
@@ -181,3 +192,23 @@ cdef class ShmStreamWriter:
 
     def close(self):
         self._ep.close()
+
+    def drain_blocking(self):
+        """Blocking drain of pending frames using ring's wait-for-space helper."""
+        cdef object item
+        cdef object data
+        cdef Py_ssize_t offset
+        cdef Py_ssize_t length
+        cdef const unsigned char* ptr
+        while self._pending:
+            item = self._pending[0]
+            data, offset, length = item
+            if isinstance(data, bytes):
+                ptr = <const unsigned char*> PyBytes_AsString(data)
+            else:
+                ptr = <const unsigned char*> PyByteArray_AS_STRING(data)
+            if self._out_ring.push_frame_wait_from(ptr + offset, <size_t>length, 1000000):
+                self._pending.popleft()
+            else:
+                # Timed out; give up for now
+                break

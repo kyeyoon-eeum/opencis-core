@@ -160,7 +160,7 @@ class SwitchConnectionManager(RunnableComponent):
                 # Send ACCEPT immediately and proceed
                 accept = BaseSidebandPacket.create(SIDEBAND_TYPES.CONNECTION_ACCEPT)
                 writer.write(bytes(accept))
-                await writer.drain()
+                await asyncio.to_thread(writer.drain_blocking)
                 logger.info(self._create_message(f"Sent ACCEPT for port {idx_local}"))
                 await self._update_connection_status(idx_local, connected=True)
                 packet_processor = CxlPacketProcessor(

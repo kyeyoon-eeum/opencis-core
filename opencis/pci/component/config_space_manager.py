@@ -8,6 +8,8 @@ See LICENSE for details.
 from typing import Optional, cast
 from enum import Enum, auto
 from asyncio import create_task, gather
+import asyncio
+import threading
 from opencis.pci.component.fifo_pair import FifoPair
 from opencis.pci.config_space.pci import REG_ADDR
 from opencis.util.unaligned_bit_structure import BitMaskedBitStructure
@@ -50,6 +52,11 @@ class ConfigSpaceManager(RunnableComponent):
         self._downstream_fifo = downstream_fifo
         self._device_type = device_type
         self._register = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._h2t_thread: threading.Thread | None = None
+        self._t2h_thread: threading.Thread | None = None
+        self._h2t_stop = threading.Event()
+        self._t2h_stop = threading.Event()
 
     def set_register(self, register: BitMaskedBitStructure):
         self._register = register
@@ -160,25 +167,34 @@ class ConfigSpaceManager(RunnableComponent):
         )
         await self._upstream_fifo.target_to_host.put(cpl_packet)
 
-    async def _process_host_to_target(self):
+    def _process_host_to_target_worker(self) -> None:
         # pylint: disable=duplicate-code
-        logger.debug(self._create_message("Started processing host to target fifo"))
-        while True:
-            packet = await self._upstream_fifo.host_to_target.get()
+        assert self._loop is not None
+        logger.debug(self._create_message("Started processing host to target fifo (thread)"))
+        while not self._h2t_stop.is_set():
+            packet = asyncio.run_coroutine_threadsafe(
+                self._upstream_fifo.host_to_target.get(), self._loop
+            ).result()
             if packet is None:
-                logger.debug(self._create_message("Stop processing host to target fifo"))
+                logger.debug(self._create_message("Stop processing host to target fifo (thread)"))
                 break
             base_packet = cast(CxlIoBasePacket, packet)
             logger.debug(self._create_message("Received host to target packet"))
             if base_packet.is_cfg_type0():
                 if base_packet.is_cfg_read():
-                    await self._process_cxl_io_cfg_rd(base_packet)
+                    asyncio.run_coroutine_threadsafe(
+                        self._process_cxl_io_cfg_rd(base_packet), self._loop
+                    ).result()
                 elif base_packet.is_cfg_write():
-                    await self._process_cxl_io_cfg_wr(base_packet)
+                    asyncio.run_coroutine_threadsafe(
+                        self._process_cxl_io_cfg_wr(base_packet), self._loop
+                    ).result()
             elif base_packet.is_cfg_type1():
                 if self._downstream_fifo:
                     self._convert_request_type_when_needed(base_packet)
-                    await self._forward_request(base_packet)
+                    asyncio.run_coroutine_threadsafe(
+                        self._forward_request(base_packet), self._loop
+                    ).result()
                 else:
                     logger.warning(
                         self._create_message("Endpoint device should not receive a type1 request")
@@ -188,7 +204,9 @@ class ConfigSpaceManager(RunnableComponent):
                     tag = cfg_req_packet.cfg_req_header.tag
                     cpl_id = tlptoh16(cfg_req_packet.cfg_req_header.dest_id)
                     ld_id = cfg_req_packet.tlp_prefix.ld_id
-                    await self._send_unsupported_request(req_id, tag, cpl_id, ld_id=ld_id)
+                    asyncio.run_coroutine_threadsafe(
+                        self._send_unsupported_request(req_id, tag, cpl_id, ld_id=ld_id), self._loop
+                    ).result()
             else:
                 raise Exception("Unexpected packet received from ConfigSpaceManager")
 
@@ -208,33 +226,76 @@ class ConfigSpaceManager(RunnableComponent):
                     packet.cxl_io_header.fmt_type = CXL_IO_FMT_TYPE.CFG_WR0
         return packet
 
-    async def _process_target_to_host(self):
+    def _process_target_to_host_worker(self) -> None:
         if not self._is_bridge():
-            logger.debug(self._create_message("Skipped processing downstream target to host fifo"))
             return
-        logger.debug(self._create_message("Started processing downstream target to host fifo"))
-        while True:
-            packet = await self._downstream_fifo.target_to_host.get()
+        assert self._loop is not None
+        logger.debug(
+            self._create_message("Started processing downstream target to host fifo (thread)")
+        )
+        while not self._t2h_stop.is_set():
+            packet = asyncio.run_coroutine_threadsafe(
+                self._downstream_fifo.target_to_host.get(), self._loop
+            ).result()
             if packet is None:
-                logger.debug(self._create_message("Stop processing downstream target to host fifo"))
                 break
             logger.debug(self._create_message("Received target to host packet"))
-            await self._upstream_fifo.target_to_host.put(packet)
+            asyncio.run_coroutine_threadsafe(
+                self._upstream_fifo.target_to_host.put(packet), self._loop
+            ).result()
 
     async def _run(self):
         # pylint: disable=duplicate-code
         # CE-94
-        tasks = [
-            create_task(self._process_host_to_target()),
-            create_task(self._process_target_to_host()),
-        ]
+        self._loop = asyncio.get_running_loop()
+        # start H2T thread
+        self._h2t_stop.clear()
+        self._h2t_thread = threading.Thread(
+            target=self._process_host_to_target_worker,
+            name=f"{self._label or ''}-cfg-h2t",
+            daemon=True,
+        )
+        self._h2t_thread.start()
+        # start T2H thread for bridges
+        self._t2h_stop.clear()
+        self._t2h_thread = threading.Thread(
+            target=self._process_target_to_host_worker,
+            name=f"{self._label or ''}-cfg-t2h",
+            daemon=True,
+        )
+        self._t2h_thread.start()
         await self._change_status_to_running()
-        await gather(*tasks)
+        # Keep alive until stop
+        stopper = asyncio.Event()
+        while not (self._h2t_stop.is_set() and self._t2h_stop.is_set()):
+            try:
+                await asyncio.wait_for(stopper.wait(), timeout=0.1)
+            except asyncio.TimeoutError:
+                pass
 
     async def _stop(self):
         logger.info(self._create_message("Stopping ConfigSpaceManager"))
+        # Signal threads
+        self._h2t_stop.set()
+        try:
+            await self._upstream_fifo.host_to_target.put(None)
+        except Exception:
+            pass
+        if self._h2t_thread is not None:
+            try:
+                self._h2t_thread.join(timeout=1.0)
+            except Exception:
+                pass
         if self._is_bridge():
-            await self._downstream_fifo.target_to_host.put(None)
+            self._t2h_stop.set()
+            try:
+                await self._downstream_fifo.target_to_host.put(None)
+            except Exception:
+                pass
+            if self._t2h_thread is not None:
+                try:
+                    self._t2h_thread.join(timeout=1.0)
+                except Exception:
+                    pass
             self._downstream_fifo = None
-        await self._upstream_fifo.host_to_target.put(None)
         self._upstream_fifo = None

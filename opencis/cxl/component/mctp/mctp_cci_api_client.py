@@ -6,6 +6,8 @@ See LICENSE for details.
 """
 
 from asyncio import Condition
+import asyncio
+import threading
 from typing import cast, Any, Tuple, Optional, Callable, Dict, Coroutine
 
 from opencis.cxl.component.mctp.mctp_connection import MctpConnection
@@ -67,6 +69,9 @@ class MctpCciApiClient(RunnableComponent):
         self._responses: Dict[int, CciMessagePacket] = {}
         self._condition = Condition()
         self._notification_handler = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._in_thread: threading.Thread | None = None
+        self._in_stop = threading.Event()
 
     async def _process_incoming_packets(self):
         while True:
@@ -94,11 +99,31 @@ class MctpCciApiClient(RunnableComponent):
                 self._condition.release()
 
     async def _run(self):
+        self._loop = asyncio.get_running_loop()
+        # Start incoming worker thread
+        self._in_stop.clear()
+        self._in_thread = threading.Thread(
+            target=self._incoming_worker,
+            name=f"{self.get_message_label()}-in",
+            daemon=True,
+        )
+        self._in_thread.start()
         await self._change_status_to_running()
-        await self._process_incoming_packets()
+        # Keep component alive; thread will handle packets
+        stopper = asyncio.Event()
+        try:
+            await stopper.wait()
+        except asyncio.CancelledError:
+            pass
 
     async def _stop(self):
-        await self._mctp_connection.ep_to_controller.put(None)
+        self._in_stop.set()
+        try:
+            await self._mctp_connection.ep_to_controller.put(None)
+        except Exception:
+            pass
+        if self._in_thread is not None:
+            self._in_thread.join(timeout=1.0)
 
     async def _get_response(self, message_tag: int) -> CciMessagePacket:
         await self._condition.acquire()
@@ -362,3 +387,34 @@ class MctpCciApiClient(RunnableComponent):
         ):
             return (return_code, None)
         return (return_code, return_code)
+
+    def _incoming_worker(self) -> None:
+        assert self._loop is not None
+        while not self._in_stop.is_set():
+            packet = asyncio.run_coroutine_threadsafe(
+                self._mctp_connection.ep_to_controller.get(), self._loop
+            ).result()
+            if packet is None:
+                break
+            response_tmc1 = cast(CciPayloadPacket, packet)
+            cci_message = response_tmc1.get_cci_message()
+            if cci_message.cci_msg_header.message_category == CCI_MCTP_MESSAGE_CATEGORY.REQUEST:
+                opcode_str = get_opcode_string(cci_message.cci_msg_header.command_opcode)
+                logger.debug(
+                    self._create_message(f"Received request (notification) packet {opcode_str}")
+                )
+                if self._notification_handler is not None:
+                    asyncio.run_coroutine_threadsafe(
+                        self._notification_handler(cci_message), self._loop
+                    ).result()
+            else:
+                logger.debug(self._create_message("Received response packet"))
+
+                # Use condition in the same loop context
+                async def _notify() -> None:
+                    await self._condition.acquire()
+                    self._responses[cci_message.cci_msg_header.message_tag] = cci_message
+                    self._condition.notify_all()
+                    self._condition.release()
+
+                asyncio.run_coroutine_threadsafe(_notify(), self._loop).result()

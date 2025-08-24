@@ -7,6 +7,8 @@ See LICENSE for details.
 
 from dataclasses import dataclass
 from typing import cast
+import asyncio
+import threading
 from opencis.util.async_queue import AsyncQueue as Queue
 from asyncio import create_task, gather
 
@@ -51,27 +53,45 @@ class PpbDownRouting(RunnableComponent):
             ),
         ]
 
-    async def cfg_process(self, source: Queue, destination: Queue):
-        while True:
-            packet = await source.get()
+    def _cfg_worker(
+        self,
+        source: Queue,
+        destination: Queue,
+        loop: asyncio.AbstractEventLoop,
+        stop_evt: threading.Event,
+    ):
+        while not stop_evt.is_set():
+            packet = asyncio.run_coroutine_threadsafe(source.get(), loop).result()
             if packet is None:
                 break
             packet = cast(CxlIoBasePacket, packet)
             packet.tlp_prefix.ld_id = self._ld_id
-            await destination.put(packet)
+            asyncio.run_coroutine_threadsafe(destination.put(packet), loop).result()
 
-    async def mmio_process(self, source: Queue, destination: Queue):
-        while True:
-            packet = await source.get()
+    def _mmio_worker(
+        self,
+        source: Queue,
+        destination: Queue,
+        loop: asyncio.AbstractEventLoop,
+        stop_evt: threading.Event,
+    ):
+        while not stop_evt.is_set():
+            packet = asyncio.run_coroutine_threadsafe(source.get(), loop).result()
             if packet is None:
                 break
             packet = cast(CxlIoBasePacket, packet)
             packet.tlp_prefix.ld_id = self._ld_id
-            await destination.put(packet)
+            asyncio.run_coroutine_threadsafe(destination.put(packet), loop).result()
 
-    async def mem_process(self, source: Queue, destination: Queue):
-        while True:
-            packet = await source.get()
+    def _mem_worker(
+        self,
+        source: Queue,
+        destination: Queue,
+        loop: asyncio.AbstractEventLoop,
+        stop_evt: threading.Event,
+    ):
+        while not stop_evt.is_set():
+            packet = asyncio.run_coroutine_threadsafe(source.get(), loop).result()
             if packet is None:
                 break
             packet = cast(CxlMemBasePacket, packet)
@@ -80,36 +100,68 @@ class PpbDownRouting(RunnableComponent):
             elif packet.is_m2srwd():
                 packet.m2srwd_header.ld_id = self._ld_id
             elif packet.is_m2sbirsp():
-                # no LD-ID on BI packets
                 pass
             else:
                 logger.warning(self._create_message("Unexpected CXL.mem packet"))
-            await destination.put(packet)
+            asyncio.run_coroutine_threadsafe(destination.put(packet), loop).result()
 
-    async def cache_process(self, source: Queue, destination: Queue):
-        while True:
-            packet = await source.get()
+    def _cache_worker(
+        self,
+        source: Queue,
+        destination: Queue,
+        loop: asyncio.AbstractEventLoop,
+        stop_evt: threading.Event,
+    ):
+        while not stop_evt.is_set():
+            packet = asyncio.run_coroutine_threadsafe(source.get(), loop).result()
             if packet is None:
                 break
-            await destination.put(packet)
+            asyncio.run_coroutine_threadsafe(destination.put(packet), loop).result()
 
     async def _run(self):
-        tasks = []
-        task = create_task(self.cfg_process(self._pairs[0].source, self._pairs[0].destination))
-        tasks.append(task)
-        task = create_task(self.mmio_process(self._pairs[1].source, self._pairs[1].destination))
-        tasks.append(task)
-        task = create_task(self.mem_process(self._pairs[2].source, self._pairs[2].destination))
-        tasks.append(task)
-        task = create_task(self.cache_process(self._pairs[3].source, self._pairs[3].destination))
-        tasks.append(task)
-
+        loop = asyncio.get_running_loop()
+        stop_evt = threading.Event()
+        self._stop_evt = stop_evt
+        self._threads = [
+            threading.Thread(
+                target=self._cfg_worker,
+                args=(self._pairs[0].source, self._pairs[0].destination, loop, stop_evt),
+                name=f"{self.__class__.__name__}-cfg",
+                daemon=True,
+            ),
+            threading.Thread(
+                target=self._mmio_worker,
+                args=(self._pairs[1].source, self._pairs[1].destination, loop, stop_evt),
+                name=f"{self.__class__.__name__}-mmio",
+                daemon=True,
+            ),
+            threading.Thread(
+                target=self._mem_worker,
+                args=(self._pairs[2].source, self._pairs[2].destination, loop, stop_evt),
+                name=f"{self.__class__.__name__}-mem",
+                daemon=True,
+            ),
+            threading.Thread(
+                target=self._cache_worker,
+                args=(self._pairs[3].source, self._pairs[3].destination, loop, stop_evt),
+                name=f"{self.__class__.__name__}-cache",
+                daemon=True,
+            ),
+        ]
+        for t in self._threads:
+            t.start()
+        self._keepalive_evt = asyncio.Event()
         await self._change_status_to_running()
-        await gather(*tasks)
+        await self._keepalive_evt.wait()
 
     async def _stop(self):
+        self._stop_evt.set()
         for pair in self._pairs:
             await pair.source.put(None)
+        for t in getattr(self, "_threads", []):
+            t.join(timeout=2)
+        if hasattr(self, "_keepalive_evt"):
+            self._keepalive_evt.set()
 
 
 class PpbUpRouting(RunnableComponent):
@@ -129,30 +181,34 @@ class PpbUpRouting(RunnableComponent):
             self._dsc.cxl_cache_fifo.target_to_host,
         ]
 
-    async def cfg_process(self):
+    def _cfg_worker(self, loop: asyncio.AbstractEventLoop, stop_evt: threading.Event):
         source = self._dsc.cfg_fifo.target_to_host
-        while True:
-            packet = await source.get()
+        while not stop_evt.is_set():
+            packet = asyncio.run_coroutine_threadsafe(source.get(), loop).result()
             if packet is None:
                 break
             cxl_io_packet = cast(CxlIoBasePacket, packet)
             ld_id = cxl_io_packet.tlp_prefix.ld_id
-            await self._usc[ld_id].cfg_fifo.target_to_host.put(packet)
+            asyncio.run_coroutine_threadsafe(
+                self._usc[ld_id].cfg_fifo.target_to_host.put(packet), loop
+            ).result()
 
-    async def mmio_process(self):
+    def _mmio_worker(self, loop: asyncio.AbstractEventLoop, stop_evt: threading.Event):
         source = self._dsc.mmio_fifo.target_to_host
-        while True:
-            packet = await source.get()
+        while not stop_evt.is_set():
+            packet = asyncio.run_coroutine_threadsafe(source.get(), loop).result()
             if packet is None:
                 break
             cxl_io_packet = cast(CxlIoBasePacket, packet)
             ld_id = cxl_io_packet.tlp_prefix.ld_id
-            await self._usc[ld_id].mmio_fifo.target_to_host.put(packet)
+            asyncio.run_coroutine_threadsafe(
+                self._usc[ld_id].mmio_fifo.target_to_host.put(packet), loop
+            ).result()
 
-    async def mem_process(self):
+    def _mem_worker(self, loop: asyncio.AbstractEventLoop, stop_evt: threading.Event):
         source = self._dsc.cxl_mem_fifo.target_to_host
-        while True:
-            packet = await source.get()
+        while not stop_evt.is_set():
+            packet = asyncio.run_coroutine_threadsafe(source.get(), loop).result()
             if packet is None:
                 break
             cxl_mem_base_packet = cast(CxlMemBasePacket, packet)
@@ -167,29 +223,64 @@ class PpbUpRouting(RunnableComponent):
                 ld_id = 0
             else:
                 raise Exception("No packet type!!!!")
-            await self._usc[ld_id].cxl_mem_fifo.target_to_host.put(packet)
+            asyncio.run_coroutine_threadsafe(
+                self._usc[ld_id].cxl_mem_fifo.target_to_host.put(packet), loop
+            ).result()
 
-    async def cache_process(self):
+    def _cache_worker(self, loop: asyncio.AbstractEventLoop, stop_evt: threading.Event):
         source = self._dsc.cxl_cache_fifo.target_to_host
-        while True:
-            packet = await source.get()
+        while not stop_evt.is_set():
+            packet = asyncio.run_coroutine_threadsafe(source.get(), loop).result()
             if packet is None:
                 break
-            await self._usc[0].cxl_cache_fifo.target_to_host.put(packet)
+            asyncio.run_coroutine_threadsafe(
+                self._usc[0].cxl_cache_fifo.target_to_host.put(packet), loop
+            ).result()
 
     async def _run(self):
-        tasks = []
-        tasks.append(create_task(self.cfg_process()))
-        tasks.append(create_task(self.mmio_process()))
-        tasks.append(create_task(self.mem_process()))
-        tasks.append(create_task(self.cache_process()))
-
+        loop = asyncio.get_running_loop()
+        stop_evt = threading.Event()
+        self._stop_evt = stop_evt
+        self._threads = [
+            threading.Thread(
+                target=self._cfg_worker,
+                args=(loop, stop_evt),
+                name=f"{self.__class__.__name__}-cfg",
+                daemon=True,
+            ),
+            threading.Thread(
+                target=self._mmio_worker,
+                args=(loop, stop_evt),
+                name=f"{self.__class__.__name__}-mmio",
+                daemon=True,
+            ),
+            threading.Thread(
+                target=self._mem_worker,
+                args=(loop, stop_evt),
+                name=f"{self.__class__.__name__}-mem",
+                daemon=True,
+            ),
+            threading.Thread(
+                target=self._cache_worker,
+                args=(loop, stop_evt),
+                name=f"{self.__class__.__name__}-cache",
+                daemon=True,
+            ),
+        ]
+        for t in self._threads:
+            t.start()
+        self._keepalive_evt = asyncio.Event()
         await self._change_status_to_running()
-        await gather(*tasks)
+        await self._keepalive_evt.wait()
 
     async def _stop(self):
+        self._stop_evt.set()
         for source in self._sources:
             await source.put(None)
+        for t in getattr(self, "_threads", []):
+            t.join(timeout=2)
+        if hasattr(self, "_keepalive_evt"):
+            self._keepalive_evt.set()
 
 
 @dataclass

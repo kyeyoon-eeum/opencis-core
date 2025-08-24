@@ -7,6 +7,8 @@ See LICENSE for details.
 
 from dataclasses import dataclass, field
 from asyncio import create_task, gather, sleep
+import asyncio
+import threading
 from opencis.util.async_queue import AsyncQueue as Queue
 from itertools import cycle
 from typing import cast
@@ -96,6 +98,11 @@ class CacheCoherencyBridge(RunnableComponent):
 
         # emulated .cache d2h channels
         self._cxl_channel = CacheCoherencyBridgeCxlChannel()
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._demux_thread: threading.Thread | None = None
+        self._demux_stop = threading.Event()
+        self._main_thread: threading.Thread | None = None
+        self._main_stop = threading.Event()
 
         self._uqid_gen = cycle(range(0, 4096))
 
@@ -397,40 +404,51 @@ class CacheCoherencyBridge(RunnableComponent):
             self._cur_state.state = COH_STATE_MACHINE.COH_STATE_INIT
 
     # .cache d2h packet process
-    async def _process_downstream_target_to_host_packets(self):
-        while True:
-            packet = await self._downstream_cxl_cache_fifos.target_to_host.get()
+    def _process_downstream_target_to_host_worker(self) -> None:
+        assert self._loop is not None
+        while not self._demux_stop.is_set():
+            packet = asyncio.run_coroutine_threadsafe(
+                self._downstream_cxl_cache_fifos.target_to_host.get(), self._loop
+            ).result()
             if packet is None:
-                logger.debug(
-                    self._create_message(
-                        "Stopped processing downstream target to host CXL.cache packets"
-                    )
-                )
                 break
-
             base_packet = cast(BasePacket, packet)
             if not base_packet.is_cxl_cache():
                 raise Exception(f"Received unexpected packet: {base_packet.get_type()}")
-
-            # packets are distributed to d2h channels
             cxl_packet = cast(CxlCacheBasePacket, packet)
             if cxl_packet.is_d2hreq():
-                await self._cxl_channel.d2h_req.put(cast(CxlCacheD2HReqPacket, packet))
+                asyncio.run_coroutine_threadsafe(
+                    self._cxl_channel.d2h_req.put(cast(CxlCacheD2HReqPacket, packet)), self._loop
+                ).result()
             elif cxl_packet.is_d2hrsp():
-                await self._cxl_channel.d2h_rsp.put(cast(CxlCacheD2HRspPacket, packet))
+                asyncio.run_coroutine_threadsafe(
+                    self._cxl_channel.d2h_rsp.put(cast(CxlCacheD2HRspPacket, packet)), self._loop
+                ).result()
             elif cxl_packet.is_d2hdata():
-                await self._cxl_channel.d2h_data.put(cast(CxlCacheD2HDataPacket, packet))
+                asyncio.run_coroutine_threadsafe(
+                    self._cxl_channel.d2h_data.put(cast(CxlCacheD2HDataPacket, packet)), self._loop
+                ).result()
             else:
                 raise Exception(f"Received unexpected packet: {cxl_packet.get_type()}")
 
     # process from host/device channels one by one in state machine
-    async def _cache_coherency_bridege_main_loop(self):
+    def _cache_coherency_bridge_main_worker(self) -> None:
+        assert self._loop is not None
         _stop_process = False
         _fc_run = False
         _fc_host_run = False
 
-        while not _stop_process:
-            await sleep(0)
+        while not _stop_process and not self._main_stop.is_set():
+            # yield to event loop
+            asyncio.run_coroutine_threadsafe(sleep(0), self._loop).result()
+            # Drain at most one pending D2H RSP per iteration to avoid starvation (transport-only)
+            if not self._cxl_channel.d2h_rsp.empty():
+                packet = asyncio.run_coroutine_threadsafe(
+                    self._cxl_channel.d2h_rsp.get(), self._loop
+                ).result()
+                asyncio.run_coroutine_threadsafe(
+                    self._process_cxl_d2h_rsp_packet(packet), self._loop
+                ).result()
             # flow control for host/device packets
             # link state machine and function to the current request
             if self._cur_state.state == COH_STATE_MACHINE.COH_STATE_INIT:
@@ -452,9 +470,9 @@ class CacheCoherencyBridge(RunnableComponent):
 
                 if _fc_run:
                     if _fc_host_run:
-                        self._cur_state.packet = (
-                            await self._upstream_cache_to_coh_bridge_fifo.request.get()
-                        )
+                        self._cur_state.packet = asyncio.run_coroutine_threadsafe(
+                            self._upstream_cache_to_coh_bridge_fifo.request.get(), self._loop
+                        ).result()
                         if self._cur_state.packet is None:
                             logger.debug(
                                 self._create_message(
@@ -464,7 +482,9 @@ class CacheCoherencyBridge(RunnableComponent):
                             _stop_process = True
                         fn = self._process_upstream_host_to_target_packets
                     else:
-                        self._cur_state.packet = await self._cxl_channel.d2h_req.get()
+                        self._cur_state.packet = asyncio.run_coroutine_threadsafe(
+                            self._cxl_channel.d2h_req.get(), self._loop
+                        ).result()
                         fn = self._process_cxl_d2h_req_packet
 
                     self._cur_state.state = COH_STATE_MACHINE.COH_STATE_START
@@ -472,20 +492,49 @@ class CacheCoherencyBridge(RunnableComponent):
             # run request processing and response checking code continuously until state changed
             # data packets are extracted and consumed in request processing code
             else:
-                await fn(self._cur_state.packet)
+                asyncio.run_coroutine_threadsafe(fn(self._cur_state.packet), self._loop).result()
 
                 if not self._cxl_channel.d2h_rsp.empty():
-                    packet = await self._cxl_channel.d2h_rsp.get()
-                    await self._process_cxl_d2h_rsp_packet(packet)
+                    packet = asyncio.run_coroutine_threadsafe(
+                        self._cxl_channel.d2h_rsp.get(), self._loop
+                    ).result()
+                    asyncio.run_coroutine_threadsafe(
+                        self._process_cxl_d2h_rsp_packet(packet), self._loop
+                    ).result()
 
     async def _run(self):
-        tasks = [
-            create_task(self._process_downstream_target_to_host_packets()),
-            create_task(self._cache_coherency_bridege_main_loop()),
-        ]
+        self._loop = asyncio.get_running_loop()
+        self._demux_stop.clear()
+        self._demux_thread = threading.Thread(
+            target=self._process_downstream_target_to_host_worker,
+            name=f"{self.get_message_label()}-cache-demux",
+            daemon=True,
+        )
+        self._demux_thread.start()
+        self._main_stop.clear()
+        self._main_thread = threading.Thread(
+            target=self._cache_coherency_bridge_main_worker,
+            name=f"{self.get_message_label()}-cache-main",
+            daemon=True,
+        )
+        self._main_thread.start()
         await self._change_status_to_running()
-        await gather(*tasks)
+        stopper = asyncio.Event()
+        try:
+            await stopper.wait()
+        except asyncio.CancelledError:
+            pass
 
     async def _stop(self):
+        self._demux_stop.set()
         await self._downstream_cxl_cache_fifos.target_to_host.put(None)
+        if self._demux_thread is not None:
+            self._demux_thread.join(timeout=1.0)
+        self._main_stop.set()
+        try:
+            await self._upstream_cache_to_coh_bridge_fifo.request.put(None)
+        except Exception:
+            pass
+        if self._main_thread is not None:
+            self._main_thread.join(timeout=1.0)
         await self._upstream_cache_to_coh_bridge_fifo.request.put(None)

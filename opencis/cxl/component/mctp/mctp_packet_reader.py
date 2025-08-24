@@ -5,6 +5,7 @@ This software is licensed under the terms of the Revised BSD License.
 See LICENSE for details.
 """
 
+import asyncio
 from asyncio import create_task
 from typing import Optional
 
@@ -46,6 +47,15 @@ class MctpPacketReader(LabeledComponent):
             self._task = None
         return packet
 
+    def get_packet_blocking(self) -> CciMessagePacket:
+        if self._aborted:
+            raise Exception("PacketReader is already aborted")
+        base_packet, payload = self._get_payload_blocking()
+        payload = bytearray(payload)
+        if base_packet.is_cci() is not True:
+            raise ValueError(f"Must be CCI packet {type(base_packet)}")
+        return CciPayloadPacket(payload)
+
     def abort(self):
         if self._aborted:
             return
@@ -83,8 +93,35 @@ class MctpPacketReader(LabeledComponent):
 
     async def _readinto_exactly(self, buf: bytearray, n: int) -> None:
         reader = self._reader
+        if hasattr(reader, "readexactly_blocking"):
+            data = await asyncio.to_thread(reader.readexactly_blocking, n)
+            memoryview(buf)[:n] = data
+            return
         if hasattr(reader, "readinto_exactly"):
             await reader.readinto_exactly(buf, n)  # type: ignore[attr-defined]
             return
         data = await reader.readexactly(n)
         memoryview(buf)[:n] = data
+
+    def _get_payload_blocking(self):
+        self._readinto_exactly_blocking(self._hdr_buf, SystemHeader.get_size())
+        base_packet = BasePacket(self._hdr_buf)
+        remaining_length = base_packet.system_header.payload_length - len(base_packet)
+        if remaining_length < 0:
+            raise Exception("remaining length is less than 0")
+        total_len = len(self._hdr_buf) + remaining_length
+        if total_len > len(self._payload_buf):
+            self._payload_buf = bytearray(total_len)
+        payload = self._payload_buf[:total_len]
+        payload[: len(self._hdr_buf)] = self._hdr_buf
+        if remaining_length:
+            self._readinto_exactly_blocking(payload[len(self._hdr_buf) :], remaining_length)
+        return base_packet, payload
+
+    def _readinto_exactly_blocking(self, buf: bytearray, n: int) -> None:
+        reader = self._reader
+        if hasattr(reader, "readexactly_blocking"):
+            data = reader.readexactly_blocking(n)
+            memoryview(buf)[:n] = data
+            return
+        raise RuntimeError("Blocking read is unavailable for the provided reader")

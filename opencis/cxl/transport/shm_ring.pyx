@@ -63,12 +63,21 @@ cdef class ShmRing:
         self.elem_size = elem_size
         cdef size_t header_size = 32
         self.region_size = header_size + capacity * elem_size
+        # Ensure stale files are removed and permissions are sane
+        try:
+            os.unlink(path)
+        except Exception:
+            pass
         cdef int fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o666)
         try:
             os.ftruncate(fd, self.region_size)
             self.base = <unsigned char*> mmap(NULL, self.region_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0)
         finally:
             os.close(fd)
+        try:
+            os.chmod(path, 0o666)
+        except Exception:
+            pass
         if self.base == <unsigned char*> -1 or self.base == NULL:
             self.base = NULL
             raise OSError("mmap failed")
@@ -476,6 +485,38 @@ cdef class ShmRing:
         cdef unsigned long long head = self._read_u64(16)
         cdef unsigned long long tail = self._read_u64(24)
         return head - tail
+
+    cpdef bint wait_for_space(self, unsigned int max_sleep_ns=1000000):
+        """Busy-wait with exponential backoff (nanosleep) until ring is not full.
+        Returns True if space became available before timeout, False otherwise.
+        """
+        cdef unsigned int slept_ns = 0
+        cdef unsigned int step = 100
+        cdef timespec ts
+        while True:
+            # Inline is_full() for speed
+            if (self._read_u64(16) - self._read_u64(24)) < self.capacity:
+                return True
+            if slept_ns >= max_sleep_ns:
+                return False
+            ts.tv_sec = 0
+            ts.tv_nsec = step
+            with nogil:
+                nanosleep(&ts, <timespec*>0)
+            slept_ns += step
+            if step < 1000000:
+                step <<= 1
+
+    cpdef bint push_frame_wait_from(self, const unsigned char* src, size_t payload_len, unsigned int max_sleep_ns=1000000):
+        """Push a frame (header + payload) waiting for space if needed.
+        Returns True on success, False if timed out before space became available.
+        """
+        if payload_len > self.elem_size - 4:
+            raise ValueError("Frame too large for element")
+        while not self.try_push_frame_from(src, payload_len):
+            if not self.wait_for_space(max_sleep_ns):
+                return False
+        return True
 
     def close(self):
         if self.base != NULL:

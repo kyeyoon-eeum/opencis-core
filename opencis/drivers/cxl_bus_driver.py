@@ -615,56 +615,81 @@ class CxlBusDriver(LabeledComponent):
     # pylint: enable=duplicate-code
 
     async def _scan_cachemem_registers(self, device_info: CxlDeviceInfo):
+        base_registers: List[int] = []
         component_register_info = device_info.get_register_by_type(CXL_REGISTER_TYPE.COMPONENT)
-        if not component_register_info:
+        if component_register_info:
+            base_registers.append(component_register_info.address)
+        device_register_info = device_info.get_register_by_type(CXL_REGISTER_TYPE.CXL_DEVICE)
+        if device_register_info:
+            base_registers.append(device_register_info.address)
+
+        if not base_registers:
             return
 
-        cxl_cachemem_offset = component_register_info.address + 0x1000
+        for base_addr in base_registers:
+            cxl_cachemem_offset = base_addr + 0x1000
 
-        logger.debug(
-            self._create_message(
-                f"Scanning CXL.cache and CXL.mem Registers at 0x{cxl_cachemem_offset:x}"
-            )
-        )
-
-        cxl_capability_header = await self._root_complex.read_mmio(
-            cxl_cachemem_offset, CXL_CACHEMEM_REGISTER_HEADER_SIZE
-        )
-        # TODO: Define constants for masks
-        cxl_capability_id = cxl_capability_header & 0xFFFF
-        cxl_capability_version = (cxl_capability_header >> 16) & 0xF
-        cxl_cachemem_version = (cxl_capability_header >> 20) & 0xF
-        array_size = (cxl_capability_header >> 24) & 0xFF
-
-        logger.debug(self._create_message(f"cxl_capability_id: {cxl_capability_id:x}"))
-        logger.debug(self._create_message(f"cxl_capability_version: {cxl_capability_version:x}"))
-        logger.debug(self._create_message(f"cxl_cachemem_version: {cxl_cachemem_version:x}"))
-        logger.debug(self._create_message(f"array_size: {array_size:x}"))
-
-        if cxl_capability_id != CXL_CACHEMEM_REGISTER_CAPABILITY_ID.CXL:
-            return
-
-        for header_index in range(array_size):
-            header_offset = (
-                header_index + 1
-            ) * CXL_CACHEMEM_REGISTER_HEADER_SIZE + cxl_cachemem_offset
-            header_info = await self._root_complex.read_mmio(
-                header_offset, CXL_CACHEMEM_REGISTER_HEADER_SIZE
+            logger.debug(
+                self._create_message(
+                    f"Scanning CXL.cache and CXL.mem Registers at 0x{cxl_cachemem_offset:x}"
+                )
             )
 
+            cxl_capability_header = await self._root_complex.read_mmio(
+                cxl_cachemem_offset, CXL_CACHEMEM_REGISTER_HEADER_SIZE
+            )
+            if cxl_capability_header is None:
+                continue
             # TODO: Define constants for masks
-            cxl_capability_id = header_info & 0xFFFF
-            cxl_capability_version = (header_info >> 16) & 0xF
-            offset = (header_info >> 20) & 0xFFF
-            cxl_capability_address = cxl_cachemem_offset + offset
-            capability_name = CXL_CACHEMEM_REGISTER_CAPABILITY_ID(cxl_capability_id).name
-            logger.debug(self._create_message(f"Found {capability_name} Capability Header"))
-            device_info.cachemem_registers[cxl_capability_id] = CxlCacheMemRegisterInfo(
-                id=cxl_capability_id,
-                version=cxl_capability_version,
-                offset=offset,
-                address=cxl_capability_address,
+            cxl_capability_id = cxl_capability_header & 0xFFFF
+            cxl_capability_version = (cxl_capability_header >> 16) & 0xF
+            cxl_cachemem_version = (cxl_capability_header >> 20) & 0xF
+            array_size = (cxl_capability_header >> 24) & 0xFF
+
+            logger.debug(self._create_message(f"cxl_capability_id: {cxl_capability_id:x}"))
+            logger.debug(
+                self._create_message(f"cxl_capability_version: {cxl_capability_version:x}")
             )
+            logger.debug(self._create_message(f"cxl_cachemem_version: {cxl_cachemem_version:x}"))
+            logger.debug(self._create_message(f"array_size: {array_size:x}"))
+
+            if cxl_capability_id != CXL_CACHEMEM_REGISTER_CAPABILITY_ID.CXL:
+                # Try next base if the header is not CXL
+                continue
+
+            for header_index in range(array_size):
+                header_offset = (
+                    header_index + 1
+                ) * CXL_CACHEMEM_REGISTER_HEADER_SIZE + cxl_cachemem_offset
+                header_info = await self._root_complex.read_mmio(
+                    header_offset, CXL_CACHEMEM_REGISTER_HEADER_SIZE
+                )
+                if header_info is None:
+                    logger.warning(
+                        self._create_message(
+                            "CXL.cachemem header read returned None; stopping capability scan"
+                        )
+                    )
+                    break
+
+                # TODO: Define constants for masks
+                cxl_capability_id = header_info & 0xFFFF
+                # Some devices may report fewer valid entries than array_size; skip blanks
+                if cxl_capability_id == 0:
+                    continue
+                cxl_capability_version = (header_info >> 16) & 0xF
+                offset = (header_info >> 20) & 0xFFF
+                cxl_capability_address = cxl_cachemem_offset + offset
+                capability_name = CXL_CACHEMEM_REGISTER_CAPABILITY_ID(cxl_capability_id).name
+                logger.debug(self._create_message(f"Found {capability_name} Capability Header"))
+                # Don't overwrite if already populated from another base
+                if cxl_capability_id not in device_info.cachemem_registers:
+                    device_info.cachemem_registers[cxl_capability_id] = CxlCacheMemRegisterInfo(
+                        id=cxl_capability_id,
+                        version=cxl_capability_version,
+                        offset=offset,
+                        address=cxl_capability_address,
+                    )
 
     async def _scan_component_register(self, device_info: CxlDeviceInfo):
         await self._scan_cachemem_registers(device_info)

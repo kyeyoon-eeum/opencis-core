@@ -6,6 +6,8 @@ See LICENSE for details.
 """
 
 from asyncio import create_task, gather
+import asyncio
+import threading
 from typing import Optional, cast
 from opencis.cxl.cci.common import CCI_FM_API_COMMAND_OPCODE
 from opencis.util.component import RunnableComponent
@@ -46,6 +48,11 @@ class FMLD(RunnableComponent):
         # ld_id of 1 has 768M of memory
         # ld_id of 2 has 512M of memory
         self._ld_allocations = {i: 1 for i in range(ld_count)}
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._t2f_thread: threading.Thread | None = None
+        self._t2f_stop = threading.Event()
+        self._f2t_thread: threading.Thread | None = None
+        self._f2t_stop = threading.Event()
 
     async def _process_get_ld_info_packet(self, get_ld_info_request_packet: CciRequestPacket):
         if get_ld_info_request_packet.get_command_opcode() != CCI_FM_API_COMMAND_OPCODE.GET_LD_INFO:
@@ -128,12 +135,15 @@ class FMLD(RunnableComponent):
         logger.info("Set LD Allocations Response sent done")
 
     async def _process_fm_to_target(self):
-        logger.info(self._create_message("Started processing FM-to-LD packets"))
+        # Async fallback (unused in thread mode). Kept for compatibility.
+        logger.info(self._create_message("Started processing FM-to-LD packets (async)"))
         while True:
             packet = await self.upstream_fifo.host_to_target.get()
             logger.info(self._create_message(f"FMLD received FM-to-LD packet: {packet}"))
             if packet is None:
-                logger.info(self._create_message("None packet received, stopping FM-to-LD packets"))
+                logger.info(
+                    self._create_message("None packet received, stopping FM-to-LD packets (async)")
+                )
                 break
 
             if packet.get_command_opcode() == CCI_FM_API_COMMAND_OPCODE.GET_LD_INFO:
@@ -145,32 +155,95 @@ class FMLD(RunnableComponent):
             elif packet.get_command_opcode() == CCI_FM_API_COMMAND_OPCODE.SET_LD_ALLOCATIONS:
                 packet = cast(SetLdAllocationsRequestPacket, packet)
                 await self._process_set_ld_allocations_packet(packet)
-        logger.info(self._create_message("Stopped processing FM-to-LD packets"))
+        logger.info(self._create_message("Stopped processing FM-to-LD packets (async)"))
 
     # TODO: This function should be implemented for LD-to-FM API
     async def _process_target_to_fm(self):
+        # Fallback async path if thread not used
         if self.downstream_fifo is None:
             logger.info(self._create_message("Skipped processing LD-to-FM packets"))
             return
-        logger.info(self._create_message("Started processing LD-to-FM packets"))
+        logger.info(self._create_message("Started processing LD-to-FM packets (async)"))
         while True:
             packet = await self.downstream_fifo.target_to_host.get()
             if packet is None:
-                logger.info(self._create_message("Stopped LD-to-FM packets"))
+                logger.info(self._create_message("Stopped LD-to-FM packets (async)"))
                 break
             logger.info(self._create_message("Received LD-to-FM Packet"))
             await self.upstream_fifo.target_to_host.put(packet)
 
+    def _t2f_worker(self) -> None:
+        if self.downstream_fifo is None:
+            return
+        assert self._loop is not None
+        logger.info(self._create_message("Started LD-to-FM worker (thread)"))
+        while not self._t2f_stop.is_set():
+            packet = asyncio.run_coroutine_threadsafe(
+                self.downstream_fifo.target_to_host.get(), self._loop
+            ).result()
+            if packet is None:
+                break
+            asyncio.run_coroutine_threadsafe(
+                self.upstream_fifo.target_to_host.put(packet), self._loop
+            ).result()
+        logger.info(self._create_message("Stopped LD-to-FM worker (thread)"))
+
+    def _f2t_worker(self) -> None:
+        assert self._loop is not None
+        logger.info(self._create_message("Started FM-to-LD worker (thread)"))
+        while not self._f2t_stop.is_set():
+            packet = asyncio.run_coroutine_threadsafe(
+                self.upstream_fifo.host_to_target.get(), self._loop
+            ).result()
+            logger.info(self._create_message(f"FMLD received FM-to-LD packet: {packet}"))
+            if packet is None:
+                break
+            opcode = packet.get_command_opcode()
+            if opcode == CCI_FM_API_COMMAND_OPCODE.GET_LD_INFO:
+                req = cast(GetLdInfoRequestPacket, packet)
+                asyncio.run_coroutine_threadsafe(
+                    self._process_get_ld_info_packet(req), self._loop
+                ).result()
+            elif opcode == CCI_FM_API_COMMAND_OPCODE.GET_LD_ALLOCATIONS:
+                req = cast(GetLdAllocationsRequestPacket, packet)
+                asyncio.run_coroutine_threadsafe(
+                    self._process_get_ld_allocations_packet(req), self._loop
+                ).result()
+            elif opcode == CCI_FM_API_COMMAND_OPCODE.SET_LD_ALLOCATIONS:
+                req = cast(SetLdAllocationsRequestPacket, packet)
+                asyncio.run_coroutine_threadsafe(
+                    self._process_set_ld_allocations_packet(req), self._loop
+                ).result()
+        logger.info(self._create_message("Stopped FM-to-LD worker (thread)"))
+
     async def _run(self):
-        tasks = [
-            create_task(self._process_fm_to_target()),
-            create_task(self._process_target_to_fm()),
-        ]
+        self._loop = asyncio.get_running_loop()
+        # Start thread to forward LD->FM responses if downstream is present
+        if self.downstream_fifo is not None:
+            self._t2f_stop.clear()
+            self._t2f_thread = threading.Thread(
+                target=self._t2f_worker, name=f"{self.__class__.__name__}-t2f", daemon=True
+            )
+            self._t2f_thread.start()
+        # Start FM->LD worker thread
+        self._f2t_stop.clear()
+        self._f2t_thread = threading.Thread(
+            target=self._f2t_worker, name=f"{self.__class__.__name__}-f2t", daemon=True
+        )
+        self._f2t_thread.start()
+        tasks = []
         await self._change_status_to_running()
         await gather(*tasks)
 
     async def _stop(self):
         logger.info(self._create_message("Stopping FMLD"))
-        if self.downstream_fifo is not None:
-            await self.downstream_fifo.target_to_host.put(None)
+        # Stop FM->LD worker
+        self._f2t_stop.set()
         await self.upstream_fifo.host_to_target.put(None)
+        if self._f2t_thread is not None:
+            self._f2t_thread.join(timeout=1.0)
+        if self.downstream_fifo is not None:
+            self._t2f_stop.set()
+            await self.downstream_fifo.target_to_host.put(None)
+            if self._t2f_thread is not None:
+                self._t2f_thread.join(timeout=1.0)

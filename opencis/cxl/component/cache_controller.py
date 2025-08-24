@@ -10,6 +10,8 @@ from asyncio import create_task, gather
 from dataclasses import dataclass
 from enum import Enum, auto
 from math import log2
+import asyncio
+import threading
 
 from opencis.util.logger import logger
 from opencis.util.component import RunnableComponent
@@ -125,6 +127,11 @@ class CacheController(RunnableComponent):
         self._coh_bridge_to_cache_fifo = config.coh_bridge_to_cache_fifo
 
         self._memory_ranges: List[MemoryRange] = []
+
+        # Threaded scheduler infrastructure
+        self._loop: asyncio.AbstractEventLoop | None = None  # type: ignore[name-defined]
+        self._stop_evt = False
+        self._threads: list[threading.Thread] = []  # type: ignore[name-defined]
 
         self.init_cache()
         logger.debug(self._create_message(f"{config.component_name} LLC Generated"))
@@ -420,48 +427,70 @@ class CacheController(RunnableComponent):
             self._cache_data_write(set, cache_blk, data)
 
     async def _uncached_load(self, addr: int, size: int) -> int:
+        from opencis.util.logger import logger  # local import to avoid cycle at module load
+
+        logger.info(self._create_message(f"UNCACHED_READ req addr=0x{addr:x} size={size}"))
         packet = CacheRequest(CACHE_REQUEST_TYPE.UNCACHED_READ, addr, size)
         await self._cache_to_coh_agent_fifo.request.put(packet)
         resp = await self._cache_to_coh_agent_fifo.response.get()
+        logger.info(self._create_message("UNCACHED_READ rsp OK"))
         return resp.data
 
     async def _uncached_store(self, addr: int, size: int, data: int) -> int:
+        from opencis.util.logger import logger  # local import to avoid cycle at module load
+
+        logger.info(self._create_message(f"UNCACHED_WRITE req addr=0x{addr:x} size={size}"))
         packet = CacheRequest(CACHE_REQUEST_TYPE.UNCACHED_WRITE, addr, size, data)
         await self._cache_to_coh_agent_fifo.request.put(packet)
-        await self._cache_to_coh_agent_fifo.response.get()
+        resp = await self._cache_to_coh_agent_fifo.response.get()
+        logger.info(self._create_message("UNCACHED_WRITE rsp OK"))
 
-    # registered event loop for processor's cache load/store operations
-    async def _processor_request_scheduler(self):
-        while True:
-            packet = await self._processor_to_cache_fifo.request.get()
+    # registered event loop for processor's cache load/store operations (thread worker)
+    def _processor_request_worker(self) -> None:
+        assert self._loop is not None
+        while not self._stop_evt:
+            packet = asyncio.run_coroutine_threadsafe(
+                self._processor_to_cache_fifo.request.get(), self._loop
+            ).result()
             if packet is None:
                 logger.debug(
                     self._create_message("Stop processing processor request scheduler fifo")
                 )
                 break
-            match packet.type:
-                case MEMORY_REQUEST_TYPE.READ:
-                    data = await self.cache_coherent_load(packet.addr, packet.size)
-                    packet = MemoryResponse(MEMORY_RESPONSE_STATUS.OK, data)
-                    await self._processor_to_cache_fifo.response.put(packet)
-
-                case MEMORY_REQUEST_TYPE.UNCACHED_READ:
-                    data = await self._uncached_load(packet.addr, packet.size)
-                    packet = MemoryResponse(MEMORY_RESPONSE_STATUS.OK, data)
-                    await self._processor_to_cache_fifo.response.put(packet)
-
-                case MEMORY_REQUEST_TYPE.WRITE:
-                    await self.cache_coherent_store(packet.addr, packet.size, packet.data)
-                    packet = MemoryResponse(MEMORY_RESPONSE_STATUS.OK)
-                    await self._processor_to_cache_fifo.response.put(packet)
-
-                case MEMORY_REQUEST_TYPE.UNCACHED_WRITE:
-                    await self._uncached_store(packet.addr, packet.size, packet.data)
-                    packet = MemoryResponse(MEMORY_RESPONSE_STATUS.OK)
-                    await self._processor_to_cache_fifo.response.put(packet)
-
-                case _:
-                    assert False
+            if packet.type == MEMORY_REQUEST_TYPE.READ:
+                data = asyncio.run_coroutine_threadsafe(
+                    self.cache_coherent_load(packet.addr, packet.size), self._loop
+                ).result()
+                resp = MemoryResponse(MEMORY_RESPONSE_STATUS.OK, data)
+                asyncio.run_coroutine_threadsafe(
+                    self._processor_to_cache_fifo.response.put(resp), self._loop
+                ).result()
+            elif packet.type == MEMORY_REQUEST_TYPE.UNCACHED_READ:
+                data = asyncio.run_coroutine_threadsafe(
+                    self._uncached_load(packet.addr, packet.size), self._loop
+                ).result()
+                resp = MemoryResponse(MEMORY_RESPONSE_STATUS.OK, data)
+                asyncio.run_coroutine_threadsafe(
+                    self._processor_to_cache_fifo.response.put(resp), self._loop
+                ).result()
+            elif packet.type == MEMORY_REQUEST_TYPE.WRITE:
+                asyncio.run_coroutine_threadsafe(
+                    self.cache_coherent_store(packet.addr, packet.size, packet.data), self._loop
+                ).result()
+                resp = MemoryResponse(MEMORY_RESPONSE_STATUS.OK)
+                asyncio.run_coroutine_threadsafe(
+                    self._processor_to_cache_fifo.response.put(resp), self._loop
+                ).result()
+            elif packet.type == MEMORY_REQUEST_TYPE.UNCACHED_WRITE:
+                asyncio.run_coroutine_threadsafe(
+                    self._uncached_store(packet.addr, packet.size, packet.data), self._loop
+                ).result()
+                resp = MemoryResponse(MEMORY_RESPONSE_STATUS.OK)
+                asyncio.run_coroutine_threadsafe(
+                    self._processor_to_cache_fifo.response.put(resp), self._loop
+                ).result()
+            else:
+                assert False
 
     async def _run_coh_request(self, packet: CacheRequest, cache_fifo: CacheFifoPair):
         cache_blk, data, prev_state = await self._coh_to_cache_state_lookup(
@@ -486,41 +515,100 @@ class CacheController(RunnableComponent):
             assert False
         await cache_fifo.response.put(packet)
 
-    # registered event loop for coh module's cache loopup operations
-    async def _coh_agent_request_scheduler(self):
-        while True:
-            packet = await self._coh_agent_to_cache_fifo.request.get()
+    # registered event loop for coh module's cache lookup operations (thread worker)
+    def _coh_agent_request_worker(self) -> None:
+        assert self._loop is not None
+        while not self._stop_evt:
+            packet = asyncio.run_coroutine_threadsafe(
+                self._coh_agent_to_cache_fifo.request.get(), self._loop
+            ).result()
             if packet is None:
                 logger.debug(
                     self._create_message("Stop processing coh agent request scheduler fifo")
                 )
                 break
-            await self._run_coh_request(packet, self._coh_agent_to_cache_fifo)
+            asyncio.run_coroutine_threadsafe(
+                self._run_coh_request(packet, self._coh_agent_to_cache_fifo), self._loop
+            ).result()
 
-    async def _coh_bridge_request_scheduler(self):
-        while True:
-            packet = await self._coh_bridge_to_cache_fifo.request.get()
+    def _coh_bridge_request_worker(self) -> None:
+        assert self._loop is not None
+        while not self._stop_evt:
+            packet = asyncio.run_coroutine_threadsafe(
+                self._coh_bridge_to_cache_fifo.request.get(), self._loop
+            ).result()
             if packet is None:
                 logger.debug(
                     self._create_message("Stop processing coh bridge request scheduler fifo")
                 )
                 break
-            await self._run_coh_request(packet, self._coh_bridge_to_cache_fifo)
+            asyncio.run_coroutine_threadsafe(
+                self._run_coh_request(packet, self._coh_bridge_to_cache_fifo), self._loop
+            ).result()
 
     async def _run(self):
-        tasks = [
-            create_task(self._coh_agent_request_scheduler()),
-        ]
+        # Initialize loop and start worker threads
+        import asyncio as _asyncio  # avoid top-cycle
+        import threading as _threading
+
+        self._loop = _asyncio.get_running_loop()
+        self._stop_evt = False
+        self._threads = []
+
+        # coh agent worker always present
+        t_agent = _threading.Thread(
+            target=self._coh_agent_request_worker,
+            name=f"{self.get_message_label()}-coh-agent",
+            daemon=True,
+        )
+        t_agent.start()
+        self._threads.append(t_agent)
+
+        # processor worker when processor_to_cache_fifo is provided (host-side)
         if self._processor_to_cache_fifo:
-            tasks.append(create_task(self._processor_request_scheduler()))
+            t_proc = _threading.Thread(
+                target=self._processor_request_worker,
+                name=f"{self.get_message_label()}-proc",
+                daemon=True,
+            )
+            t_proc.start()
+            self._threads.append(t_proc)
+
+        # bridge worker when bridge fifo present
         if self._cache_to_coh_bridge_fifo:
-            tasks.append(create_task(self._coh_bridge_request_scheduler()))
+            t_bridge = _threading.Thread(
+                target=self._coh_bridge_request_worker,
+                name=f"{self.get_message_label()}-bridge",
+                daemon=True,
+            )
+            t_bridge.start()
+            self._threads.append(t_bridge)
+
         await self._change_status_to_running()
-        await gather(*tasks)
+        # Keep component alive
+        stopper = _asyncio.Event()
+        await stopper.wait()
 
     async def _stop(self):
-        if self._processor_to_cache_fifo:
-            await self._processor_to_cache_fifo.request.put(None)
-        if self._coh_bridge_to_cache_fifo:
-            await self._coh_bridge_to_cache_fifo.request.put(None)
-        await self._coh_agent_to_cache_fifo.request.put(None)
+        # Signal workers to stop and nudge queues with None, matching original semantics
+        self._stop_evt = True
+        try:
+            if self._processor_to_cache_fifo:
+                await self._processor_to_cache_fifo.request.put(None)
+        except Exception:
+            pass
+        try:
+            if self._coh_bridge_to_cache_fifo:
+                await self._coh_bridge_to_cache_fifo.request.put(None)
+        except Exception:
+            pass
+        try:
+            await self._coh_agent_to_cache_fifo.request.put(None)
+        except Exception:
+            pass
+        # Join threads
+        for t in getattr(self, "_threads", []) or []:
+            try:
+                t.join(timeout=1.0)
+            except Exception:
+                pass

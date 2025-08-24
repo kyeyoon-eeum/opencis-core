@@ -6,6 +6,8 @@ See LICENSE for details.
 """
 
 from dataclasses import dataclass
+import asyncio
+import threading
 from typing import cast
 from opencis.util.async_queue import AsyncQueue as Queue
 from asyncio import create_task, gather, timeout, exceptions
@@ -47,6 +49,11 @@ class IoBridge(RunnableComponent):
         self._next_tag = 0
 
         self._internal_io_fifo = Queue()
+        self._internal_cfg_fifo = Queue()
+        self._loop = None
+        self._mmio_thread = None
+        self._cfg_thread = None
+        self._stop_evt = threading.Event()
 
     # pylint: disable=unused-argument
     async def _get_mmio_response(self, tag: int):
@@ -84,8 +91,13 @@ class IoBridge(RunnableComponent):
         await self._cxl_io_cfg_fifos.host_to_target.put(packet)
         logger.debug(self._create_message("Enqueued CFG WR to host_to_target"))
 
-        # TODO: Wait for an incoming packet that matchs tag
-        packet = await self._cxl_io_cfg_fifos.target_to_host.get()
+        # Wait for completion from internal cfg fifo (fed by thread)
+        try:
+            async with timeout(10):
+                packet = await self._internal_cfg_fifo.get()
+        except exceptions.TimeoutError:
+            logger.error(self._create_message("CXL.io cfg WR: Timed-out"))
+            return
         logger.debug(self._create_message("Dequeued CFG completion from target_to_host"))
 
         tpl_type_str = "CFG WR0" if is_type0 else "CFG WR1"
@@ -132,9 +144,14 @@ class IoBridge(RunnableComponent):
         await self._cxl_io_cfg_fifos.host_to_target.put(packet)
         logger.debug(self._create_message("Enqueued CFG RD to host_to_target"))
 
-        # TODO: Wait for an incoming packet that matchs tag
+        # Wait for completion from internal cfg fifo (fed by thread)
         logger.debug(self._create_message("Putting Read Config packet to FIFO"))
-        packet = await self._cxl_io_cfg_fifos.target_to_host.get()
+        try:
+            async with timeout(10):
+                packet = await self._internal_cfg_fifo.get()
+        except exceptions.TimeoutError:
+            logger.error(self._create_message("CXL.io cfg RD: Timed-out"))
+            return None
         logger.debug(self._create_message("Dequeued CFG completion from target_to_host"))
 
         bit_offset = (offset % 4) * 8
@@ -175,7 +192,7 @@ class IoBridge(RunnableComponent):
         logger.debug(self._create_message("Enqueued MMIO RD to host_to_target"))
 
         try:
-            async with timeout(10):
+            async with timeout(1):
                 packet = await self._get_mmio_response(packet.mreq_header.tag)
 
         except exceptions.TimeoutError:
@@ -189,6 +206,7 @@ class IoBridge(RunnableComponent):
     # pylint: enable=duplicate-code
 
     async def process_target_to_host_mmio_packets(self):
+        # Async fallback if thread not used
         while True:
             packet = await self._cxl_io_mmio_fifos.target_to_host.get()
             if packet is None:
@@ -197,10 +215,79 @@ class IoBridge(RunnableComponent):
             await self._internal_io_fifo.put(packet)
 
     async def _run(self):
-        tasks = [create_task(self.process_target_to_host_mmio_packets())]
+        self._loop = asyncio.get_running_loop()
+        # Start thread to forward MMIO completions into internal FIFO
+        self._stop_evt.clear()
+        self._mmio_thread = threading.Thread(
+            target=self._mmio_resp_worker, name=f"{self.get_message_label()}-mmio", daemon=True
+        )
+        self._mmio_thread.start()
+        # Start thread to forward CFG completions into internal FIFO
+        self._cfg_thread = threading.Thread(
+            target=self._cfg_resp_worker, name=f"{self.get_message_label()}-cfg", daemon=True
+        )
+        self._cfg_thread.start()
         await self._change_status_to_running()
-        await gather(*tasks)
+        # Keep alive until stop
+        stopper = asyncio.Event()
+        try:
+            while not self._stop_evt.is_set():
+                try:
+                    await asyncio.wait_for(stopper.wait(), timeout=0.1)
+                except asyncio.TimeoutError:
+                    pass
+        finally:
+            pass
 
     async def _stop(self):
-        await self._cxl_io_mmio_fifos.host_to_target.put(None)
-        await self._cxl_io_mmio_fifos.target_to_host.put(None)
+        self._stop_evt.set()
+        try:
+            await self._cxl_io_mmio_fifos.host_to_target.put(None)
+            await self._cxl_io_mmio_fifos.target_to_host.put(None)
+            await self._cxl_io_cfg_fifos.host_to_target.put(None)
+            await self._cxl_io_cfg_fifos.target_to_host.put(None)
+        except Exception:
+            pass
+        try:
+            if self._mmio_thread is not None:
+                self._mmio_thread.join(timeout=1.0)
+            if self._cfg_thread is not None:
+                self._cfg_thread.join(timeout=1.0)
+        except Exception:
+            pass
+
+    def _mmio_resp_worker(self) -> None:
+        assert self._loop is not None
+        while not self._stop_evt.is_set():
+            try:
+                packet = asyncio.run_coroutine_threadsafe(
+                    self._cxl_io_mmio_fifos.target_to_host.get(), self._loop
+                ).result()
+            except Exception:
+                break
+            if packet is None:
+                break
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    self._internal_io_fifo.put(packet), self._loop
+                ).result()
+            except Exception:
+                break
+
+    def _cfg_resp_worker(self) -> None:
+        assert self._loop is not None
+        while not self._stop_evt.is_set():
+            try:
+                packet = asyncio.run_coroutine_threadsafe(
+                    self._cxl_io_cfg_fifos.target_to_host.get(), self._loop
+                ).result()
+            except Exception:
+                break
+            if packet is None:
+                break
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    self._internal_cfg_fifo.put(packet), self._loop
+                ).result()
+            except Exception:
+                break

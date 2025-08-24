@@ -12,6 +12,7 @@ from asyncio import (
     Lock,
 )
 import asyncio
+import threading
 from dataclasses import dataclass
 from enum import StrEnum, IntEnum
 from typing import cast, Optional, Dict, Union, List
@@ -89,9 +90,19 @@ class CxlPacketProcessor(RunnableComponent):
         self._component_type = component_type
         self._fmld = None
         self._cci_connection_for_fmld = None
+        self._reader_thread = None
+        self._reader_thread_stop = threading.Event()
+        self._loop = None
+        self._outgoing_threads: list[threading.Thread] = []
+        self._writer_lock = threading.Lock()
+        self._tlp_lock = threading.Lock()
+        self._stop_event_async: Optional[asyncio.Event] = None
+        self._outgoing_stop = threading.Event()
 
         logger.debug(self._create_message(f"Configured for {component_type.name}"))
         if component_type in (CXL_COMPONENT_TYPE.R, CXL_COMPONENT_TYPE.DSP):
+            # For both R (host end) and DSP (device end), this stream instance
+            # sees T2H completions as incoming and H2T requests as outgoing.
             self._incoming = FifoGroup(
                 cfg_space=self._cxl_connection.cfg_fifo.target_to_host,
                 mmio=self._cxl_connection.mmio_fifo.target_to_host,
@@ -230,11 +241,12 @@ class CxlPacketProcessor(RunnableComponent):
         del self._tlp_table[t_index]
         return fifo_type
 
-    async def _process_incoming_packets(self):
-        logger.debug(self._create_message(f"Starting {self._incoming_dir} packet processor"))
-        while True:  # pylint: disable=too-many-nested-blocks
+    def _reader_thread_main(self):
+        logger.debug(self._create_message(f"Reader thread starting for {self._incoming_dir}"))
+        assert self._loop is not None
+        while not self._reader_thread_stop.is_set():  # pylint: disable=too-many-nested-blocks
             try:
-                packet = await asyncio.to_thread(self._reader.get_packet)
+                packet = self._reader.get_packet()
                 # Gracefully handle sideband frames that may appear on the stream (e.g., transport handshakes)
                 base_packet = cast(BasePacket, packet)
                 if base_packet.system_header.payload_type == SYSTEM_PAYLOAD_TYPE.SIDEBAND:
@@ -243,7 +255,9 @@ class CxlPacketProcessor(RunnableComponent):
                         notification_packet = BaseSidebandPacket.create(
                             SIDEBAND_TYPES.CONNECTION_DISCONNECTED
                         )
-                        await self._notify_outgoing_processors(notification_packet)
+                        asyncio.run_coroutine_threadsafe(
+                            self._notify_outgoing_processors(notification_packet), self._loop
+                        )
                         break
                     # Ignore other sideband frames
                     logger.debug("[%s] Received sideband; ignoring", self.get_message_label())
@@ -260,15 +274,20 @@ class CxlPacketProcessor(RunnableComponent):
                         # Add MLD
                         if self._component_type == CXL_COMPONENT_TYPE.LD:
                             ld_id = cxl_io_packet.tlp_prefix.ld_id
-                            if fifo_type == CXL_IO_FIFO_TYPE.CFG:
-                                await self._incoming[ld_id].cfg_space.put(cxl_io_packet)
-                            else:
-                                await self._incoming[ld_id].mmio.put(cxl_io_packet)
+                            target_q = (
+                                self._incoming[ld_id].cfg_space
+                                if fifo_type == CXL_IO_FIFO_TYPE.CFG
+                                else self._incoming[ld_id].mmio
+                            )
                         else:
-                            if fifo_type == CXL_IO_FIFO_TYPE.CFG:
-                                await self._incoming.cfg_space.put(cxl_io_packet)
-                            else:
-                                await self._incoming.mmio.put(cxl_io_packet)
+                            target_q = (
+                                self._incoming.cfg_space
+                                if fifo_type == CXL_IO_FIFO_TYPE.CFG
+                                else self._incoming.mmio
+                            )
+                        asyncio.run_coroutine_threadsafe(
+                            target_q.put(cxl_io_packet), self._loop
+                        ).result()
                     elif cxl_io_packet.is_cfg():
                         logger.debug(
                             "[%s] Received %s CXL.io (CFG_RD/CFG_WR) packet",
@@ -279,9 +298,13 @@ class CxlPacketProcessor(RunnableComponent):
                         # Add MLD
                         if self._component_type == CXL_COMPONENT_TYPE.LD:
                             ld_id = cxl_io_packet.tlp_prefix.ld_id
-                            await self._incoming[ld_id].cfg_space.put(cxl_io_packet)
+                            asyncio.run_coroutine_threadsafe(
+                                self._incoming[ld_id].cfg_space.put(cxl_io_packet), self._loop
+                            ).result()
                         else:
-                            await self._incoming.cfg_space.put(cxl_io_packet)
+                            asyncio.run_coroutine_threadsafe(
+                                self._incoming.cfg_space.put(cxl_io_packet), self._loop
+                            ).result()
                     elif cxl_io_packet.is_mmio():
                         logger.debug(
                             "[%s] Received %s CXL.io (MRD/MWR) packet",
@@ -293,9 +316,13 @@ class CxlPacketProcessor(RunnableComponent):
                         # Add MLD
                         if self._component_type == CXL_COMPONENT_TYPE.LD:
                             ld_id = cxl_io_packet.tlp_prefix.ld_id
-                            await self._incoming[ld_id].mmio.put(cxl_io_packet)
+                            asyncio.run_coroutine_threadsafe(
+                                self._incoming[ld_id].mmio.put(cxl_io_packet), self._loop
+                            ).result()
                         else:
-                            await self._incoming.mmio.put(cxl_io_packet)
+                            asyncio.run_coroutine_threadsafe(
+                                self._incoming.mmio.put(cxl_io_packet), self._loop
+                            ).result()
                     else:
                         logger.warning("[%s] Unexpected CXL.io packet", self.get_message_label())
                         logger.debug(
@@ -332,9 +359,13 @@ class CxlPacketProcessor(RunnableComponent):
                                 "[%s] Unexpected CXL.mem packet", self.get_message_label()
                             )
 
-                        await self._incoming[ld_id].cxl_mem.put(cxl_mem_packet)
+                        asyncio.run_coroutine_threadsafe(
+                            self._incoming[ld_id].cxl_mem.put(cxl_mem_packet), self._loop
+                        ).result()
                     else:
-                        await self._incoming.cxl_mem.put(cxl_mem_packet)
+                        asyncio.run_coroutine_threadsafe(
+                            self._incoming.cxl_mem.put(cxl_mem_packet), self._loop
+                        ).result()
 
                 elif packet.is_cxl_cache():
                     if self._incoming.cxl_cache is None:
@@ -349,7 +380,9 @@ class CxlPacketProcessor(RunnableComponent):
                         self._incoming_dir,
                     )
                     cxl_cache_packet = cast(CxlCacheBasePacket, packet)
-                    await self._incoming.cxl_cache.put(cxl_cache_packet)
+                    asyncio.run_coroutine_threadsafe(
+                        self._incoming.cxl_cache.put(cxl_cache_packet), self._loop
+                    ).result()
                 elif packet.is_cci():
                     if self._component_type == CXL_COMPONENT_TYPE.D2:
                         logger.error(
@@ -364,9 +397,13 @@ class CxlPacketProcessor(RunnableComponent):
                             )
                             raise Exception("Got CCI packet on no CCI FIFO")
                         cci_packet = cast(CciRequestPacket, packet)
-                        await self._fmld.upstream_fifo.host_to_target.put(cci_packet)
+                        asyncio.run_coroutine_threadsafe(
+                            self._fmld.upstream_fifo.host_to_target.put(cci_packet), self._loop
+                        ).result()
                     elif self._component_type == CXL_COMPONENT_TYPE.DSP:
-                        await self._incoming.cci_fifo.put(packet)
+                        asyncio.run_coroutine_threadsafe(
+                            self._incoming.cci_fifo.put(packet), self._loop
+                        ).result()
                 else:
                     message = f"Received unexpected {self._incoming_dir} packet"
                     logger.warning("[%s] %s", self.get_message_label(), message)
@@ -378,14 +415,14 @@ class CxlPacketProcessor(RunnableComponent):
                     notification_packet = BaseSidebandPacket.create(
                         SIDEBAND_TYPES.CONNECTION_DISCONNECTED
                     )
-                    await self._notify_outgoing_processors(notification_packet)
+                    asyncio.run_coroutine_threadsafe(
+                        self._notify_outgoing_processors(notification_packet), self._loop
+                    )
                     break
                 # Otherwise, treat as recoverable and continue
                 logger.warning("[%s] Recoverable incoming error: %s", self.get_message_label(), msg)
                 continue
-        logger.debug(
-            "[%s] Stopped %s packet processor", self.get_message_label(), self._incoming_dir
-        )
+        logger.debug("[%s] Stopped %s reader thread", self.get_message_label(), self._incoming_dir)
 
     async def _notify_outgoing_processors(self, packet):
         await self._outgoing.cfg_space.put(packet)
@@ -402,69 +439,55 @@ class CxlPacketProcessor(RunnableComponent):
             await self._outgoing.cci_fifo.put(packet)
 
     async def _process_outgoing_cfg_packets(self):
-        logger.debug(self._create_message("Starting outgoing CFG FIFO processor"))
+        # Kept only for compatibility if ever invoked; main path uses threads
+        logger.debug(self._create_message("Starting outgoing CFG FIFO processor (async fallback)"))
         while True:
             packet = await self._outgoing.cfg_space.get()
             if self._is_disconnection_notification(packet):
                 break
-
             cxl_io_packet = cast(CxlIoBasePacket, packet)
             if cxl_io_packet.is_cpl() or cxl_io_packet.is_cpld():
-                logger.debug(
-                    "[%s] Received %s CXL.io (CPL/CPLD) packet",
-                    self.get_message_label(),
-                    self._outgoing_dir,
-                )
-                self._pop_tlp_table_entry(cxl_io_packet)
+                with self._tlp_lock:
+                    self._pop_tlp_table_entry(cxl_io_packet)
             else:
-                logger.debug(
-                    "[%s] Received %s CXL.io (CFG_RD/CFG_WR) packet",
-                    self.get_message_label(),
-                    self._outgoing_dir,
-                )
-                self._push_tlp_table_entry(cxl_io_packet)
-            # zero-copy write path
+                with self._tlp_lock:
+                    self._push_tlp_table_entry(cxl_io_packet)
             try:
                 view = packet.get_view()  # type: ignore[attr-defined]
             except Exception:
                 view = bytes(packet)
-            self._writer.write(view)
-            await self._writer.drain()
-        logger.debug(self._create_message("Stopped outgoing CFG FIFO processor"))
+            with self._writer_lock:
+                self._writer.write(view)
+                await asyncio.to_thread(self._writer.drain_blocking)
+        logger.debug(self._create_message("Stopped outgoing CFG FIFO processor (async fallback)"))
 
     async def _process_outgoing_mmio_packets(self):
-        logger.debug(self._create_message("Starting outgoing MMIO FIFO processor"))
+        logger.debug(self._create_message("Starting outgoing MMIO FIFO processor (async fallback)"))
         while True:
             packet = await self._outgoing.mmio.get()
             if self._is_disconnection_notification(packet):
                 break
             cxl_io_packet = cast(CxlIoBasePacket, packet)
             if cxl_io_packet.is_cpl() or cxl_io_packet.is_cpld():
-                logger.debug(
-                    "[%s] Received %s CXL.io (CPL/CPLD) packet",
-                    self.get_message_label(),
-                    self._outgoing_dir,
-                )
-                self._pop_tlp_table_entry(cxl_io_packet)
+                with self._tlp_lock:
+                    self._pop_tlp_table_entry(cxl_io_packet)
             else:
-                logger.debug(
-                    "[%s] Received %s CXL.io (MRD/MWR) packet",
-                    self.get_message_label(),
-                    self._outgoing_dir,
-                )
                 if cxl_io_packet.is_mem_write() is False:
-                    self._push_tlp_table_entry(cxl_io_packet)
-            # zero-copy write path
+                    with self._tlp_lock:
+                        self._push_tlp_table_entry(cxl_io_packet)
             try:
                 view = packet.get_view()  # type: ignore[attr-defined]
             except Exception:
                 view = bytes(packet)
-            self._writer.write(view)
-            await self._writer.drain()
-        logger.debug(self._create_message("Stopped outgoing MMIO FIFO processor"))
+            with self._writer_lock:
+                self._writer.write(view)
+                await asyncio.to_thread(self._writer.drain_blocking)
+        logger.debug(self._create_message("Stopped outgoing MMIO FIFO processor (async fallback)"))
 
     async def _process_outgoing_cxl_mem_packets(self):
-        logger.debug(self._create_message("Starting outgoing CXL.mem FIFO processor"))
+        logger.debug(
+            self._create_message("Starting outgoing CXL.mem FIFO processor (async fallback)")
+        )
         while True:
             packet = await self._outgoing.cxl_mem.get()
             if self._is_disconnection_notification(packet):
@@ -473,12 +496,17 @@ class CxlPacketProcessor(RunnableComponent):
                 view = packet.get_view()  # type: ignore[attr-defined]
             except Exception:
                 view = bytes(packet)
-            self._writer.write(view)
-            await self._writer.drain()
-        logger.debug(self._create_message("Stopped outgoing CXL.mem FIFO processor"))
+            with self._writer_lock:
+                self._writer.write(view)
+                await asyncio.to_thread(self._writer.drain_blocking)
+        logger.debug(
+            self._create_message("Stopped outgoing CXL.mem FIFO processor (async fallback)")
+        )
 
     async def _process_outgoing_cxl_cache_packets(self):
-        logger.debug(self._create_message("Starting outgoing CXL.cache FIFO processor"))
+        logger.debug(
+            self._create_message("Starting outgoing CXL.cache FIFO processor (async fallback)")
+        )
         while True:
             packet = await self._outgoing.cxl_cache.get()
             if self._is_disconnection_notification(packet):
@@ -487,9 +515,12 @@ class CxlPacketProcessor(RunnableComponent):
                 view = packet.get_view()  # type: ignore[attr-defined]
             except Exception:
                 view = bytes(packet)
-            self._writer.write(view)
-            await self._writer.drain()
-        logger.debug(self._create_message("Stopped outgoing CXL.cache FIFO processor"))
+            with self._writer_lock:
+                self._writer.write(view)
+                await asyncio.to_thread(self._writer.drain_blocking)
+        logger.debug(
+            self._create_message("Stopped outgoing CXL.cache FIFO processor (async fallback)")
+        )
 
     async def _process_outgoing_cci_packets(self):
         logger.debug(self._create_message("Starting outgoing CCI FIFO processor"))
@@ -508,7 +539,7 @@ class CxlPacketProcessor(RunnableComponent):
                     except Exception:
                         view = bytes(packet)
                     self._writer.write(view)
-                    await self._writer.drain()
+                    await asyncio.to_thread(self._writer.drain_blocking)
                 elif opcode == CCI_FM_API_COMMAND_OPCODE.GET_LD_ALLOCATIONS:
                     packet = cast(GetLdAllocationsResponsePacket, packet)
                     try:
@@ -516,7 +547,7 @@ class CxlPacketProcessor(RunnableComponent):
                     except Exception:
                         view = bytes(packet)
                     self._writer.write(view)
-                    await self._writer.drain()
+                    await asyncio.to_thread(self._writer.drain_blocking)
                 elif opcode == CCI_FM_API_COMMAND_OPCODE.SET_LD_ALLOCATIONS:
                     packet = cast(SetLdAllocationsResponsePacket, packet)
                     try:
@@ -524,7 +555,7 @@ class CxlPacketProcessor(RunnableComponent):
                     except Exception:
                         view = bytes(packet)
                     self._writer.write(view)
-                    await self._writer.drain()
+                    await asyncio.to_thread(self._writer.drain_blocking)
                 else:
                     logger.warning(self._create_message("Unsupported CCI packet"))
             elif self._component_type == CXL_COMPONENT_TYPE.DSP:
@@ -536,31 +567,29 @@ class CxlPacketProcessor(RunnableComponent):
                 except Exception:
                     view = bytes(packet)
                 self._writer.write(view)
-                await self._writer.drain()
+                await asyncio.to_thread(self._writer.drain_blocking)
             else:
                 break
         logger.debug(self._create_message("Stopped outgoing CCI FIFO processor"))
 
     async def _process_outgoing_packets(self):
-        tasks = [
-            create_task(self._process_outgoing_cfg_packets()),
-            create_task(self._process_outgoing_mmio_packets()),
-        ]
-        if self._outgoing.cxl_mem:
-            tasks.append(create_task(self._process_outgoing_cxl_mem_packets()))
-        if self._outgoing.cxl_cache:
-            tasks.append(create_task(self._process_outgoing_cxl_cache_packets()))
-        tasks.append(create_task(self._process_outgoing_cci_packets()))
-        # TODO: Enable later when CCI for LD is needed
-        # if self._outgoing.cci_fifo:
-        #     tasks.append(create_task(self._process_outgoing_XXX()))
-        await gather(*tasks)
+        # All outgoing work is handled by threads now. Keep this coroutine alive
+        # until stop is requested to maintain lifecycle symmetry.
+        if self._stop_event_async is None:
+            self._stop_event_async = asyncio.Event()
+        await self._stop_event_async.wait()
 
     async def _run(self):
-        tasks = [
-            create_task(self._process_incoming_packets()),
-            create_task(self._process_outgoing_packets()),
-        ]
+        self._loop = asyncio.get_running_loop()
+        # Start reader thread for blocking packet reads
+        self._reader_thread_stop.clear()
+        self._reader_thread = threading.Thread(
+            target=self._reader_thread_main, name=f"{self.get_message_label()}-reader", daemon=True
+        )
+        self._reader_thread.start()
+        # Start outgoing workers in threads
+        self._start_outgoing_threads()
+        tasks = [create_task(self._process_outgoing_packets())]
         if self._fmld:
             fmld_task = [create_task(self._fmld.run())]
             await self._fmld.wait_for_ready()
@@ -579,4 +608,206 @@ class CxlPacketProcessor(RunnableComponent):
         if self._fmld:
             task = create_task(self._fmld.stop())
             await gather(task)
-        self._reader.abort()
+        # Stop reader thread
+        try:
+            self._reader_thread_stop.set()
+            self._reader.abort()
+            if self._reader_thread is not None:
+                self._reader_thread.join(timeout=1.0)
+        except Exception:
+            pass
+        # Stop outgoing workers
+        try:
+            self._outgoing_stop.set()
+            # Nudge workers by notifying outgoing processors
+            try:
+                notification_packet = BaseSidebandPacket.create(
+                    SIDEBAND_TYPES.CONNECTION_DISCONNECTED
+                )
+                await self._notify_outgoing_processors(notification_packet)
+            except Exception:
+                pass
+            for t in self._outgoing_threads:
+                t.join(timeout=1.0)
+        except Exception:
+            pass
+        # Signal async stopper
+        if self._stop_event_async is not None:
+            try:
+                self._stop_event_async.set()
+            except Exception:
+                pass
+
+    # Thread workers for outgoing hot paths
+    def _outgoing_cfg_worker(self) -> None:
+        logger.debug(self._create_message("Starting outgoing CFG FIFO worker (thread)"))
+        q = self._outgoing.cfg_space
+        assert self._loop is not None
+        while not self._outgoing_stop.is_set():
+            try:
+                packet = asyncio.run_coroutine_threadsafe(q.get(), self._loop).result()
+            except Exception:
+                break
+            if self._is_disconnection_notification(packet):
+                break
+            cxl_io_packet = cast(CxlIoBasePacket, packet)
+            if cxl_io_packet.is_cpl() or cxl_io_packet.is_cpld():
+                with self._tlp_lock:
+                    self._pop_tlp_table_entry(cxl_io_packet)
+            else:
+                with self._tlp_lock:
+                    self._push_tlp_table_entry(cxl_io_packet)
+            try:
+                view = packet.get_view()  # type: ignore[attr-defined]
+            except Exception:
+                view = bytes(packet)
+            with self._writer_lock:
+                self._writer.write(view)
+                self._writer.drain_blocking()
+        logger.debug(self._create_message("Stopped outgoing CFG FIFO worker (thread)"))
+
+    def _outgoing_mmio_worker(self) -> None:
+        logger.debug(self._create_message("Starting outgoing MMIO FIFO worker (thread)"))
+        q = self._outgoing.mmio
+        assert self._loop is not None
+        while not self._outgoing_stop.is_set():
+            try:
+                packet = asyncio.run_coroutine_threadsafe(q.get(), self._loop).result()
+            except Exception:
+                break
+            if self._is_disconnection_notification(packet):
+                break
+            cxl_io_packet = cast(CxlIoBasePacket, packet)
+            if cxl_io_packet.is_cpl() or cxl_io_packet.is_cpld():
+                with self._tlp_lock:
+                    self._pop_tlp_table_entry(cxl_io_packet)
+            else:
+                if cxl_io_packet.is_mem_write() is False:
+                    with self._tlp_lock:
+                        self._push_tlp_table_entry(cxl_io_packet)
+            try:
+                view = packet.get_view()  # type: ignore[attr-defined]
+            except Exception:
+                view = bytes(packet)
+            with self._writer_lock:
+                self._writer.write(view)
+                self._writer.drain_blocking()
+        logger.debug(self._create_message("Stopped outgoing MMIO FIFO worker (thread)"))
+
+    def _outgoing_cxl_mem_worker(self) -> None:
+        if self._outgoing.cxl_mem is None:
+            return
+        logger.debug(self._create_message("Starting outgoing CXL.mem FIFO worker (thread)"))
+        q = self._outgoing.cxl_mem
+        assert self._loop is not None
+        while not self._outgoing_stop.is_set():
+            try:
+                packet = asyncio.run_coroutine_threadsafe(q.get(), self._loop).result()
+            except Exception:
+                break
+            if self._is_disconnection_notification(packet):
+                break
+            try:
+                view = packet.get_view()  # type: ignore[attr-defined]
+            except Exception:
+                view = bytes(packet)
+            with self._writer_lock:
+                self._writer.write(view)
+                self._writer.drain_blocking()
+        logger.debug(self._create_message("Stopped outgoing CXL.mem FIFO worker (thread)"))
+
+    def _outgoing_cxl_cache_worker(self) -> None:
+        if self._outgoing.cxl_cache is None:
+            return
+        logger.debug(self._create_message("Starting outgoing CXL.cache FIFO worker (thread)"))
+        q = self._outgoing.cxl_cache
+        assert self._loop is not None
+        while not self._outgoing_stop.is_set():
+            try:
+                packet = asyncio.run_coroutine_threadsafe(q.get(), self._loop).result()
+            except Exception:
+                break
+            if self._is_disconnection_notification(packet):
+                break
+            try:
+                view = packet.get_view()  # type: ignore[attr-defined]
+            except Exception:
+                view = bytes(packet)
+            with self._writer_lock:
+                self._writer.write(view)
+                self._writer.drain_blocking()
+        logger.debug(self._create_message("Stopped outgoing CXL.cache FIFO worker (thread)"))
+
+    def _start_outgoing_threads(self) -> None:
+        self._outgoing_stop.clear()
+        threads: list[threading.Thread] = [
+            threading.Thread(
+                target=self._outgoing_cfg_worker,
+                name=f"{self.get_message_label()}-out-cfg",
+                daemon=True,
+            ),
+            threading.Thread(
+                target=self._outgoing_mmio_worker,
+                name=f"{self.get_message_label()}-out-mmio",
+                daemon=True,
+            ),
+        ]
+        if self._outgoing.cxl_mem is not None:
+            threads.append(
+                threading.Thread(
+                    target=self._outgoing_cxl_mem_worker,
+                    name=f"{self.get_message_label()}-out-mem",
+                    daemon=True,
+                )
+            )
+        if self._outgoing.cxl_cache is not None:
+            threads.append(
+                threading.Thread(
+                    target=self._outgoing_cxl_cache_worker,
+                    name=f"{self.get_message_label()}-out-cache",
+                    daemon=True,
+                )
+            )
+        # CCI worker when used
+        if (
+            self._component_type == CXL_COMPONENT_TYPE.LD
+            or self._component_type == CXL_COMPONENT_TYPE.DSP
+        ):
+            threads.append(
+                threading.Thread(
+                    target=self._outgoing_cci_worker,
+                    name=f"{self.get_message_label()}-out-cci",
+                    daemon=True,
+                )
+            )
+        for t in threads:
+            t.start()
+        self._outgoing_threads = threads
+
+    def _outgoing_cci_worker(self) -> None:
+        logger.debug(self._create_message("Starting outgoing CCI FIFO worker (thread)"))
+        assert self._loop is not None
+        while not self._outgoing_stop.is_set():
+            try:
+                if self._component_type == CXL_COMPONENT_TYPE.LD:
+                    packet = asyncio.run_coroutine_threadsafe(
+                        self._fmld.upstream_fifo.target_to_host.get(), self._loop
+                    ).result()
+                elif self._component_type == CXL_COMPONENT_TYPE.DSP:
+                    packet = asyncio.run_coroutine_threadsafe(
+                        self._outgoing.cci_fifo.get(), self._loop
+                    ).result()
+                else:
+                    break
+            except Exception:
+                break
+            if self._is_disconnection_notification(packet):
+                break
+            try:
+                view = packet.get_view()  # type: ignore[attr-defined]
+            except Exception:
+                view = bytes(packet)
+            with self._writer_lock:
+                self._writer.write(view)
+                self._writer.drain_blocking()
+        logger.debug(self._create_message("Stopped outgoing CCI FIFO worker (thread)"))

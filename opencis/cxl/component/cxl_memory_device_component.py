@@ -72,21 +72,33 @@ class CharDriverAccessor:
         self.filename = filename
         self.size = size
 
-    async def write(self, offset: int, data: int, size: int):
-        # TODO: Check for OOB and use asyncio
+    def _write_blocking(self, offset: int, data: int, size: int) -> None:
         data_bytes = data.to_bytes(size, "little")
         fd = os.open(self.filename, os.O_WRONLY, 0o644)
-        os.lseek(fd, offset, os.SEEK_SET)
-        os.write(fd, data_bytes)
-        os.close(fd)
+        try:
+            os.lseek(fd, offset, os.SEEK_SET)
+            os.write(fd, data_bytes)
+        finally:
+            os.close(fd)
+
+    def _read_blocking(self, offset: int, size: int) -> int:
+        fd = os.open(self.filename, os.O_RDONLY)
+        try:
+            os.lseek(fd, offset, os.SEEK_SET)
+            data = os.read(fd, size)
+        finally:
+            os.close(fd)
+        return int.from_bytes(data, "little")
+
+    async def write(self, offset: int, data: int, size: int):
+        import asyncio
+
+        await asyncio.to_thread(self._write_blocking, offset, data, size)
 
     async def read(self, offset: int, size: int) -> int:
-        # TODO: Check for OOB and use asyncio
-        fd = os.open(self.filename, os.O_RDONLY)
-        os.lseek(fd, offset, os.SEEK_SET)
-        data = os.read(fd, size)
-        os.close(fd)
-        return int.from_bytes(data, "little")
+        import asyncio
+
+        return await asyncio.to_thread(self._read_blocking, offset, size)
 
 
 class MemoryDeviceIdentity(UnalignedBitStructure):

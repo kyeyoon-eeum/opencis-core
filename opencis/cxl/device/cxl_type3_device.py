@@ -78,6 +78,11 @@ class CxlType3Device(RunnableComponent):
         self._cxl_memory_device_component = None
         self._upstream_connection = transport_connection
 
+        # Create mem manager first so it's available during IO manager init callback
+        self._cxl_mem_manager = CxlMemManager(
+            upstream_fifo=self._upstream_connection.cxl_mem_fifo,
+            label=self._label,
+        )
         self._cxl_io_manager = CxlIoManager(
             self._upstream_connection.mmio_fifo,
             None,
@@ -87,13 +92,6 @@ class CxlType3Device(RunnableComponent):
             init_callback=self._init_device,
             label=self._label,
         )
-        self._cxl_mem_manager = CxlMemManager(
-            upstream_fifo=self._upstream_connection.cxl_mem_fifo,
-            label=self._label,
-        )
-
-        # Update CxlMemManager with a CxlMemoryDeviceComponent
-        self._cxl_mem_manager.set_memory_device_component(self._cxl_memory_device_component)
 
     def _init_device(
         self,
@@ -124,6 +122,9 @@ class CxlType3Device(RunnableComponent):
             memory_size=self._memory_size,
             label=self._label,
         )
+
+        # Now that the memory device component exists, wire it into the mem manager
+        self._cxl_mem_manager.set_memory_device_component(self._cxl_memory_device_component)
 
         # Create CombinedMmioRegister
         options = CombinedMmioRegiterOptions(cxl_component=self._cxl_memory_device_component)

@@ -6,6 +6,7 @@ See LICENSE for details.
 """
 
 import asyncio
+import threading
 from typing import cast, Tuple, Optional
 from enum import Enum, auto
 
@@ -62,6 +63,9 @@ class SwitchConnectionClient(RunnableComponent):
         self._injected_error = None
         self._retry = retry
         self._stop_signal = False
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._worker_thread: threading.Thread | None = None
+        self._worker_stop = threading.Event()
 
     async def _connect(self) -> Tuple[ShmStreamReader, StreamWriterLike]:
         # Connect using selected transport with async retry for server readiness
@@ -70,7 +74,9 @@ class SwitchConnectionClient(RunnableComponent):
         transport = "shm"
         while True:
             try:
-                shm_pair = ShmStreamPair(port_index=self._port_index, is_server=False, namespace="switch")
+                shm_pair = ShmStreamPair(
+                    port_index=self._port_index, is_server=False, namespace="switch"
+                )
                 reader = shm_pair.reader
                 writer = shm_pair.writer
                 logger.debug(self._create_message(f"Client Connected ({transport})"))
@@ -93,19 +99,23 @@ class SwitchConnectionClient(RunnableComponent):
     def set_port(self, port: int):
         self._port = port
 
-    async def _run(self):
-        (reader, writer) = await self._connect()
+    def _client_worker(self) -> None:
+        assert self._loop is not None
+        # Run connect in the event loop to reuse its retry/sleep logic
+        reader, writer = asyncio.run_coroutine_threadsafe(self._connect(), self._loop).result()
         logger.info(self._create_message("Client connected"))
-        # Send sideband connection request and wait for accept
+        # Sideband handshake (blocking read/write in this thread)
         logger.info(self._create_message("Sending CONNECTION_REQUEST"))
         sb_req = SidebandConnectionRequestPacket.create(self._port_index)
         writer.write(bytes(sb_req))
-        await writer.drain()
+        try:
+            writer.drain_blocking()
+        except Exception:
+            pass
         logger.info(self._create_message("Sent CONNECTION_REQUEST; waiting for ACCEPT"))
         pr = _prc.ShmPacketReader(reader)
-        # Read until we get ACCEPT; ignore any out-of-order frames
-        while True:
-            packet = await asyncio.to_thread(pr.get_packet)
+        while not self._worker_stop.is_set():
+            packet = pr.get_packet()
             if packet.system_header.payload_type != SYSTEM_PAYLOAD_TYPE.SIDEBAND:
                 continue
             base_sideband_packet = cast(BaseSidebandPacket, packet)
@@ -114,7 +124,6 @@ class SwitchConnectionClient(RunnableComponent):
         logger.info(self._create_message("Handshake accepted by server"))
 
         logger.info(self._create_message("Connected to switch using shm"))
-
         self._packet_processor = CxlPacketProcessor(
             reader,
             writer,
@@ -123,13 +132,42 @@ class SwitchConnectionClient(RunnableComponent):
             label=f"ClientPort{self._port_index}",
         )
         logger.info(self._create_message("Starting client PacketProcessor"))
-        tasks = [asyncio.create_task(self._packet_processor.run())]
-        await self._packet_processor.wait_for_ready()
+
+        # Start processor in loop and wait until ready
+        def _start_pp() -> None:
+            asyncio.create_task(self._packet_processor.run())
+
+        self._loop.call_soon_threadsafe(_start_pp)
+        asyncio.run_coroutine_threadsafe(
+            self._packet_processor.wait_for_ready(), self._loop
+        ).result()
         logger.info(self._create_message("Client PacketProcessor RUNNING"))
         logger.info(self._create_message("SwitchConnectionClient READY"))
+
+    async def _run(self):
+        self._loop = asyncio.get_running_loop()
+        self._worker_stop.clear()
+        self._worker_thread = threading.Thread(
+            target=self._client_worker,
+            name=f"{self.get_message_label()}-client",
+            daemon=True,
+        )
+        self._worker_thread.start()
         await self._change_status_to_running()
-        await asyncio.gather(*tasks)
+        # Keep alive until stop
+        stopper = asyncio.Event()
+        try:
+            await stopper.wait()
+        except asyncio.CancelledError:
+            pass
 
     async def _stop(self):
         self._stop_signal = True
-        await self._packet_processor.stop()
+        self._worker_stop.set()
+        try:
+            if self._packet_processor is not None:
+                await self._packet_processor.stop()
+        except Exception:
+            pass
+        if self._worker_thread is not None:
+            self._worker_thread.join(timeout=1.0)
