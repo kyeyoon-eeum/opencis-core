@@ -316,28 +316,28 @@ def sample_app(keepalive: bool, **kwargs):
     # Helper to run potentially blocking ops with a short timeout
     import threading
 
-    def try_call(fn, timeout_s: float = 0.02):
-        result_holder = {"done": False, "val": None}
+    # def try_call(fn, timeout_s: float = 0.02):
+    #     result_holder = {"done": False, "val": None}
 
-        def _runner():
-            try:
-                result_holder["val"] = fn()
-            except Exception:
-                pass
-            finally:
-                result_holder["done"] = True
+    #     def _runner():
+    #         try:
+    #             result_holder["val"] = fn()
+    #         except Exception:
+    #             pass
+    #         finally:
+    #             result_holder["done"] = True
 
-        t = threading.Thread(target=_runner, daemon=True)
-        t.start()
-        t.join(timeout=timeout_s)
-        return result_holder["done"], result_holder["val"]
+    #     t = threading.Thread(target=_runner, daemon=True)
+    #     t.start()
+    #     t.join(timeout=timeout_s)
+    #     return result_holder["done"], result_holder["val"]
 
     # Best-effort warmup without blocking
-    try_call(lambda: cpu.store_sync(0x100000000000, 0x40, 0xDEADBEEF))
-    _, val = try_call(lambda: cpu.load_sync(0x100000000000, 0x40))
+    cpu.store(0x100000000000, 0x40, 0xDEADBEEF)
+    val = cpu.load(0x100000000000, 0x40)
     if val is not None:
         logger.info(f"0x{val:X}")
-    _, val = try_call(lambda: cpu.load_sync(0x100000000040, 0x40))
+    val = cpu.load(0x100000000040, 0x40)
     if val is not None:
         logger.info(f"0x{val:X}")
 
@@ -345,7 +345,7 @@ def sample_app(keepalive: bool, **kwargs):
     logger.info("PERF_START")
     start = time.time()
     for offset in range(0, BYTE_COUNT, 0x40):
-        try_call(lambda: cpu.store_sync(0x100000000000 + offset, 0x40, 0xDEADBEEF))
+        cpu.store(0x100000000000 + offset, 0x40, 0xDEADBEEF)
     end = time.time()
     wr_time = max(end - start, 1e-6)
     wr_throughput = (BYTE_COUNT / (1024 * 1024)) / wr_time
@@ -353,7 +353,7 @@ def sample_app(keepalive: bool, **kwargs):
 
     start = time.time()
     for offset in range(0, BYTE_COUNT, 0x40):
-        try_call(lambda: cpu.load_sync(0x100000000000 + offset, 0x40))
+        cpu.load(0x100000000000 + offset, 0x40)
     end = time.time()
     rd_time = max(end - start, 1e-6)
     rd_throughput = (BYTE_COUNT / (1024 * 1024)) / rd_time

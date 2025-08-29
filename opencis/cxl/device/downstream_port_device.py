@@ -11,7 +11,6 @@ from threading import Event
 from opencis.cxl.component.cxl_io_callback_data import CxlIoCallbackData
 from opencis.util.logger import logger
 from opencis.util.component import RunnableComponent
-from opencis.util.async_gatherer import AsyncGatherer
 from opencis.cxl.component.common import CXL_COMPONENT_TYPE
 from opencis.cxl.component.cxl_cache_manager import CxlCacheManager
 from opencis.cxl.component.cxl_connection import CxlConnection
@@ -68,7 +67,6 @@ class DownstreamPortDevice(CxlPortDevice):
     ):
         super().__init__(transport_connection, port_index)
 
-        self._tasks = AsyncGatherer()
         self._stop_tasks = []
 
         # Per LD

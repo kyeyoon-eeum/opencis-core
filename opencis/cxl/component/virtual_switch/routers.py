@@ -13,7 +13,6 @@ import threading
 from opencis.util.component import RunnableComponent
 from opencis.util.pci import bdf_to_string
 from opencis.util.number import tlptoh16
-from opencis.util.async_gatherer import AsyncGatherer
 from opencis.cxl.component.cxl_connection import FifoPair
 from opencis.cxl.component.virtual_switch.routing_table import RoutingTable
 from opencis.cxl.component.virtual_switch.port_binder import PortBinder, BindSlot
@@ -53,7 +52,6 @@ class CxlRouter(RunnableComponent):
         self._downstream_connection_fifos: List[FifoPair]
         self._upstream_connection_fifo: FifoPair
 
-        self._routing_tasks = AsyncGatherer()
         super().__init__()
         self._vcs_id = vcs_id
         self._routing_table = routing_table

@@ -10,6 +10,7 @@ import inspect
 import threading
 from tqdm.auto import tqdm
 
+from opencis.util.logger import logger
 from opencis.util.component import RunnableComponent
 from opencis.cxl.component.cxl_memory_hub import CxlMemoryHub
 
@@ -27,6 +28,7 @@ class CPU(RunnableComponent):
         self._user_app = user_app
         self._fut = None
         self._app_task = None
+        self._threads = []
 
     def _run_sys_sw_app(self, *args, **kwargs):
         kwargs["cxl_memory_hub"] = self._cxl_memory_hub
@@ -42,8 +44,8 @@ class CPU(RunnableComponent):
             self._user_app(*args, **kwargs)  # type: ignore[misc]
 
         t = threading.Thread(target=_runner, name=f"{self.get_message_label()}-user-app")
+        self._threads.append(t)
         t.start()
-        t.join()
 
     def create_message(self, message):
         return self._create_message(message)
@@ -106,22 +108,15 @@ class CPU(RunnableComponent):
         return self._user_app(_cpu=self, _mem_hub=self._cxl_memory_hub)
 
     def _run(self):
-        # Signal running early so parents don't block on readiness
-        self._change_status_to_running()
-        # Start system software app in a background thread so user app can run immediately
-        sys_sw_thread = threading.Thread(
-            target=self._run_sys_sw_app, name=f"{self.get_message_label()}-sys-sw"
-        )
-        sys_sw_thread.start()
-        sys_sw_thread.join()
+        logger.info(self._create_message("Starting sys_sw app"))
+        self._run_sys_sw_app()
+        logger.info(self._create_message("Finished sys_sw app"))
+        logger.info(self._create_message("Starting user app"))
         self._run_user_app()
+        self._change_status_to_running()
+        for t in self._threads:
+            t.join()
+        logger.info(self._create_message("User app completed"))
 
     def _stop(self):
         pass
-
-    # Synchronous helpers for sync apps
-    def load_sync(self, addr: int, size: int) -> int:
-        return self.load(addr, size)
-
-    def store_sync(self, addr: int, size: int, value: int) -> None:
-        self.store(addr, size, value)

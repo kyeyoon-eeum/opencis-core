@@ -148,15 +148,10 @@ cdef class ShmRing:
         (<unsigned long long*> (self.base + off))[0] = v
 
     cdef inline unsigned int _read_u32(self, size_t off):
-        cdef unsigned char* p = self.base + off
-        return (p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24))
+        return (<unsigned int*> (self.base + off))[0]
 
-    cdef inline void _write_u32(self, size_t off, unsigned int val):
-        cdef unsigned char* p = self.base + off
-        p[0] = <uint8_t> (val & 0xFF)
-        p[1] = <uint8_t> ((val >> 8) & 0xFF)
-        p[2] = <uint8_t> ((val >> 16) & 0xFF)
-        p[3] = <uint8_t> ((val >> 24) & 0xFF)
+    cdef inline void _write_u32(self, size_t off, unsigned int v):
+        (<unsigned int*> (self.base + off))[0] = v
 
     def try_push(self, bytes data):
         """Non-blocking push. Returns True on success, False if full."""

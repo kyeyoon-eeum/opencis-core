@@ -12,7 +12,6 @@ from queue import Queue
 
 from opencis.util.logger import logger
 from opencis.util.component import RunnableComponent
-from opencis.util.async_gatherer import AsyncGatherer
 
 from opencis.cxl.component.cxl_connection import CxlConnection
 from opencis.cxl.transport.cxl_mem_packets import (
@@ -278,7 +277,6 @@ class PpbDevice(RunnableComponent):
     ):
         super().__init__()
         self._port_index = port_index
-        self._routing_tasks = AsyncGatherer()
 
         self._downstream_connection = CxlConnection()
         self._upstream_connections: dict[int, CxlConnection] = {}
