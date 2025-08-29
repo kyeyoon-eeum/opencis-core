@@ -106,10 +106,6 @@ class SwitchConnectionClient(RunnableComponent):
         logger.info(self._create_message("Sending CONNECTION_REQUEST"))
         sb_req = SidebandConnectionRequestPacket.create(self._port_index)
         writer.write(bytes(sb_req))
-        try:
-            writer.drain_blocking()
-        except Exception:
-            pass
         logger.info(self._create_message("Sent CONNECTION_REQUEST; waiting for ACCEPT"))
         pr = _prc.ShmPacketReader(reader)
         while not self._worker_stop.is_set():

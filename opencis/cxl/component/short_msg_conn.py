@@ -184,14 +184,12 @@ class ShortMsgConn(RunnableComponent):
         _, writer = self._connections[device]
         val_w_dev_id = request.real_val << 8 | self._device_id
         writer.write(val_w_dev_id.to_bytes(length=self._msg_width))
-        writer.drain_blocking()
 
     def start_connection(self):
         logger.info(self._create_message("ShortMsg client starting shm connection"))
         shm = ShmStreamPair(port_index=self._port, is_server=False, namespace="shortmsg")
         reader, writer = shm.reader, shm.writer
         writer.write(int.to_bytes(self._device_id, 16, "little"))
-        writer.drain_blocking()
         logger.info(self._create_message("ShortMsg client sent device ID"))
         self._connections[0] = (reader, writer)
         self._run_status = True

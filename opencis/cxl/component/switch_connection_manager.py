@@ -162,10 +162,6 @@ class SwitchConnectionManager(RunnableComponent):
                     return
                 accept = BaseSidebandPacket.create(SIDEBAND_TYPES.CONNECTION_ACCEPT)
                 writer.write(bytes(accept))
-                try:
-                    writer.drain_blocking()
-                except Exception:
-                    pass
                 logger.info(self._create_message(f"Sent ACCEPT for port {idx_local}"))
                 self._update_connection_status_sync(idx_local, connected=True)
                 packet_processor = CxlPacketProcessor(

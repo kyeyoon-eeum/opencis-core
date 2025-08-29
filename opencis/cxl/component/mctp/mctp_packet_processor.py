@@ -95,7 +95,6 @@ class MctpPacketProcessor(RunnableComponent):
                 break
             try:
                 self._writer.write(bytes(packet))
-                self._writer.drain_blocking()
             except Exception as e:
                 logger.debug(self._create_message(str(e)))
                 break
