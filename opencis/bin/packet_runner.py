@@ -5,7 +5,6 @@ This software is licensed under the terms of the Revised BSD License.
 See LICENSE for details.
 """
 
-import asyncio
 import click
 
 from opencis.bin.common import BASED_INT
@@ -25,4 +24,4 @@ def ptr_group():
 @click.option("--label", type=str, default=None, help="Label to attach to the log lines")
 def start(pcap_file, switch_host, switch_port, device_port, label):
     trace_runner = PacketTraceRunner(pcap_file, device_port, switch_port, switch_host, label)
-    asyncio.run(trace_runner.run())
+    trace_runner.run()

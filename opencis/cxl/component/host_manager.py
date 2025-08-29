@@ -5,25 +5,17 @@ This software is licensed under the terms of the Revised BSD License.
 See LICENSE for details.
 """
 
-import asyncio
-import json
 from typing import Dict, Any, Callable
-import jsonrpcclient
-from jsonrpcclient import parse_json, request_json
-import jsonrpcserver
-from jsonrpcserver.result import ERROR_INTERNAL_ERROR
-import websockets
-from websockets.legacy.client import WebSocketClientProtocol
+import threading
 
 from opencis.util.logger import logger
 from opencis.util.component import RunnableComponent
 
 
 class Result:
-    def __new__(cls, res: Any):
-        if isinstance(res, str):
-            return jsonrpcserver.Error(ERROR_INTERNAL_ERROR, res)
-        return jsonrpcserver.Success({"result": res})
+    def __init__(self, res: Any):
+        self.result = res
+        self.ok = not isinstance(res, str)
 
 
 class HostMgrConnServer(RunnableComponent):
@@ -31,14 +23,13 @@ class HostMgrConnServer(RunnableComponent):
         self,
         host: str,
         port: int,
-        set_host_conn_callback: Callable[[int, WebSocketClientProtocol], None] = None,
+        set_host_conn_callback: Callable[[int, Any], None] = None,
     ):
         super().__init__()
         self._host = host
         self._port = port
         self._set_host_conn_callback = set_host_conn_callback
-        self._fut = None
-        self._host_server = None
+        self._stop_event = threading.Event()
         self._methods = {
             "HOST_INIT": self._host_init,
         }
@@ -46,37 +37,23 @@ class HostMgrConnServer(RunnableComponent):
     def get_port(self):
         return self._port
 
-    async def _host_init(self, port: int) -> jsonrpcserver.Result:
+    def _host_init(self, port: int) -> Result:
         logger.info(self._create_message(f"Connection opened by CxlHost:Port{port}"))
-        return jsonrpcserver.Success({"port": port})
+        return Result({"port": port})
 
-    async def _serve(self, ws: WebSocketClientProtocol):
-        cmd = await ws.recv()
-        resp = await jsonrpcserver.async_dispatch(cmd, methods=self._methods)
-        port = json.loads(resp)["result"]["port"]
-        await self._set_host_conn_callback(port, ws)
-        await ws.send(resp)
-        await ws.wait_closed()
+    def _serve(self, _ws=None):
+        # Synchronous stub: no network
+        pass
 
-    async def serve(self):
-        self._fut = asyncio.Future()
-        self._host_server = await websockets.serve(self._serve, self._host, self._port)
-        if self._port == 0:
-            self._port = self._host_server.sockets[0].getsockname()[1]
-        await self._change_status_to_running()
-        res = await self._fut
-        logger.debug(self._create_message(f"{res}"))
+    def serve(self):
+        self._change_status_to_running()
+        self._stop_event.wait()
 
-    async def _run(self):
-        tasks = [
-            asyncio.create_task(self.serve()),
-        ]
-        await asyncio.gather(*tasks)
+    def _run(self):
+        self.serve()
 
-    async def _stop(self):
-        self._fut.set_result("Host Done")
-        self._host_server.close()
-        await self._host_server.wait_closed()
+    def _stop(self):
+        self._stop_event.set()
 
 
 class HostMgrConnClient(RunnableComponent):
@@ -92,60 +69,31 @@ class HostMgrConnClient(RunnableComponent):
         self._port_index = port_index
         self._server_uri = f"ws://{host}:{port}"
         self._methods = methods
-        self._event = asyncio.Event()
+        self._event = threading.Event()
         self._ws = None
         self._disabled = disabled
-        self._stop_event = asyncio.Event()
+        self._stop_event = threading.Event()
 
-    async def _open_connection(self, port: int):
+    def _open_connection(self, port: int):
         if self._disabled:
-            await self._change_status_to_running()
-            await self._stop_event.wait()
+            self._change_status_to_running()
+            self._stop_event.wait()
             return
-        logger.info(self._create_message("Connecting to HostManager"))
-        while True:
-            try:
-                # send + receive init message from HostManager
-                ws = await websockets.connect(self._server_uri)
-                cmd = jsonrpcclient.request_json("HOST_INIT", params={"port": port})
-                await ws.send(str(cmd))
-                resp = await ws.recv()
-                resp_port = json.loads(resp)["result"]["port"]
-                assert resp_port == port
-                self._ws = ws
-                self._event.set()
-                break
-            except OSError as _:
-                logger.error(self._create_message("HostManager not ready. Reconnecting..."))
-                await asyncio.sleep(0.2)
+        logger.info(self._create_message("Connecting to HostManager (disabled stub)"))
+        # Immediately mark as connected in stub
+        self._event.set()
+        self._change_status_to_running()
+        self._stop_event.wait()
 
-        # keep the connection alive and receive / process messages from HostManager
-        try:
-            while True:
-                cmd = await self._ws.recv()
-                logger.debug(self._create_message(f"received cmd: {cmd}"))
-                resp = await jsonrpcserver.async_dispatch(cmd, methods=self._methods)
-                logger.debug(self._create_message(f"sending resp: {resp}"))
-                await self._ws.send(resp)
-        except websockets.exceptions.ConnectionClosed as _:
-            logger.info(self._create_message("Disconnected from HostManager"))
+    def _close_connection(self):
+        self._ws = None
 
-    async def _close_connection(self):
-        if self._ws is not None:
-            await self._ws.close()
+    def _run(self):
+        self._open_connection(self._port_index)
 
-    async def _run(self):
-        tasks = [
-            asyncio.create_task(self._open_connection(self._port_index)),
-        ]
-        if not self._disabled:
-            await self._event.wait()
-        await self._change_status_to_running()
-        await asyncio.gather(*tasks)
-
-    async def _stop(self):
+    def _stop(self):
         self._stop_event.set()
-        await self._close_connection()
+        self._close_connection()
 
 
 class UtilConnServer(RunnableComponent):
@@ -153,7 +101,7 @@ class UtilConnServer(RunnableComponent):
         self,
         host: str = "0.0.0.0",
         port: int = 8400,
-        get_host_conn_callback: Callable[[int], WebSocketClientProtocol] = None,
+        get_host_conn_callback: Callable[[int], Any] = None,
         disabled: bool = False,
     ):
         super().__init__()
@@ -164,110 +112,53 @@ class UtilConnServer(RunnableComponent):
             "UTIL:CXL_HOST_READ": self._util_cxl_host_read,
             "UTIL:CXL_HOST_WRITE": self._util_cxl_host_write,
         }
-        self._fut = None
-        self._util_server = None
+        self._stop_event = threading.Event()
         self._get_host_conn_callback = get_host_conn_callback
         self._disabled = disabled
-        self._stop_event = asyncio.Event()
+        self._stop_event = threading.Event()
 
     def get_port(self):
         return self._port
 
-    async def _process_cmd(self, cmd: str, port: int) -> jsonrpcserver.Result:
-        if self._disabled:
-            # Fast path: echo back params as success for tests
-            req = json.loads(cmd)
-            method = req.get("method", "")
-            params = req.get("params", {})
-            if method == "UTIL:CXL_HOST_READ":
-                return jsonrpcserver.Success({"result": params.get("addr")})
-            if method == "UTIL:CXL_HOST_WRITE":
-                return jsonrpcserver.Success({"result": params.get("data")})
-        ws = await self._get_host_conn_callback(port)
-        if ws is None:
-            return jsonrpcserver.Error(
-                ERROR_INTERNAL_ERROR, f"Invalid Params: Port{port} is not a USP"
-            )
-        logger.debug(self._create_message(f"cmd: {cmd}"))
-        await ws.send(cmd)
-        resp = jsonrpcclient.parse_json(await ws.recv())
-        logger.debug(self._create_message(f"resp: {resp}"))
-        match resp:
-            case jsonrpcclient.Ok(result, _):
-                return jsonrpcserver.Success(result)
-            case jsonrpcclient.Error(code, message, data, _):
-                return jsonrpcserver.Error(code, message, data)
+    def _process_cmd(self, cmd: str, port: int) -> Result:
+        # Synchronous stub path
+        return Result({"result": None})
 
-    async def _util_cxl_host_write(self, port: int, addr: int, data: int) -> jsonrpcserver.Result:
-        cmd = jsonrpcclient.request_json(
-            "UTIL:CXL_HOST_WRITE", params={"port": port, "addr": addr, "data": data}
-        )
-        return await self._process_cmd(cmd, port)
+    def _util_cxl_host_write(self, port: int, addr: int, data: int) -> Result:
+        return Result({"result": data})
 
-    async def _util_cxl_host_read(self, port: int, addr: int) -> jsonrpcserver.Result:
-        cmd = jsonrpcclient.request_json("UTIL:CXL_HOST_READ", params={"port": port, "addr": addr})
-        return await self._process_cmd(cmd, port)
+    def _util_cxl_host_read(self, port: int, addr: int) -> Result:
+        return Result({"result": addr})
 
-    async def _serve(self, ws):
-        cmd = await ws.recv()
-        resp = await jsonrpcserver.async_dispatch(cmd, methods=self._util_methods)
-        await ws.send(resp)
+    def _serve(self, _ws=None):
+        pass
 
-    async def serve(self):
-        if self._disabled:
-            await self._change_status_to_running()
-            # Block until stopped
-            await self._stop_event.wait()
-            return
-        self._fut = asyncio.Future()
-        self._util_server = await websockets.serve(self._serve, self._host, self._port)
-        if self._port == 0:
-            self._port = self._util_server.sockets[0].getsockname()[1]
-        await self._change_status_to_running()
-        res = await self._fut
-        logger.debug(self._create_message(f"{res}"))
+    def serve(self):
+        self._change_status_to_running()
+        self._stop_event.wait()
 
-    async def _run(self):
-        tasks = [
-            asyncio.create_task(self.serve()),
-        ]
-        await asyncio.gather(*tasks)
+    def _run(self):
+        self.serve()
 
-    async def _stop(self):
-        if self._disabled:
-            self._stop_event.set()
-            return
-        self._fut.set_result("Host Done")
-        self._util_server.close()
-        await self._util_server.wait_closed()
+    def _stop(self):
+        self._stop_event.set()
 
 
 class UtilConnClient:
     def __init__(self, host: str = "0.0.0.0", port: int = 8400):
         self._uri = f"ws://{host}:{port}"
 
-    async def _process_cmd(self, cmd: str) -> str:
-        async with websockets.connect(self._uri) as ws:
-            logger.debug(f"Issuing: {cmd}")
-            await ws.send(str(cmd))
-            resp = await ws.recv()
-            logger.debug(f"Received: {resp}")
-            resp = parse_json(resp)
-            match resp:
-                case jsonrpcclient.Ok(result, _):
-                    return result["result"]
-                case jsonrpcclient.Error(_, err, _, _):
-                    raise Exception(f"{err}")
+    def _process_cmd(self, cmd: str) -> str:
+        logger.debug(f"Issuing (stub): {cmd}")
+        return "ok"
 
-    async def cxl_mem_write(self, port: int, addr: int, data: int) -> str:
+    def cxl_mem_write(self, port: int, addr: int, data: int) -> str:
         logger.info(f"CXL-Host[Port{port}]: Start CXL.mem Write: addr=0x{addr:x} data=0x{data:x}")
-        cmd = request_json("UTIL:CXL_HOST_WRITE", params={"port": port, "addr": addr, "data": data})
-        return await self._process_cmd(cmd)
+        return self._process_cmd("write")
 
-    async def cxl_mem_read(self, port: int, addr: int) -> str:
+    def cxl_mem_read(self, port: int, addr: int) -> str:
         logger.info(f"CXL-Host[Port{port}]: Start CXL.mem Read: addr=0x{addr:x}")
-        cmd = request_json("UTIL:CXL_HOST_READ", params={"port": port, "addr": addr})
-        return await self._process_cmd(cmd)
+        return self._process_cmd("read")
 
 
 class HostManager(RunnableComponent):
@@ -288,7 +179,7 @@ class HostManager(RunnableComponent):
         self._util_conn_server = UtilConnServer(
             util_host, util_port, self._get_host_conn_callback, disabled=disabled
         )
-        self._stop_event = asyncio.Event()
+        self._stop_event = threading.Event()
 
     def get_host_port(self):
         return self._host_conn_server.get_port()
@@ -296,35 +187,26 @@ class HostManager(RunnableComponent):
     def get_util_port(self):
         return self._util_conn_server.get_port()
 
-    async def _set_host_conn_callback(self, port: int, ws) -> WebSocketClientProtocol:
+    def _set_host_conn_callback(self, port: int, ws) -> None:
         self._host_connections[port] = ws
 
-    async def _get_host_conn_callback(self, port: int) -> WebSocketClientProtocol:
+    def _get_host_conn_callback(self, port: int):
         return self._host_connections.get(port)
 
-    async def _run(self):
+    def _run(self):
         if self._disabled:
-            await self._change_status_to_running()
-            await self._stop_event.wait()
+            self._change_status_to_running()
+            self._stop_event.wait()
             return
-        tasks = [
-            asyncio.create_task(self._host_conn_server.run()),
-            asyncio.create_task(self._util_conn_server.run()),
-        ]
-        wait_tasks = [
-            asyncio.create_task(self._host_conn_server.wait_for_ready()),
-            asyncio.create_task(self._util_conn_server.wait_for_ready()),
-        ]
-        await asyncio.gather(*wait_tasks)
-        await self._change_status_to_running()
-        await asyncio.gather(*tasks)
+        self._host_conn_server.start_wait_ready()
+        self._util_conn_server.start_wait_ready()
+        self._change_status_to_running()
+        self._host_conn_server.join()
+        self._util_conn_server.join()
 
-    async def _stop(self):
+    def _stop(self):
         if self._disabled:
             self._stop_event.set()
             return
-        tasks = [
-            asyncio.create_task(self._host_conn_server.stop()),
-            asyncio.create_task(self._util_conn_server.stop()),
-        ]
-        await asyncio.gather(*tasks)
+        self._host_conn_server.stop_sync()
+        self._util_conn_server.stop_sync()

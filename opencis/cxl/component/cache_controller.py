@@ -6,11 +6,9 @@ See LICENSE for details.
 """
 
 from typing import Optional, Tuple, List
-from asyncio import create_task, gather
 from dataclasses import dataclass
 from enum import Enum, auto
 from math import log2
-import asyncio
 import threading
 
 from opencis.util.logger import logger
@@ -129,7 +127,6 @@ class CacheController(RunnableComponent):
         self._memory_ranges: List[MemoryRange] = []
 
         # Threaded scheduler infrastructure
-        self._loop: asyncio.AbstractEventLoop | None = None  # type: ignore[name-defined]
         self._stop_evt = False
         self._threads: list[threading.Thread] = []  # type: ignore[name-defined]
 
@@ -282,25 +279,25 @@ class CacheController(RunnableComponent):
             case _:
                 raise Exception(f"OOB Memory Address: 0x{addr:x}")
 
-    async def _memory_load(self, addr: int, size: int) -> CacheResponse:
+    def _memory_load(self, addr: int, size: int) -> CacheResponse:
         cache_fifo = self._get_cache_fifo(addr)
         packet = CacheRequest(CACHE_REQUEST_TYPE.SNP_DATA, addr, size)
-        await cache_fifo.request.put(packet)
-        packet = await cache_fifo.response.get()
+        cache_fifo.request.put(packet)
+        packet = cache_fifo.response.get()
         return packet
 
-    async def _memory_store(self, addr: int, size: int, prev_state: CacheState, value) -> None:
+    def _memory_store(self, addr: int, size: int, prev_state: CacheState, value) -> None:
         cache_fifo = self._get_cache_fifo(addr)
         # Check for dirtiness, use WRITE_BACK_CLEAN if clean
         if prev_state == CacheState.CACHE_MODIFIED:
             packet = CacheRequest(CACHE_REQUEST_TYPE.WRITE_BACK, addr, size, value)
         else:
             packet = CacheRequest(CACHE_REQUEST_TYPE.WRITE_BACK_CLEAN, addr, size, value)
-        await cache_fifo.request.put(packet)
-        await cache_fifo.response.get()
+        cache_fifo.request.put(packet)
+        cache_fifo.response.get()
 
     # For request: coherency tasks from cache controller to coh module
-    async def _cache_to_coh_state_lookup(self, addr: int) -> None:
+    def _cache_to_coh_state_lookup(self, addr: int) -> None:
         if self._processor_to_cache_fifo is None:
             # device-side cache controller
             cache_fifo = self._cache_to_coh_agent_fifo
@@ -316,12 +313,12 @@ class CacheController(RunnableComponent):
                 return
 
         packet = CacheRequest(CACHE_REQUEST_TYPE.SNP_INV, addr)
-        await cache_fifo.request.put(packet)
-        packet = await cache_fifo.response.get()
+        cache_fifo.request.put(packet)
+        packet = cache_fifo.response.get()
         assert packet.status == CACHE_RESPONSE_STATUS.RSP_I
 
     # For response: coherency tasks from coh module to cache controller
-    async def _coh_to_cache_state_lookup(
+    def _coh_to_cache_state_lookup(
         self, type: CACHE_REQUEST_TYPE, addr: int
     ) -> Tuple[int, int, CacheState]:
         data = 0
@@ -345,7 +342,7 @@ class CacheController(RunnableComponent):
         return cache_blk, data, prev_state
 
     # cache access for read
-    async def cache_coherent_load(self, addr: int, size: int) -> int:
+    def cache_coherent_load(self, addr: int, size: int) -> int:
         assert size == self._cache_blk_size
 
         tag = self._cache_extract_tag(addr)
@@ -366,12 +363,12 @@ class CacheController(RunnableComponent):
                 cached_data = self._cache_data_read(set, cache_blk)
 
                 # cacheline flush to secure space
-                await self._memory_store(assem_addr, size, prev_state, cached_data)
+                self._memory_store(assem_addr, size, prev_state, cached_data)
                 self._cache_update_block_state(tag, set, cache_blk, CacheState.CACHE_INVALID)
 
             # coherency check whenever inserting a cache block
             # snoop_data to get mesi response
-            packet = await self._memory_load(addr, size)
+            packet = self._memory_load(addr, size)
             data = packet.data
 
             cache_state = self._cache_rsp_state_lookup(packet)
@@ -385,7 +382,7 @@ class CacheController(RunnableComponent):
         return data
 
     # cache access for write
-    async def cache_coherent_store(self, addr: int, size: int, data: int) -> None:
+    def cache_coherent_store(self, addr: int, size: int, data: int) -> None:
         assert size == self._cache_blk_size
 
         tag = self._cache_extract_tag(addr)
@@ -399,7 +396,7 @@ class CacheController(RunnableComponent):
 
             if cache_state == CacheState.CACHE_SHARED:
                 # can be real shared or exclusive-shared
-                await self._cache_to_coh_state_lookup(addr)
+                self._cache_to_coh_state_lookup(addr)
                 self._cache_update_block_state(tag, set, cache_blk, CacheState.CACHE_EXCLUSIVE)
 
             self._cache_update_block_state(tag, set, cache_blk, CacheState.CACHE_MODIFIED)
@@ -415,87 +412,66 @@ class CacheController(RunnableComponent):
                 cached_data = self._cache_data_read(set, cache_blk)
 
                 # cacheline flush to secure space
-                await self._memory_store(assem_addr, size, prev_state, cached_data)
+                self._memory_store(assem_addr, size, prev_state, cached_data)
                 self._cache_update_block_state(tag, set, cache_blk, CacheState.CACHE_INVALID)
 
             # coherency check whenever inserting a cache block
             # always snoop_invalidate for now
-            await self._cache_to_coh_state_lookup(addr)
+            self._cache_to_coh_state_lookup(addr)
 
             # todo: read memory if partial update is supported
             self._cache_update_block_state(tag, set, cache_blk, CacheState.CACHE_MODIFIED)
             self._cache_data_write(set, cache_blk, data)
 
-    async def _uncached_load(self, addr: int, size: int) -> int:
+    def _uncached_load(self, addr: int, size: int) -> int:
         from opencis.util.logger import logger  # local import to avoid cycle at module load
 
         logger.info(self._create_message(f"UNCACHED_READ req addr=0x{addr:x} size={size}"))
         packet = CacheRequest(CACHE_REQUEST_TYPE.UNCACHED_READ, addr, size)
-        await self._cache_to_coh_agent_fifo.request.put(packet)
-        resp = await self._cache_to_coh_agent_fifo.response.get()
+        self._cache_to_coh_agent_fifo.request.put(packet)
+        resp = self._cache_to_coh_agent_fifo.response.get()
         logger.info(self._create_message("UNCACHED_READ rsp OK"))
         return resp.data
 
-    async def _uncached_store(self, addr: int, size: int, data: int) -> int:
+    def _uncached_store(self, addr: int, size: int, data: int) -> int:
         from opencis.util.logger import logger  # local import to avoid cycle at module load
 
         logger.info(self._create_message(f"UNCACHED_WRITE req addr=0x{addr:x} size={size}"))
         packet = CacheRequest(CACHE_REQUEST_TYPE.UNCACHED_WRITE, addr, size, data)
-        await self._cache_to_coh_agent_fifo.request.put(packet)
-        resp = await self._cache_to_coh_agent_fifo.response.get()
+        self._cache_to_coh_agent_fifo.request.put(packet)
+        resp = self._cache_to_coh_agent_fifo.response.get()
         logger.info(self._create_message("UNCACHED_WRITE rsp OK"))
 
     # registered event loop for processor's cache load/store operations (thread worker)
     def _processor_request_worker(self) -> None:
-        assert self._loop is not None
         while not self._stop_evt:
-            packet = asyncio.run_coroutine_threadsafe(
-                self._processor_to_cache_fifo.request.get(), self._loop
-            ).result()
+            packet = self._processor_to_cache_fifo.request.get()
             if packet is None:
                 logger.debug(
                     self._create_message("Stop processing processor request scheduler fifo")
                 )
                 break
             if packet.type == MEMORY_REQUEST_TYPE.READ:
-                data = asyncio.run_coroutine_threadsafe(
-                    self.cache_coherent_load(packet.addr, packet.size), self._loop
-                ).result()
+                data = self.cache_coherent_load(packet.addr, packet.size)
                 resp = MemoryResponse(MEMORY_RESPONSE_STATUS.OK, data)
-                asyncio.run_coroutine_threadsafe(
-                    self._processor_to_cache_fifo.response.put(resp), self._loop
-                ).result()
+                self._processor_to_cache_fifo.response.put(resp)
             elif packet.type == MEMORY_REQUEST_TYPE.UNCACHED_READ:
-                data = asyncio.run_coroutine_threadsafe(
-                    self._uncached_load(packet.addr, packet.size), self._loop
-                ).result()
+                data = self._uncached_load(packet.addr, packet.size)
                 resp = MemoryResponse(MEMORY_RESPONSE_STATUS.OK, data)
-                asyncio.run_coroutine_threadsafe(
-                    self._processor_to_cache_fifo.response.put(resp), self._loop
-                ).result()
+                self._processor_to_cache_fifo.response.put(resp)
             elif packet.type == MEMORY_REQUEST_TYPE.WRITE:
-                asyncio.run_coroutine_threadsafe(
-                    self.cache_coherent_store(packet.addr, packet.size, packet.data), self._loop
-                ).result()
+                self.cache_coherent_store(packet.addr, packet.size, packet.data)
                 resp = MemoryResponse(MEMORY_RESPONSE_STATUS.OK)
-                asyncio.run_coroutine_threadsafe(
-                    self._processor_to_cache_fifo.response.put(resp), self._loop
-                ).result()
+                self._processor_to_cache_fifo.response.put(resp)
             elif packet.type == MEMORY_REQUEST_TYPE.UNCACHED_WRITE:
-                asyncio.run_coroutine_threadsafe(
-                    self._uncached_store(packet.addr, packet.size, packet.data), self._loop
-                ).result()
+                self._uncached_store(packet.addr, packet.size, packet.data)
                 resp = MemoryResponse(MEMORY_RESPONSE_STATUS.OK)
-                asyncio.run_coroutine_threadsafe(
-                    self._processor_to_cache_fifo.response.put(resp), self._loop
-                ).result()
+                self._processor_to_cache_fifo.response.put(resp)
             else:
                 assert False
 
-    async def _run_coh_request(self, packet: CacheRequest, cache_fifo: CacheFifoPair):
-        cache_blk, data, prev_state = await self._coh_to_cache_state_lookup(
-            packet.type, packet.addr
-        )
+    def _run_coh_request(self, packet: CacheRequest, cache_fifo: CacheFifoPair):
+        cache_blk, data, prev_state = self._coh_to_cache_state_lookup(packet.type, packet.addr)
         if cache_blk is None:
             packet = CacheResponse(CACHE_RESPONSE_STATUS.RSP_MISS, data)
         elif packet.type == CACHE_REQUEST_TYPE.SNP_DATA:
@@ -513,45 +489,33 @@ class CacheController(RunnableComponent):
             packet = CacheResponse(CACHE_RESPONSE_STATUS.RSP_V, data)
         else:
             assert False
-        await cache_fifo.response.put(packet)
+        cache_fifo.response.put(packet)
 
     # registered event loop for coh module's cache lookup operations (thread worker)
     def _coh_agent_request_worker(self) -> None:
-        assert self._loop is not None
         while not self._stop_evt:
-            packet = asyncio.run_coroutine_threadsafe(
-                self._coh_agent_to_cache_fifo.request.get(), self._loop
-            ).result()
+            packet = self._coh_agent_to_cache_fifo.request.get()
             if packet is None:
                 logger.debug(
                     self._create_message("Stop processing coh agent request scheduler fifo")
                 )
                 break
-            asyncio.run_coroutine_threadsafe(
-                self._run_coh_request(packet, self._coh_agent_to_cache_fifo), self._loop
-            ).result()
+            self._run_coh_request(packet, self._coh_agent_to_cache_fifo)
 
     def _coh_bridge_request_worker(self) -> None:
-        assert self._loop is not None
         while not self._stop_evt:
-            packet = asyncio.run_coroutine_threadsafe(
-                self._coh_bridge_to_cache_fifo.request.get(), self._loop
-            ).result()
+            packet = self._coh_bridge_to_cache_fifo.request.get()
             if packet is None:
                 logger.debug(
                     self._create_message("Stop processing coh bridge request scheduler fifo")
                 )
                 break
-            asyncio.run_coroutine_threadsafe(
-                self._run_coh_request(packet, self._coh_bridge_to_cache_fifo), self._loop
-            ).result()
+            self._run_coh_request(packet, self._coh_bridge_to_cache_fifo)
 
-    async def _run(self):
-        # Initialize loop and start worker threads
-        import asyncio as _asyncio  # avoid top-cycle
+    def _run(self):
+        # Initialize and start worker threads
         import threading as _threading
 
-        self._loop = _asyncio.get_running_loop()
         self._stop_evt = False
         self._threads = []
 
@@ -584,26 +548,29 @@ class CacheController(RunnableComponent):
             t_bridge.start()
             self._threads.append(t_bridge)
 
-        await self._change_status_to_running()
-        # Keep component alive
-        stopper = _asyncio.Event()
-        await stopper.wait()
+        self._change_status_to_running()
+        # Keep component alive by joining worker threads
+        for t in self._threads:
+            try:
+                t.join()
+            except Exception:
+                pass
 
-    async def _stop(self):
+    def _stop(self):
         # Signal workers to stop and nudge queues with None, matching original semantics
         self._stop_evt = True
         try:
             if self._processor_to_cache_fifo:
-                await self._processor_to_cache_fifo.request.put(None)
+                self._processor_to_cache_fifo.request.put(None)
         except Exception:
             pass
         try:
             if self._coh_bridge_to_cache_fifo:
-                await self._coh_bridge_to_cache_fifo.request.put(None)
+                self._coh_bridge_to_cache_fifo.request.put(None)
         except Exception:
             pass
         try:
-            await self._coh_agent_to_cache_fifo.request.put(None)
+            self._coh_agent_to_cache_fifo.request.put(None)
         except Exception:
             pass
         # Join threads

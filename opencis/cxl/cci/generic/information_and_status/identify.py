@@ -89,7 +89,7 @@ class IdentifyCommand(CciForegroundCommand):
         super().__init__(self.OPCODE, label=label)
         self._dev_info = dev_info
 
-    async def _execute(self, _: CciRequest) -> CciResponse:
+    def _execute(self, _: CciRequest) -> CciResponse:
         payload = self._dev_info.dump()
         return CciResponse(payload=payload)
 

@@ -5,7 +5,7 @@ This software is licensed under the terms of the Revised BSD License.
 See LICENSE for details.
 """
 
-from asyncio import gather, create_task
+import threading
 from typing import List
 
 from opencis.cxl.component.cxl_connection import CxlConnection
@@ -84,21 +84,21 @@ class MultiLogicalDevice(RunnableComponent):
             )
             self._cxl_type3_devices.append(cxl_type3_device)
 
-    async def _run(self):
-        # pylint: disable=duplicate-code
-        run_tasks = [create_task(device.run()) for device in self._cxl_type3_devices]
-        wait_tasks = [create_task(device.wait_for_ready()) for device in self._cxl_type3_devices]
+    def _run(self):
+        # start and wait ready synchronously
+        for device in self._cxl_type3_devices:
+            device.start_wait_ready()
         if not self._test_mode:
-            run_tasks += [create_task(self._sw_conn_client.run())]
-            wait_tasks += [create_task(self._sw_conn_client.wait_for_ready())]
-
-        await gather(*wait_tasks)
-        await self._change_status_to_running()
-        await gather(*run_tasks)
-
-    async def _stop(self):
-        stop_tasks = [create_task(device.stop()) for device in self._cxl_type3_devices]
+            self._sw_conn_client.start_wait_ready()
+        self._change_status_to_running()
+        # block on joins
+        for device in self._cxl_type3_devices:
+            device.join()
         if not self._test_mode:
-            stop_tasks += [create_task(self._sw_conn_client.stop())]
+            self._sw_conn_client.join()
 
-        await gather(*stop_tasks)
+    def _stop(self):
+        for device in self._cxl_type3_devices:
+            device.stop_sync()
+        if not self._test_mode:
+            self._sw_conn_client.stop_sync()

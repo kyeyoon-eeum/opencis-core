@@ -6,7 +6,6 @@ See LICENSE for details.
 """
 
 from abc import abstractmethod
-from asyncio import create_task, gather
 from enum import IntEnum
 
 from opencis.cxl.component.cxl_cache_manager import CxlCacheManager
@@ -97,29 +96,31 @@ class CxlPortDevice(RunnableComponent):
     def get_device_type(self) -> CXL_COMPONENT_TYPE:
         """This must be implemented in the child class"""
 
-    async def _run(self):
+    def _run(self):
         logger.info(self._create_message("Starting"))
-        run_tasks = [
-            create_task(self._cxl_io_manager.run()),
-            create_task(self._cxl_mem_manager.run()),
-            create_task(self._cxl_cache_manager.run()),
-        ]
-        wait_tasks = [
-            create_task(self._cxl_io_manager.wait_for_ready()),
-            create_task(self._cxl_mem_manager.wait_for_ready()),
-            create_task(self._cxl_cache_manager.wait_for_ready()),
-        ]
-        # pylint: disable=duplicate-code
-        await gather(*wait_tasks)
-        await self._change_status_to_running()
-        await gather(*run_tasks)
+        # Start sub-managers synchronously and wait for readiness
+        self._cxl_io_manager.start_wait_ready()
+        self._cxl_mem_manager.start_wait_ready()
+        self._cxl_cache_manager.start_wait_ready()
+        self._change_status_to_running()
+        # Join until stop
+        self._cxl_io_manager.join()
+        self._cxl_mem_manager.join()
+        self._cxl_cache_manager.join()
         logger.info(self._create_message("Stopped"))
 
-    async def _stop(self):
+    def _stop(self):
         logger.info(self._create_message("Stopping"))
-        tasks = [
-            create_task(self._cxl_io_manager.stop()),
-            create_task(self._cxl_mem_manager.stop()),
-            create_task(self._cxl_cache_manager.stop()),
-        ]
-        await gather(*tasks)
+        try:
+            self._cxl_io_manager.stop_sync()
+        except Exception:
+            pass
+        try:
+            self._cxl_mem_manager.stop_sync()
+        except Exception:
+            pass
+        try:
+            self._cxl_cache_manager.stop_sync()
+        except Exception:
+            pass
+        logger.info(self._create_message("Stopped"))

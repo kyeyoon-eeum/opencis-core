@@ -5,7 +5,7 @@ This software is licensed under the terms of the Revised BSD License.
 See LICENSE for details.
 """
 
-from asyncio import gather, create_task, run
+import threading
 from typing import List, cast
 
 from opencis.util.logger import logger
@@ -23,40 +23,39 @@ from opencis.drivers.pci_bus_driver import PciBusDriver
 from opencis.drivers.cxl_bus_driver import CxlBusDriver
 from opencis.drivers.cxl_mem_driver import CxlMemDriver
 
-# pylint: disable=duplicate-code
-
 
 class TestRunner:
     def __init__(self, apps: List[RunnableComponent]):
         self._apps = apps
 
-    async def run(self):
-        tasks = []
+    def run(self):
+        threads: list[threading.Thread] = []
         for app in self._apps:
-            tasks.append(create_task(app.run()))
-        tasks.append(create_task(self.run_test()))
-        await gather(*tasks)
+            t = threading.Thread(target=app.start_wait_ready)
+            t.start()
+            threads.append(t)
+        self.run_test()
+        for t in threads:
+            t.join()
 
-    async def wait_for_ready(self):
-        tasks = []
+    def wait_for_ready(self):
         for app in self._apps:
-            tasks.append(create_task(app.wait_for_ready()))
-        await gather(*tasks)
+            app.wait_for_ready_sync()
 
-    async def run_test(self):
+    def run_test(self):
         logger.info("Waiting for Apps to be ready")
-        await self.wait_for_ready()
+        self.wait_for_ready()
         host = cast(CxlHost, self._apps[3])
         pci_bus_driver = PciBusDriver(host.get_root_complex())
         logger.info("Starting PCI bus driver init")
-        await pci_bus_driver.init(mmio_base_address=0)
+        pci_bus_driver.init(mmio_base_address=0)
         logger.info("Completed PCI bus driver init")
         cxl_bus_driver = CxlBusDriver(pci_bus_driver, host.get_root_complex())
         logger.info("Starting CXL bus driver init")
-        await cxl_bus_driver.init()
+        cxl_bus_driver.init()
         logger.info("Completed CXL bus driver init")
         cxl_mem_driver = CxlMemDriver(cxl_bus_driver, host.get_root_complex())
-        await cxl_mem_driver.init()
+        cxl_mem_driver.init()
 
         hpa_base = 0x0
         next_available_hpa_base = hpa_base
@@ -66,7 +65,7 @@ class TestRunner:
             bdf = device.pci_device_info.bdf
             bus = (bdf >> 8) & 0xFF
             logger.info(f"Scanned bus number for .mem bi-id: {bus}")
-            successful = await cxl_mem_driver.attach_single_mem_device(
+            successful = cxl_mem_driver.attach_single_mem_device(
                 device, next_available_hpa_base, size
             )
             if successful:
@@ -99,7 +98,7 @@ def main():
         show_linenumber=show_linenumber,
     )
 
-    apps = []
+    apps: list[RunnableComponent] = []
 
     switch_port = 8000
     port_configs = [
@@ -131,18 +130,11 @@ def main():
     )
     apps.append(virtual_switch_manager)
 
-    # TODO: Migrate to pytest
-    # 256 MB
-    # host_config = CxlHostConfig(
-    #     host_name="CXLHost",
-    #     root_bus=0,
-    #     root_port_switch_type=ROOT_PORT_SWITCH_TYPE.PASS_THROUGH,
-    #     root_ports=[RootPortClientConfig(0, "0.0.0.0", 8000)],
-    #     memory_ranges=[],
-    # )
-    # host = CxlHost(host_config)
-    # apps.append(host)
+    # Host
+    host = CxlHost()
+    apps.append(host)
 
+    # 256 MB x 4
     memory_size = 0x10000000
     memex_t3_1 = SingleLogicalDevice(
         port_index=1,
@@ -178,7 +170,7 @@ def main():
     apps.append(memex_t3_4)
 
     test_runner = TestRunner(apps)
-    run(test_runner.run())
+    test_runner.run()
 
 
 if __name__ == "__main__":

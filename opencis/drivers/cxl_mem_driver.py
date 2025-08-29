@@ -23,7 +23,7 @@ class CxlMemDriver(LabeledComponent):
         self._cxl_bus_driver = cxl_bus_driver
         self._devices: List[CxlDeviceInfo] = []
 
-    async def init(self):
+    def init(self):
         self.scan_mem_devices()
 
     def scan_mem_devices(self):
@@ -43,24 +43,22 @@ class CxlMemDriver(LabeledComponent):
             return -1
         return downstream_port.pci_device_info.get_port_number()
 
-    async def attach_single_mem_device(
-        self, device: CxlDeviceInfo, hpa_base: int, size: int
-    ) -> bool:
+    def attach_single_mem_device(self, device: CxlDeviceInfo, hpa_base: int, size: int) -> bool:
         # should only be used for non-interleave setup
-        successful = await self.config_cxl_mem_device(device, hpa_base, size)
+        successful = self.config_cxl_mem_device(device, hpa_base, size)
         if not successful:
             return False
 
         downsream_port = device.parent
         upstream_port = downsream_port.parent
         port_number = self.get_port_number(device)
-        successful = await self.config_usp(upstream_port, hpa_base, size, [port_number])
+        successful = self.config_usp(upstream_port, hpa_base, size, [port_number])
         if not successful:
             return False
 
         return True
 
-    async def config_cxl_mem_device(
+    def config_cxl_mem_device(
         self,
         device: CxlDeviceInfo,
         hpa_base: int,
@@ -75,7 +73,7 @@ class CxlMemDriver(LabeledComponent):
                 f"config_cxl_mem_device ENTER bdf={bdf_str} base=0x{hpa_base:x} size=0x{size:x} ig={ig.name} iw={iw.name}"
             )
         )
-        successful = await device.configure_hdm_decoder_device(
+        successful = device.configure_hdm_decoder_device(
             hpa_base=hpa_base,
             hpa_size=size,
             interleaving_granularity=ig.value,
@@ -91,7 +89,7 @@ class CxlMemDriver(LabeledComponent):
             return False
         return True
 
-    async def config_usp(
+    def config_usp(
         self,
         upstream_port: CxlDeviceInfo,
         hpa_base: int,
@@ -112,7 +110,7 @@ class CxlMemDriver(LabeledComponent):
                 f"config_usp ENTER bdf={bdf_str} base=0x{hpa_base:x} size=0x{size:x} targets={target_list} ig={ig.name} iw={iw.name}"
             )
         )
-        successful = await upstream_port.configure_hdm_decoder_switch(
+        successful = upstream_port.configure_hdm_decoder_switch(
             hpa_base=hpa_base,
             hpa_size=size,
             target_list=target_list,

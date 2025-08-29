@@ -5,7 +5,6 @@ This software is licensed under the terms of the Revised BSD License.
 See LICENSE for details.
 """
 
-import asyncio
 import click
 
 from opencis.util.logger import logger
@@ -27,12 +26,13 @@ def start(use_test_runner):
     logger.info("Starting CXL FabricManager")
     fabric_manager = CxlFabricManager(use_test_runner=use_test_runner)
     try:
-        asyncio.run(fabric_manager.run())
+        fabric_manager.start_wait_ready()
+        fabric_manager.join()
     except Exception as e:
         logger.error("Error while running CXL FabricManager", exc_info=e)
     finally:
         try:
-            asyncio.run(fabric_manager.stop())
+            fabric_manager.stop_sync(timeout=2.0)
         except Exception as e:
             logger.error("Error while stopping CXL FabricManager", exc_info=e)
 
@@ -48,20 +48,21 @@ def start(use_test_runner):
     default=0,
 )
 def fm_bind(vcs: int, vppb: int, physical: int, ld_id: int):
-    asyncio.run(socketio_client.bind(vcs, vppb, physical, ld_id))
+    # SocketIO client is disabled/stubbed in sync mode
+    logger.info("bind command is disabled in synchronous mode")
 
 
 @fabric_manager_group.command(name="unbind")
 @click.argument("vcs", nargs=1, type=BASED_INT)
 @click.argument("vppb", nargs=1, type=BASED_INT)
 def fm_unbind(vcs: int, vppb: int):
-    asyncio.run(socketio_client.unbind(vcs, vppb))
+    logger.info("unbind command is disabled in synchronous mode")
 
 
 @fabric_manager_group.command(name="get-ld-info")
 @click.argument("port_index", nargs=1, type=BASED_INT)
 def get_ld_info(port_index: int):
-    asyncio.run(socketio_client.get_ld_info(port_index))
+    logger.info("get-ld-info is disabled in synchronous mode")
 
 
 @fabric_manager_group.command(name="get-ld-allocations")
@@ -69,23 +70,21 @@ def get_ld_info(port_index: int):
 @click.argument("start_ld_id", nargs=1, type=BASED_INT)
 @click.argument("ld_allocation_list_limit", nargs=1, type=BASED_INT)
 def get_ld_allocation(port_index: int, start_ld_id: int, ld_allocation_list_limit: int):
-    asyncio.run(
-        socketio_client.get_ld_allocation(port_index, start_ld_id, ld_allocation_list_limit)
-    )
+    logger.info("get-ld-allocations is disabled in synchronous mode")
 
 
 @fabric_manager_group.command(name="freeze")
 @click.argument("vcs", nargs=1, type=BASED_INT)
 @click.argument("vppb", nargs=1, type=BASED_INT)
 def fm_freeze(vcs: int, vppb: int):
-    asyncio.run(socketio_client.freeze(vcs, vppb))
+    logger.info("freeze is disabled in synchronous mode")
 
 
 @fabric_manager_group.command(name="unfreeze")
 @click.argument("vcs", nargs=1, type=BASED_INT)
 @click.argument("vppb", nargs=1, type=BASED_INT)
 def fm_unfreeze(vcs: int, vppb: int):
-    asyncio.run(socketio_client.unfreeze(vcs, vppb))
+    logger.info("unfreeze is disabled in synchronous mode")
 
 
 # TODO: Implement set_ld_allocation

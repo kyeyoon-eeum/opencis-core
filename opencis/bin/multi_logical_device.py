@@ -5,7 +5,6 @@ This software is licensed under the terms of the Revised BSD License.
 See LICENSE for details.
 """
 
-import asyncio
 from typing import List
 import humanfriendly
 import click
@@ -20,9 +19,12 @@ def mld_group():
     """Command group for managing single logical devices."""
 
 
-async def run_devices(mlds: List[MultiLogicalDevice]):
+def run_devices(mlds: List[MultiLogicalDevice]):
     try:
-        await asyncio.gather(*(mld.run() for mld in mlds))
+        for mld in mlds:
+            mld.start_wait_ready()
+        for mld in mlds:
+            mld.join()
     except Exception as e:
         logger.error(
             "An error occurred while running the Single Logical Device clients.",
@@ -30,7 +32,8 @@ async def run_devices(mlds: List[MultiLogicalDevice]):
         )
     finally:
         try:
-            await asyncio.gather(*(mld.stop() for mld in mlds))
+            for mld in mlds:
+                mld.stop_sync()
         except Exception as e:
             logger.error("Error while stopping Multi Logical Device", exc_info=e)
 
@@ -49,7 +52,7 @@ def start_group(config_file):
             port=cxl_env.switch_config.port,
         )
         mlds.append(mld)
-    asyncio.run(run_devices(mlds))
+    run_devices(mlds)
 
 
 @mld_group.command(name="start")
@@ -62,4 +65,5 @@ def start(port, memfile, memsize):
         memfile = f"mld-mem{port}.bin"
     memsize = humanfriendly.parse_size(memsize, binary=True)
     mld = MultiLogicalDevice(port, memsize, memfile, serial_numbers=[])
-    asyncio.run(mld.run())
+    mld.start_wait_ready()
+    mld.join()

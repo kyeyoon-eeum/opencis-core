@@ -5,13 +5,12 @@ This software is licensed under the terms of the Revised BSD License.
 See LICENSE for details.
 """
 
-from asyncio import create_task, gather
 from dataclasses import dataclass
 from typing import List, Optional
 
 from opencis.cxl.component.virtual_switch.virtual_switch import (
     CxlVirtualSwitch,
-    AsyncEventHandlerType,
+    EventHandlerType,
 )
 from opencis.cxl.component.physical_port_manager import PhysicalPortManager
 from opencis.util.component import RunnableComponent
@@ -83,26 +82,20 @@ class VirtualSwitchManager(RunnableComponent):
     def get_port(self, switch_index):
         return self._virtual_switches[switch_index].get_irq_port()
 
-    def register_event_handler(self, event_handler: AsyncEventHandlerType):
+    def register_event_handler(self, event_handler: EventHandlerType):
         for vcs in self._virtual_switches:
             vcs.register_event_handler(event_handler)
 
-    async def _run(self):
-        run_tasks = []
+    def _run(self):
         for virtual_switch in self._virtual_switches:
-            run_tasks.append(create_task(virtual_switch.run()))
-        wait_tasks = []
-        for virtual_switch in self._virtual_switches:
-            wait_tasks.append(create_task(virtual_switch.wait_for_ready()))
-        await gather(*wait_tasks)
-        await self._change_status_to_running()
+            virtual_switch.start_wait_ready()
+        self._change_status_to_running()
         from opencis.util.logger import logger
 
         logger.info(self._create_message("VirtualSwitchManager RUNNING"))
-        await gather(*run_tasks)
-
-    async def _stop(self):
-        tasks = []
         for virtual_switch in self._virtual_switches:
-            tasks.append(create_task(virtual_switch.stop()))
-        await gather(*tasks)
+            virtual_switch.join()
+
+    def _stop(self):
+        for virtual_switch in self._virtual_switches:
+            virtual_switch.stop_sync()

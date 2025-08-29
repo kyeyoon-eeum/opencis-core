@@ -5,7 +5,6 @@ This software is licensed under the terms of the Revised BSD License.
 See LICENSE for details.
 """
 
-import asyncio
 import click
 
 from opencis.util.logger import logger
@@ -31,7 +30,7 @@ def cxl_mem_write(port: int, addr: int, data: int, util_host: str, util_port: in
         logger.info(f"CXL-Host[Port{port}]: Error - Data length greater than 0x40 bytes")
         return
     try:
-        asyncio.run(client.cxl_mem_write(port, addr, data))
+        client.cxl_mem_write(port, addr, data)
     except Exception as e:
         logger.info(f"CXL-Host[Port{port}]: {e}")
         return
@@ -47,7 +46,7 @@ def cxl_mem_read(port: int, addr: int, util_host: str, util_port: int):
     """CXL.mem Read Command"""
     client = UtilConnClient(host=util_host, port=util_port)
     try:
-        res = asyncio.run(client.cxl_mem_read(port, addr))
+        res = client.cxl_mem_read(port, addr)
     except Exception as e:
         logger.info(f"CXL-Host[Port{port}]: {e}")
         return

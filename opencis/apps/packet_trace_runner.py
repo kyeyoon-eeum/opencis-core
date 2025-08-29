@@ -5,7 +5,7 @@ This software is licensed under the terms of the Revised BSD License.
 See LICENSE for details.
 """
 
-import asyncio
+import socket
 from scapy.all import PcapReader
 
 from opencis.util.logger import logger
@@ -29,13 +29,14 @@ class PacketTraceRunner(LabeledComponent):
         self._trace_switch_port = trace_switch_port
         self._trace_device_port = trace_device_port
 
-    async def run(self):
+    def run(self):
         try:
-            reader, writer = await asyncio.open_connection(self._switch_host, self._switch_port)
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.connect((self._switch_host, self._switch_port))
         except Exception as e:
             raise RuntimeError("Failed to connect to switch") from e
 
-        local_ip, local_port = writer.get_extra_info("sockname")
+        local_ip, local_port = s.getsockname()
         logger.info(self._create_message(f"Local address: {local_ip}, Local port: {local_port}"))
 
         with PcapReader(self._pcap_file) as pr:
@@ -49,15 +50,14 @@ class PacketTraceRunner(LabeledComponent):
                         and tcp.dport == self._trace_switch_port
                     ):
                         logger.info(self._create_message(f"({n + 1}) Tx: 0x{data:x}"))
-                        writer.write(data_bytes)
+                        s.sendall(data_bytes)
                     elif (
                         tcp.sport == self._trace_switch_port
                         and tcp.dport == self._trace_device_port
                     ):
                         try:
-                            recv_data_bytes = await asyncio.wait_for(
-                                reader.read(len(data_bytes)), timeout=5
-                            )
+                            s.settimeout(5)
+                            recv_data_bytes = s.recv(len(data_bytes))
                         except TimeoutError as e:
                             raise ValueError(f"Timed out waiting for Packet {n+1}") from e
 
@@ -69,5 +69,9 @@ class PacketTraceRunner(LabeledComponent):
                                 f"Packet {n + 1}\n  Expected (in BE): 0x{data:x}\n"
                                 f"  Received (in BE): 0x{recv_data:x}"
                             )
-        writer.close()
+        try:
+            s.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
+        s.close()
         logger.info("The packet trace run finished successfully!")

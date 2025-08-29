@@ -70,7 +70,7 @@ class UnbindVppbCommand(CciBackgroundCommand):
         super().__init__(self.OPCODE)
         self._virtual_switch_manager = virtual_switch_manager
 
-    async def _execute(self, request: CciRequest, callback: ProgressCallback) -> CciResponse:
+    def _execute(self, request: CciRequest, callback: ProgressCallback) -> CciResponse:
         request_payload = self.parse_request_payload(request.payload)
         vcs_id = request_payload.vcs_id
         vppb_id = request_payload.vppb_id
@@ -88,9 +88,8 @@ class UnbindVppbCommand(CciBackgroundCommand):
             logger.debug(self._create_message(f"vPPB {vppb_id} is already unbound"))
             return CciResponse(return_code=CCI_RETURN_CODE.INVALID_INPUT)
 
-        await callback(50)
-
-        await vcs.unbind_vppb(vppb_id)
+        callback(50)
+        vcs.unbind_vppb(vppb_id)
         response = CciResponse()
         return response
 

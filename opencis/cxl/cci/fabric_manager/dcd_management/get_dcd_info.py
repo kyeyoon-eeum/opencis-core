@@ -148,7 +148,7 @@ class GetDcdInfoCommand(CciForegroundCommand):
         self._virtual_switch_manager = virtual_switch_manager
         super().__init__(CCI_FM_API_COMMAND_OPCODE.GET_DCD_INFO)
 
-    async def _execute(self, _: CciRequest) -> CciResponse:
+    def _execute(self, _: CciRequest) -> CciResponse:
         #######################################################
         # TODO: Add code that will get the following variables
         # WILL NOT WORK WITHOUT IMPLEMENTATION

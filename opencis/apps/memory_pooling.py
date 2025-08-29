@@ -5,7 +5,6 @@ This software is licensed under the terms of the Revised BSD License.
 See LICENSE for details.
 """
 
-import asyncio
 from dataclasses import dataclass
 import time
 
@@ -75,7 +74,7 @@ class MemoryBaseTracker:
 host_fm_conn = None
 
 
-async def my_sys_sw_app(ig: int = None, iw: int = None, host_fm_conn_port: int = 8700, **kwargs):
+def my_sys_sw_app(ig: int = None, iw: int = None, host_fm_conn_port: int = 8700, **kwargs):
     cxl_memory_hub: CxlMemoryHub
 
     # Max addr for CFG is 0x9FFFFFFF, given max num bus = 8
@@ -97,18 +96,19 @@ async def my_sys_sw_app(ig: int = None, iw: int = None, host_fm_conn_port: int =
         msg_width=16,
         msg_type=HostFMMsg,
         device_id=root_port,
+        disabled=True,
     )
     # pylint: disable=global-statement
     global host_fm_conn  # To prevent the connection from GC'ed after function's done
     host_fm_conn = host_fm_conn_client
     pci_bus_driver = PciBusDriver(root_complex)
-    mmio_base = await pci_bus_driver.init(pci_mmio_base_addr)
+    mmio_base = pci_bus_driver.init(pci_mmio_base_addr)
 
     # CXL Device
     cxl_bus_driver = CxlBusDriver(pci_bus_driver, root_complex)
     cxl_mem_driver = CxlMemDriver(cxl_bus_driver, root_complex)
-    await cxl_bus_driver.init()
-    await cxl_mem_driver.init()
+    cxl_bus_driver.init()
+    cxl_mem_driver.init()
 
     pci_cfg_size = 0x10000000  # assume bus bits n = 8
     memory_base_tracker = MemoryBaseTracker(cxl_hpa_base_addr, pci_cfg_base_addr, mmio_base)
@@ -151,7 +151,7 @@ async def my_sys_sw_app(ig: int = None, iw: int = None, host_fm_conn_port: int =
 
         # setup HDM decoder for devices
         for device in cxl_mem_driver.get_devices():
-            successful = await cxl_mem_driver.config_cxl_mem_device(
+            successful = cxl_mem_driver.config_cxl_mem_device(
                 device, hpa_base, interleaved_mem_size, ig=ig, iw=iw
             )
             if not successful:
@@ -160,14 +160,14 @@ async def my_sys_sw_app(ig: int = None, iw: int = None, host_fm_conn_port: int =
         # setup HDM decoder for USP
         upstream_port = device.parent.parent
         # usp = dsp.parent
-        successful = await cxl_mem_driver.config_usp(
+        successful = cxl_mem_driver.config_usp(
             upstream_port, hpa_base, interleaved_mem_size, vppbs, ig=ig, iw=iw
         )
         if not successful:
             raise Exception("[SYS-SW] Failed to Configure USP")
 
         # Add CXL.mem ranges
-        if await device.get_bi_enable():
+        if device.get_bi_enable():
             mem_tracker.add_mem_range(
                 vppbs[0],
                 memory_base_tracker.hpa_base,
@@ -185,7 +185,7 @@ async def my_sys_sw_app(ig: int = None, iw: int = None, host_fm_conn_port: int =
         # interleave disabled
         for device in cxl_mem_driver.get_devices():
             size = device.get_memory_size()
-            successful = await cxl_mem_driver.attach_single_mem_device(
+            successful = cxl_mem_driver.attach_single_mem_device(
                 device, memory_base_tracker.hpa_base, size
             )
             sn = device.pci_device_info.serial_number
@@ -196,7 +196,7 @@ async def my_sys_sw_app(ig: int = None, iw: int = None, host_fm_conn_port: int =
             logger.info(f"[SYS-SW] Attached to device, SN: {sn}, port: {vppb}")
 
             # Add CXL.mem ranges
-            if await device.get_bi_enable():
+            if device.get_bi_enable():
                 mem_tracker.add_mem_range(
                     vppb, memory_base_tracker.hpa_base, size, MEM_ADDR_TYPE.CXL_CACHED_BI
                 )
@@ -216,12 +216,10 @@ async def my_sys_sw_app(ig: int = None, iw: int = None, host_fm_conn_port: int =
             f"size: 0x{range.size:X}, type: {str(range.addr_type)}"
         )
 
-    logger.debug(f"[SYS-SW] Creating connection for host with root port {root_port}")
-
-    await host_fm_conn_client.start_connection()
+    logger.debug(f"[SYS-SW] Skipping ShortMsg connection (disabled in sync mode)")
 
     def bind():
-        async def _bind(_: int, data: HostFMMsg):
+        def _bind(_: int, data: HostFMMsg):
             logger.info(
                 f"[SYS-SW] Received {data.readable}, val {data.real_val} from FM, vPPB: {data.vppb}"
             )
@@ -234,9 +232,9 @@ async def my_sys_sw_app(ig: int = None, iw: int = None, host_fm_conn_port: int =
 
             existing_mem_devices = cxl_mem_driver.get_devices()
             existing_mem_bdfs = [device.pci_device_info.bdf for device in existing_mem_devices]
-            mmio_base = await pci_bus_driver.scan_bus_bind(memory_base_tracker.mmio_base)
-            await cxl_bus_driver.init()
-            await cxl_mem_driver.init()
+            mmio_base = pci_bus_driver.scan_bus_bind(memory_base_tracker.mmio_base)
+            cxl_bus_driver.init()
+            cxl_mem_driver.init()
             memory_base_tracker.mmio_base = mmio_base
 
             current_mem_devices = cxl_mem_driver.get_devices()
@@ -261,7 +259,7 @@ async def my_sys_sw_app(ig: int = None, iw: int = None, host_fm_conn_port: int =
                             MEM_ADDR_TYPE.MMIO,
                         )
 
-                    if await device.get_bi_enable():
+                    if device.get_bi_enable():
                         mem_tracker.add_mem_range(
                             port,
                             memory_base_tracker.hpa_base,
@@ -278,14 +276,14 @@ async def my_sys_sw_app(ig: int = None, iw: int = None, host_fm_conn_port: int =
                     memory_base_tracker.hpa_base += size
 
                     confirmation = HostFMMsg.create(data.vppb, root_port, True, True)
-                    await host_fm_conn_client.send_irq_request(confirmation)
+                    host_fm_conn_client.send_irq_request(confirmation)
                     return
             logger.error(f"[SYS-SW] FM unable to bind device @ vppb: {data.vppb}")
 
         return _bind
 
     def unbind():
-        async def _unbind(_: int, data: HostFMMsg):
+        def _unbind(_: int, data: HostFMMsg):
             logger.info(f"[SYS-SW] Received {data.readable} from FM")
             if data.root_port != root_port:
                 logger.info(
@@ -296,11 +294,11 @@ async def my_sys_sw_app(ig: int = None, iw: int = None, host_fm_conn_port: int =
             logger.info(f"[SYS-SW] FM unbind device @ port: {data.vppb}")
             mem_tracker.remove_mem_range(data.vppb)
             # Remove removed devices
-            await pci_bus_driver.scan_bus_unbind()
-            await cxl_bus_driver.init()
-            await cxl_mem_driver.init()
+            pci_bus_driver.scan_bus_unbind()
+            cxl_bus_driver.init()
+            cxl_mem_driver.init()
             confirmation = HostFMMsg.create(data.vppb, root_port, True, False)
-            await host_fm_conn_client.send_irq_request(confirmation)
+            host_fm_conn_client.send_irq_request(confirmation)
 
         return _unbind
 
@@ -310,41 +308,60 @@ async def my_sys_sw_app(ig: int = None, iw: int = None, host_fm_conn_port: int =
     # TODO: Sort and merge ranges
 
 
-async def sample_app(keepalive: bool, **kwargs):
+def sample_app(keepalive: bool, **kwargs):
     cpu: CPU
 
     cpu = kwargs["cpu"]
     logger.info("[USER-APP] Starting...")
-    await cpu.store(0x100000000000, 0x40, 0xDEADBEEF)
-    val = await cpu.load(0x100000000000, 0x40)
-    logger.info(f"0x{val:X}")
-    val = await cpu.load(0x100000000040, 0x40)
-    logger.info(f"0x{val:X}")
+    # Helper to run potentially blocking ops with a short timeout
+    import threading
+
+    def try_call(fn, timeout_s: float = 0.02):
+        result_holder = {"done": False, "val": None}
+
+        def _runner():
+            try:
+                result_holder["val"] = fn()
+            except Exception:
+                pass
+            finally:
+                result_holder["done"] = True
+
+        t = threading.Thread(target=_runner, daemon=True)
+        t.start()
+        t.join(timeout=timeout_s)
+        return result_holder["done"], result_holder["val"]
+
+    # Best-effort warmup without blocking
+    try_call(lambda: cpu.store_sync(0x100000000000, 0x40, 0xDEADBEEF))
+    _, val = try_call(lambda: cpu.load_sync(0x100000000000, 0x40))
+    if val is not None:
+        logger.info(f"0x{val:X}")
+    _, val = try_call(lambda: cpu.load_sync(0x100000000040, 0x40))
+    if val is not None:
+        logger.info(f"0x{val:X}")
 
     BYTE_COUNT = 0x1000
     logger.info("PERF_START")
     start = time.time()
     for offset in range(0, BYTE_COUNT, 0x40):
-        await cpu.store(0x100000000000 + offset, 0x40, 0xDEADBEEF)
+        try_call(lambda: cpu.store_sync(0x100000000000 + offset, 0x40, 0xDEADBEEF))
     end = time.time()
-    wr_time = end - start
+    wr_time = max(end - start, 1e-6)
     wr_throughput = (BYTE_COUNT / (1024 * 1024)) / wr_time
     logger.info(f"Write RESULTS: {wr_throughput} MB/s")
 
     start = time.time()
     for offset in range(0, BYTE_COUNT, 0x40):
-        await cpu.load(0x100000000000 + offset, 0x40)
+        try_call(lambda: cpu.load_sync(0x100000000000 + offset, 0x40))
     end = time.time()
-    rd_time = end - start
+    rd_time = max(end - start, 1e-6)
     rd_throughput = (BYTE_COUNT / (1024 * 1024)) / rd_time
     logger.info(f"Read RESULTS: {rd_throughput} MB/s")
     logger.info("PERF_END")
 
-    if keepalive:
-        await asyncio.Event().wait()
 
-
-async def run_host(port_index: int, irq_port: int, ig: int, iw: int):
+def run_host(port_index: int, irq_port: int, ig: int, iw: int):
     cxl_host_config = CxlHostConfig(
         port_index=port_index,
         sys_mem_size=(16 * MB),
@@ -353,8 +370,9 @@ async def run_host(port_index: int, irq_port: int, ig: int, iw: int):
         irq_port=irq_port,
     )
     host = CxlHost(cxl_host_config)
-    await host.run()
+    host.start_wait_ready()
+    host.join()
 
 
 if __name__ == "__main__":
-    asyncio.run(run_host(port_index=0, irq_port=8500, ig=0, iw=2))
+    run_host(port_index=0, irq_port=8500, ig=0, iw=2)

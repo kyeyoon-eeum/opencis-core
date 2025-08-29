@@ -5,7 +5,6 @@ This software is licensed under the terms of the Revised BSD License.
 See LICENSE for details.
 """
 
-import asyncio
 from typing import Callable, Awaitable
 from dataclasses import dataclass
 
@@ -86,39 +85,46 @@ class CxlHost(RunnableComponent):
     def get_irq_manager(self):
         return self._irq_manager
 
-    async def _cxl_host_read(self, addr: int):
-        res = await self._cpu.load(addr, 64)
+    def _cxl_host_read(self, addr: int):
+        res = self._cpu.load(addr, 64)
         if res is False:
             logger.error(self._create_message(f"Host Read: Error - 0x{addr:x} is invalid address"))
             return Result(f"Invalid Params: 0x{addr:x} is not a valid address")
         return Result(res)
 
-    async def _cxl_host_write(self, addr: int, data: int):
-        res = await self._cpu.store(addr, 64, data)
+    def _cxl_host_write(self, addr: int, data: int):
+        res = self._cpu.store(addr, 64, data)
         if res is False:
             logger.error(self._create_message(f"Host Write: Error - 0x{addr:x} is invalid address"))
             return Result(f"Invalid Params: 0x{addr:x} is not a valid address")
         return Result(res)
 
-    async def _run(self):
+    def _run(self):
         logger.info(self._create_message("CxlHost starting IRQ manager, memory hub, and CPU"))
-        tasks = [
-            await self._irq_manager.run_wait_ready(),
-            await self._cxl_memory_hub.run_wait_ready(),
-            await self._cpu.run_wait_ready(),
-        ]
+        self._irq_manager.start_wait_ready()
+        # Ensure memory hub is READY before running CPU/user app to avoid request stalls
+        self._cxl_memory_hub.start_wait_ready()
+        self._cpu.start_wait_ready()
         if self._enable_hm:
-            tasks.append(asyncio.create_task(self._host_mgr_conn_client.run()))
-            await self._host_mgr_conn_client.wait_for_ready()
-
-        await self._change_status_to_running()
+            self._host_mgr_conn_client.start()
+        self._change_status_to_running()
         logger.info(self._create_message("CxlHost RUNNING"))
-        await asyncio.gather(*tasks)
+        self._irq_manager.join()
+        self._cxl_memory_hub.join()
+        self._cpu.join()
+        if self._enable_hm:
+            self._host_mgr_conn_client.join()
 
-    async def _stop(self):
-        tasks = [
-            asyncio.create_task(self._cxl_memory_hub.stop()),
-            asyncio.create_task(self._cpu.stop()),
-            asyncio.create_task(self._irq_manager.stop()),
-        ]
-        await asyncio.gather(*tasks)
+    def _stop(self):
+        try:
+            self._cxl_memory_hub.stop_sync()
+        except Exception:
+            pass
+        try:
+            self._cpu.stop_sync()
+        except Exception:
+            pass
+        try:
+            self._irq_manager.stop_sync()
+        except Exception:
+            pass

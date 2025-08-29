@@ -148,8 +148,8 @@ class CxlDeviceInfo:
 
     # pylint: disable=duplicate-code
 
-    async def _get_hdm_decoder_count(self, register_base_address: int) -> int:
-        hdm_decoder_cap = await self.root_complex.read_mmio(
+    def _get_hdm_decoder_count(self, register_base_address: int) -> int:
+        hdm_decoder_cap = self.root_complex.read_mmio(
             register_base_address, CXL_HDM_DECODER_CAPABILITY_REGISTER_SIZE
         )
         decoder_count_index = HDM_DECODER_COUNT(hdm_decoder_cap & 0xF)
@@ -172,15 +172,15 @@ class CxlDeviceInfo:
         logger.debug(f"{self._get_prefix()}Total of {decoder_count} decoders are supported")
         return decoder_count
 
-    async def _get_next_available_decoder_index(self, register_base_address: int) -> Optional[int]:
-        decoder_count = await self._get_hdm_decoder_count(register_base_address)
+    def _get_next_available_decoder_index(self, register_base_address: int) -> Optional[int]:
+        decoder_count = self._get_hdm_decoder_count(register_base_address)
         if decoder_count == 0:
             return None
 
         next_available_decoder = None
         for decoder_index in range(decoder_count):
             register_offset = 0x20 + decoder_index * 0x20 + register_base_address
-            register_value = await self.root_complex.read_mmio(
+            register_value = self.root_complex.read_mmio(
                 register_offset, CXL_HDM_DECODER_CONTROL_REGISTER_SIZE
             )
             is_committed = bool(register_value & CXL_HDM_DECODER_CONTROL_REGISTER_COMMITTED_MASK)
@@ -189,7 +189,7 @@ class CxlDeviceInfo:
                 break
         return next_available_decoder
 
-    async def _configure_hdm_decoder_common(
+    def _configure_hdm_decoder_common(
         self,
         register_base_address: int,
         decoder_index: int,
@@ -218,19 +218,19 @@ class CxlDeviceInfo:
         logger.debug(f"{self._get_prefix()}HDM Decoder {decoder_index}, HPA Base: 0x{hpa_base:x}")
         logger.debug(f"{self._get_prefix()}HDM Decoder {decoder_index}, HPA Size: 0x{hpa_size:x}")
 
-        await self.root_complex.write_mmio(decoder_base_low_offset, 4, decoder_base_low)
-        await self.root_complex.write_mmio(decoder_base_high_offset, 4, decoder_base_high)
-        await self.root_complex.write_mmio(decoder_size_low_offset, 4, decoder_size_low)
-        await self.root_complex.write_mmio(decoder_size_high_offset, 4, decoder_size_high)
-        await self.root_complex.write_mmio(decoder_control_register_offset, 4, decoder_control)
+        self.root_complex.write_mmio(decoder_base_low_offset, 4, decoder_base_low)
+        self.root_complex.write_mmio(decoder_base_high_offset, 4, decoder_base_high)
+        self.root_complex.write_mmio(decoder_size_low_offset, 4, decoder_size_low)
+        self.root_complex.write_mmio(decoder_size_high_offset, 4, decoder_size_high)
+        self.root_complex.write_mmio(decoder_control_register_offset, 4, decoder_control)
 
         logger.debug(f"{self._get_prefix()}Waiting until the decoder is committed")
         committed = False
         while not committed:
-            control = await self.root_complex.read_mmio(decoder_control_register_offset, 4)
+            control = self.root_complex.read_mmio(decoder_control_register_offset, 4)
             committed = bool(control & CXL_HDM_DECODER_CONTROL_REGISTER_COMMITTED_MASK)
 
-    async def configure_hdm_decoder_device(
+    def configure_hdm_decoder_device(
         self,
         hpa_base: int,
         hpa_size: int,
@@ -246,7 +246,7 @@ class CxlDeviceInfo:
             return False
 
         register_base_address = hdm_decoder.address
-        decoder_index = await self._get_next_available_decoder_index(register_base_address)
+        decoder_index = self._get_next_available_decoder_index(register_base_address)
         if decoder_index is None:
             logger.warning(f"{self._get_prefix()}Not found any available HDM decoders")
             return False
@@ -260,10 +260,10 @@ class CxlDeviceInfo:
         dpa_skip_high_offset = 0x20 * decoder_index + 0x28 + register_base_address
         dpa_skip_low = dpa_skip & 0xFFFFFFFF
         dpa_skip_high = (dpa_skip >> 32) & 0xFFFFFFFF
-        await self.root_complex.write_mmio(dpa_skip_low_offset, 4, dpa_skip_low)
-        await self.root_complex.write_mmio(dpa_skip_high_offset, 4, dpa_skip_high)
+        self.root_complex.write_mmio(dpa_skip_low_offset, 4, dpa_skip_low)
+        self.root_complex.write_mmio(dpa_skip_high_offset, 4, dpa_skip_high)
 
-        await self._configure_hdm_decoder_common(
+        self._configure_hdm_decoder_common(
             register_base_address,
             decoder_index,
             hpa_base,
@@ -275,7 +275,7 @@ class CxlDeviceInfo:
         logger.debug(f"{self._get_prefix()}Successfully configured HDM decoder {decoder_index}")
         return True
 
-    async def configure_hdm_decoder_switch(
+    def configure_hdm_decoder_switch(
         self,
         hpa_base: int,
         hpa_size: int,
@@ -291,7 +291,7 @@ class CxlDeviceInfo:
             return False
 
         register_base_address = hdm_decoder.address
-        decoder_index = await self._get_next_available_decoder_index(register_base_address)
+        decoder_index = self._get_next_available_decoder_index(register_base_address)
         if decoder_index is None:
             logger.warning(f"{self._get_prefix()}Not found any available HDM decoders")
             return False
@@ -316,10 +316,10 @@ class CxlDeviceInfo:
             elif i < 8:
                 target_list_high |= (target_list[i] & 0xFF) << ((i - 4) * 8)
 
-        await self.root_complex.write_mmio(target_list_low_offset, 4, target_list_low)
-        await self.root_complex.write_mmio(target_list_high_offset, 4, target_list_high)
+        self.root_complex.write_mmio(target_list_low_offset, 4, target_list_low)
+        self.root_complex.write_mmio(target_list_high_offset, 4, target_list_high)
 
-        await self._configure_hdm_decoder_common(
+        self._configure_hdm_decoder_common(
             register_base_address,
             decoder_index,
             hpa_base,
@@ -333,14 +333,14 @@ class CxlDeviceInfo:
         )
         return True
 
-    async def get_bi_enable(self) -> bool:
+    def get_bi_enable(self) -> bool:
         bi_decoder_control_reg = self.get_cachemem_register_by_id(
             CXL_CACHEMEM_REGISTER_CAPABILITY_ID.CXL_BI_DECODER
         )
         if bi_decoder_control_reg is None:
             return False
 
-        reg_val = await self.root_complex.read_mmio(bi_decoder_control_reg.address, 4)
+        reg_val = self.root_complex.read_mmio(bi_decoder_control_reg.address, 4)
         return reg_val & 0x2 != 0
 
     # pylint: enable=duplicate-code
@@ -375,9 +375,9 @@ class CxlBusDriver(LabeledComponent):
         self._pci_bus_driver = pci_bus_driver
         self._devices: List[CxlDeviceInfo] = []
 
-    async def init(self):
-        await self._scan_cxl_devices()
-        await self._connect_cxl_devices()
+    def init(self):
+        self._scan_cxl_devices()
+        self._connect_cxl_devices()
         self.display_devices()
 
     def get_devices(self) -> List[CxlDeviceInfo]:
@@ -431,7 +431,7 @@ class CxlBusDriver(LabeledComponent):
 
             logger.debug(self._create_message("------------------------------"))
 
-    async def _connect_cxl_devices(self):
+    def _connect_cxl_devices(self):
         bdf_map = {}
         for device in self._devices:
             device.parent = None
@@ -450,7 +450,7 @@ class CxlBusDriver(LabeledComponent):
 
     # pylint: disable=duplicate-code
 
-    async def _scan_register_locator_dvsec(self, device_info: CxlDeviceInfo):
+    def _scan_register_locator_dvsec(self, device_info: CxlDeviceInfo):
         bdf = device_info.pci_device_info.bdf
         register_locator_dvsec = device_info.get_dvsec_by_id(CXL_DVSEC_ID.REGISTER_LOCATOR_DVSEC)
         if not register_locator_dvsec:
@@ -465,14 +465,12 @@ class CxlBusDriver(LabeledComponent):
         for block_index in range(blocks):
             block_offset = block_offset_base + block_index * block_size
 
-            register_offset_low = await self._root_complex.read_config(
-                bdf, cap_offset + block_offset, 4
-            )
+            register_offset_low = self._root_complex.read_config(bdf, cap_offset + block_offset, 4)
             if register_offset_low is None:
                 raise Exception(
                     f"Failed to read Register Block {block_index + 1} - Register Offset Low"
                 )
-            register_offset_high = await self._root_complex.read_config(
+            register_offset_high = self._root_complex.read_config(
                 bdf, cap_offset + block_offset + 4, 4
             )
             if register_offset_high is None:
@@ -512,7 +510,7 @@ class CxlBusDriver(LabeledComponent):
 
     # pylint: enable=duplicate-code
 
-    async def _scan_pcie_dvsec_for_cxl_devices(self, device_info: CxlDeviceInfo):
+    def _scan_pcie_dvsec_for_cxl_devices(self, device_info: CxlDeviceInfo):
         device_dvsec = device_info.get_dvsec_by_id(CXL_DVSEC_ID.PCIE_DVSEC_FOR_CXL_DEVICES)
         if not device_dvsec:
             raise Exception("Call this method only when the PCIE_DVSEC_FOR_CXL_DEVICES exists")
@@ -520,7 +518,7 @@ class CxlBusDriver(LabeledComponent):
         bdf = device_info.pci_device_info.bdf
         # TODO: Define OFFSETs as IntEnum
         dvsec_cxl_capability_offset = device_dvsec.offset + 0x0A
-        capability = await self._root_complex.read_config(bdf, dvsec_cxl_capability_offset, 2)
+        capability = self._root_complex.read_config(bdf, dvsec_cxl_capability_offset, 2)
         cache_capable = bool(capability & 0x01)
         io_capable = bool(capability & 0x02)
         mem_capable = bool(capability & 0x04)
@@ -530,14 +528,14 @@ class CxlBusDriver(LabeledComponent):
 
         for range_index in range(2):
             range_size_high_offset = device_dvsec.offset + 0x18 + range_index * 0x10
-            size_high = await self._root_complex.read_config(bdf, range_size_high_offset, 4)
+            size_high = self._root_complex.read_config(bdf, range_size_high_offset, 4)
             range_size_low_offset = device_dvsec.offset + 0x1C + range_index * 0x10
-            size_low = await self._root_complex.read_config(bdf, range_size_low_offset, 4)
+            size_low = self._root_complex.read_config(bdf, range_size_low_offset, 4)
 
             range_base_high_offset = device_dvsec.offset + 0x20 + range_index * 0x10
-            base_high = await self._root_complex.read_config(bdf, range_base_high_offset, 4)
+            base_high = self._root_complex.read_config(bdf, range_base_high_offset, 4)
             range_base_low_offset = device_dvsec.offset + 0x24 + range_index * 0x10
-            base_low = await self._root_complex.read_config(bdf, range_base_low_offset, 4)
+            base_low = self._root_complex.read_config(bdf, range_base_low_offset, 4)
 
             memory_info_valid = bool(size_low & 0b1)
             memory_active = bool((size_low >> 1) & 0b1)
@@ -564,7 +562,7 @@ class CxlBusDriver(LabeledComponent):
 
     # pylint: disable=duplicate-code
 
-    async def _scan_dvsec(self, device_info: CxlDeviceInfo):
+    def _scan_dvsec(self, device_info: CxlDeviceInfo):
         for capability in device_info.pci_device_info.capabilities:
             is_dvsec = capability.id == 0x0023 and capability.version == 0x1
             if not is_dvsec:
@@ -572,10 +570,10 @@ class CxlBusDriver(LabeledComponent):
 
             bdf = device_info.pci_device_info.bdf
             offset = capability.offset
-            dvsec_header1 = await self._root_complex.read_config(bdf, offset + 0x04, 4)
+            dvsec_header1 = self._root_complex.read_config(bdf, offset + 0x04, 4)
             if dvsec_header1 is None:
                 raise Exception("Failed to read DVSEC Header 1")
-            dvsec_header2 = await self._root_complex.read_config(bdf, offset + 0x08, 2)
+            dvsec_header2 = self._root_complex.read_config(bdf, offset + 0x08, 2)
             if dvsec_header2 is None:
                 raise Exception("Failed to read DVSEC Header 2")
 
@@ -610,11 +608,11 @@ class CxlBusDriver(LabeledComponent):
             if not dvsec_function:
                 continue
 
-            await dvsec_function(device_info)
+            dvsec_function(device_info)
 
     # pylint: enable=duplicate-code
 
-    async def _scan_cachemem_registers(self, device_info: CxlDeviceInfo):
+    def _scan_cachemem_registers(self, device_info: CxlDeviceInfo):
         base_registers: List[int] = []
         component_register_info = device_info.get_register_by_type(CXL_REGISTER_TYPE.COMPONENT)
         if component_register_info:
@@ -635,7 +633,7 @@ class CxlBusDriver(LabeledComponent):
                 )
             )
 
-            cxl_capability_header = await self._root_complex.read_mmio(
+            cxl_capability_header = self._root_complex.read_mmio(
                 cxl_cachemem_offset, CXL_CACHEMEM_REGISTER_HEADER_SIZE
             )
             if cxl_capability_header is None:
@@ -661,7 +659,7 @@ class CxlBusDriver(LabeledComponent):
                 header_offset = (
                     header_index + 1
                 ) * CXL_CACHEMEM_REGISTER_HEADER_SIZE + cxl_cachemem_offset
-                header_info = await self._root_complex.read_mmio(
+                header_info = self._root_complex.read_mmio(
                     header_offset, CXL_CACHEMEM_REGISTER_HEADER_SIZE
                 )
                 if header_info is None:
@@ -691,10 +689,10 @@ class CxlBusDriver(LabeledComponent):
                         address=cxl_capability_address,
                     )
 
-    async def _scan_component_register(self, device_info: CxlDeviceInfo):
-        await self._scan_cachemem_registers(device_info)
+    def _scan_component_register(self, device_info: CxlDeviceInfo):
+        self._scan_cachemem_registers(device_info)
 
-    async def _scan_cxl_devices(self):
+    def _scan_cxl_devices(self):
         self._devices = []
         count = 0
         for device in self._pci_bus_driver.get_devices():
@@ -709,5 +707,5 @@ class CxlBusDriver(LabeledComponent):
             logger.debug(self._create_message(f"Found CXL Device at {bdf_to_string(device.bdf)}"))
             device_info = CxlDeviceInfo(root_complex=self._root_complex, pci_device_info=device)
             self._devices.append(device_info)
-            await self._scan_dvsec(device_info)
-            await self._scan_component_register(device_info)
+            self._scan_dvsec(device_info)
+            self._scan_component_register(device_info)

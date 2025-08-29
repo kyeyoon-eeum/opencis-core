@@ -172,10 +172,10 @@ class PciBusDriver(LabeledComponent):
         self._existing_bdfs: list[int] = []
         self._current_enum_bdfs: list[int] = []
 
-    async def init(self, mmio_base_address: int):
+    def init(self, mmio_base_address: int):
         self._current_enum_bdfs = []
-        (_, memory_end) = await self._scan_pci_devices(mmio_base_address)
-        await self._init_pci_devices()
+        (_, memory_end) = self._scan_pci_devices(mmio_base_address)
+        self._init_pci_devices()
         self.display_devices()
         return memory_end
 
@@ -189,54 +189,54 @@ class PciBusDriver(LabeledComponent):
             device.print("[PciBusDriver] ")
             logger.debug(self._create_message("------------------------------"))
 
-    async def _scan_pci_devices(self, mmio_base_address: int):
+    def _scan_pci_devices(self, mmio_base_address: int):
         root_bus = self._root_complex.get_root_bus()
-        return await self._scan_bus(root_bus, mmio_base_address)
+        return self._scan_bus(root_bus, mmio_base_address)
 
-    async def _init_pci_devices(self):
+    def _init_pci_devices(self):
         pass
 
     # pylint: disable=duplicate-code
 
-    async def read_config(self, bdf: int, offset: int, size: int) -> int:
+    def read_config(self, bdf: int, offset: int, size: int) -> int:
         # Ensure reads do not cross a DWORD boundary by splitting if necessary
         boundary_end = ((offset // 4) + 1) * 4
         if offset + size <= boundary_end:
-            return await self._root_complex.read_config(bdf, offset, size)
+            return self._root_complex.read_config(bdf, offset, size)
         first_len = boundary_end - offset
         second_len = size - first_len
-        first_part = await self._root_complex.read_config(bdf, offset, first_len)
+        first_part = self._root_complex.read_config(bdf, offset, first_len)
         if first_part is None:
             return None
-        second_part = await self._root_complex.read_config(bdf, offset + first_len, second_len)
+        second_part = self._root_complex.read_config(bdf, offset + first_len, second_len)
         if second_part is None:
             return None
         # Combine little-endian contiguous bytes
         return first_part | (second_part << (8 * first_len))
 
-    async def write_config(self, bdf: int, offset: int, size: int, value: int):
-        await self._root_complex.write_config(bdf, offset, size, value)
+    def write_config(self, bdf: int, offset: int, size: int, value: int):
+        self._root_complex.write_config(bdf, offset, size, value)
 
-    async def read_mmio(self, address, size) -> int:
-        return await self._root_complex.read_mmio(address, size)
+    def read_mmio(self, address, size) -> int:
+        return self._root_complex.read_mmio(address, size)
 
-    async def write_mmio(self, address, size, value):
-        await self._root_complex.write_mmio(address, size, value)
+    def write_mmio(self, address, size, value):
+        self._root_complex.write_mmio(address, size, value)
 
-    async def _set_secondary_bus(self, bdf: int, secondary_bus: int):
+    def _set_secondary_bus(self, bdf: int, secondary_bus: int):
         bdf_string = bdf_to_string(bdf)
         logger.debug(
             self._create_message(f"Setting secondary bus of device {bdf_string} to {secondary_bus}")
         )
 
-        await self.write_config(
+        self.write_config(
             bdf,
             REG_ADDR.SECONDARY_BUS_NUMBER.START,
             REG_ADDR.SECONDARY_BUS_NUMBER.LEN,
             secondary_bus,
         )
 
-    async def _set_subordinate_bus(self, bdf: int, subordinate_bus: int):
+    def _set_subordinate_bus(self, bdf: int, subordinate_bus: int):
         bdf_string = bdf_to_string(bdf)
         logger.debug(
             self._create_message(
@@ -244,14 +244,14 @@ class PciBusDriver(LabeledComponent):
             )
         )
 
-        await self.write_config(
+        self.write_config(
             bdf,
             REG_ADDR.SUBORDINATE_BUS_NUMBER.START,
             REG_ADDR.SUBORDINATE_BUS_NUMBER.LEN,
             subordinate_bus,
         )
 
-    async def _set_memory_base(self, bdf: int, address_base: int):
+    def _set_memory_base(self, bdf: int, address_base: int):
         bdf_string = bdf_to_string(bdf)
         logger.debug(
             self._create_message(
@@ -259,28 +259,28 @@ class PciBusDriver(LabeledComponent):
             )
         )
         address_base_regval = memory_base_addr_to_regval(address_base)
-        await self.write_config(
+        self.write_config(
             bdf,
             REG_ADDR.MEMORY_BASE.START,
             REG_ADDR.MEMORY_BASE.LEN,
             address_base_regval,
         )
 
-    async def _set_memory_limit(self, bdf: int, address_limit: int):
+    def _set_memory_limit(self, bdf: int, address_limit: int):
         logger.debug(
             self._create_message(
                 f"Setting memory limit of device {bdf_to_string(bdf)} to {address_limit:08x}"
             )
         )
         address_limit_regval = memory_limit_addr_to_regval(address_limit)
-        await self.write_config(
+        self.write_config(
             bdf,
             REG_ADDR.MEMORY_LIMIT.START,
             REG_ADDR.MEMORY_LIMIT.LEN,
             address_limit_regval,
         )
 
-    async def _set_prefetchable_memory_base(self, bdf: int, address_base: int):
+    def _set_prefetchable_memory_base(self, bdf: int, address_base: int):
         bdf_string = bdf_to_string(bdf)
         logger.debug(
             self._create_message(
@@ -292,20 +292,20 @@ class PciBusDriver(LabeledComponent):
         address_upper = (address_base >> 32) & 0xFFFFFFFF
         address_base_regval = memory_base_addr_to_regval(address_lower)
 
-        await self.write_config(
+        self.write_config(
             bdf,
             REG_ADDR.PREFETCHABLE_MEMORY_BASE.START,
             REG_ADDR.PREFETCHABLE_MEMORY_BASE.LEN,
             address_base_regval,
         )
-        await self.write_config(
+        self.write_config(
             bdf,
             REG_ADDR.PREFETCHABLE_MEMORY_BASE_UPPER.START,
             REG_ADDR.PREFETCHABLE_MEMORY_BASE_UPPER.LEN,
             address_upper,
         )
 
-    async def _set_prefetchable_memory_limit(self, bdf: int, address_limit: int):
+    def _set_prefetchable_memory_limit(self, bdf: int, address_limit: int):
         logger.debug(
             self._create_message(
                 f"Setting prefetchable memory limit of device {bdf_to_string(bdf)}"
@@ -316,35 +316,35 @@ class PciBusDriver(LabeledComponent):
         address_lower = address_limit & 0xFFFFFFFF
         address_upper = (address_limit >> 32) & 0xFFFFFFFF
         address_limit_regval = memory_limit_addr_to_regval(address_lower)
-        await self.write_config(
+        self.write_config(
             bdf,
             REG_ADDR.PREFETCHABLE_MEMORY_LIMIT.START,
             REG_ADDR.PREFETCHABLE_MEMORY_LIMIT.LEN,
             address_limit_regval,
         )
-        await self.write_config(
+        self.write_config(
             bdf,
             REG_ADDR.PREFETCHABLE_MEMORY_LIMIT_UPPER.START,
             REG_ADDR.PREFETCHABLE_MEMORY_LIMIT_UPPER.LEN,
             address_upper,
         )
 
-    async def _set_bar0(self, bdf: int, bar_address: int):
-        await self.write_config(bdf, BAR_OFFSETS.BAR0, BAR_REGISTER_SIZE, bar_address)
+    def _set_bar0(self, bdf: int, bar_address: int):
+        self.write_config(bdf, BAR_OFFSETS.BAR0, BAR_REGISTER_SIZE, bar_address)
 
-    async def _get_bar0_size(
+    def _get_bar0_size(
         self,
         bdf: int,
     ) -> int:
-        data = await self.read_config(bdf, BAR_OFFSETS.BAR0, BAR_REGISTER_SIZE)
+        data = self.read_config(bdf, BAR_OFFSETS.BAR0, BAR_REGISTER_SIZE)
         if data is None or data == 0:
             return data
         return 0xFFFFFFFF - data + 1
 
-    async def _read_vid_did(self, bdf: int) -> Optional[int]:
+    def _read_vid_did(self, bdf: int) -> Optional[int]:
         logger.debug(self._create_message(f"Reading VID/DID from {bdf_to_string(bdf)}"))
-        vid = await self.read_config(bdf, REG_ADDR.VENDOR_ID.START, REG_ADDR.VENDOR_ID.LEN)
-        did = await self.read_config(bdf, REG_ADDR.DEVICE_ID.START, REG_ADDR.DEVICE_ID.LEN)
+        vid = self.read_config(bdf, REG_ADDR.VENDOR_ID.START, REG_ADDR.VENDOR_ID.LEN)
+        did = self.read_config(bdf, REG_ADDR.DEVICE_ID.START, REG_ADDR.DEVICE_ID.LEN)
         if vid is None or did is None:
             logger.debug(self._create_message("VID/DID read returned None; skipping device"))
             return None
@@ -355,22 +355,22 @@ class PciBusDriver(LabeledComponent):
             return None
         return (did << 16) | vid
 
-    async def _read_class_code(self, bdf: int) -> int:
-        data = await self.read_config(bdf, REG_ADDR.CLASS_CODE.START, REG_ADDR.CLASS_CODE.LEN)
+    def _read_class_code(self, bdf: int) -> int:
+        data = self.read_config(bdf, REG_ADDR.CLASS_CODE.START, REG_ADDR.CLASS_CODE.LEN)
         if data is None or data == 0xFFFF:
             return 0
         return data
 
-    async def _read_bar(self, bdf, bar_id) -> int:
+    def _read_bar(self, bdf, bar_id) -> int:
         offset = 0x10 + bar_id * 4
         size = 4
-        data = await self.read_config(bdf, offset, size=size)
+        data = self.read_config(bdf, offset, size=size)
         if data == 0xFFFF:
             raise Exception(f"Failed to read bar {bar_id}")
         return data
 
-    async def _read_secondary_bus(self, bdf: int) -> int:
-        data = await self.read_config(
+    def _read_secondary_bus(self, bdf: int) -> int:
+        data = self.read_config(
             bdf,
             REG_ADDR.SECONDARY_BUS_NUMBER.START,
             REG_ADDR.SECONDARY_BUS_NUMBER.LEN,
@@ -379,8 +379,8 @@ class PciBusDriver(LabeledComponent):
             raise Exception("Failed to read secondary bus")
         return data
 
-    async def _read_subordinate_bus(self, bdf: int) -> int:
-        data = await self.read_config(
+    def _read_subordinate_bus(self, bdf: int) -> int:
+        data = self.read_config(
             bdf,
             REG_ADDR.SUBORDINATE_BUS_NUMBER.START,
             REG_ADDR.SUBORDINATE_BUS_NUMBER.LEN,
@@ -389,25 +389,25 @@ class PciBusDriver(LabeledComponent):
             raise Exception("Failed to read subordinate bus")
         return data
 
-    async def _read_memory_base(self, bdf: int) -> int:
-        data = await self.read_config(bdf, REG_ADDR.MEMORY_BASE.START, REG_ADDR.MEMORY_BASE.LEN)
+    def _read_memory_base(self, bdf: int) -> int:
+        data = self.read_config(bdf, REG_ADDR.MEMORY_BASE.START, REG_ADDR.MEMORY_BASE.LEN)
         if data == 0xFFFF:
             raise Exception("Failed to read memory base")
         return data
 
-    async def _read_memory_limit(self, bdf: int) -> int:
-        data = await self.read_config(bdf, REG_ADDR.MEMORY_LIMIT.START, REG_ADDR.MEMORY_LIMIT.LEN)
+    def _read_memory_limit(self, bdf: int) -> int:
+        data = self.read_config(bdf, REG_ADDR.MEMORY_LIMIT.START, REG_ADDR.MEMORY_LIMIT.LEN)
         if data == 0xFFFF:
             raise Exception("Failed to read memory limit")
         return data
 
-    async def _check_bar_size_and_set(self, bdf: int, memory_base: int, device_info: PciDeviceInfo):
+    def _check_bar_size_and_set(self, bdf: int, memory_base: int, device_info: PciDeviceInfo):
         bdf_string = bdf_to_string(bdf)
         logger.debug(self._create_message(f"Checking BAR0 size of device {bdf_string}"))
 
         # NOTE: Write 0xFFFFFFFF to BAR0 to get the size of BAR0
-        await self._set_bar0(bdf, 0xFFFFFFFF)
-        size = await self._get_bar0_size(bdf)
+        self._set_bar0(bdf, 0xFFFFFFFF)
+        size = self._get_bar0_size(bdf)
         logger.debug(self._create_message(f"BAR0 size of device {bdf_string} is {size}"))
         if size > 0:
             logger.debug(
@@ -415,16 +415,16 @@ class PciBusDriver(LabeledComponent):
                     f"Setting BAR0 address of device {bdf_string} to 0x{memory_base:08x}"
                 )
             )
-            await self._set_bar0(bdf, memory_base)
+            self._set_bar0(bdf, memory_base)
         else:
-            await self._set_bar0(bdf, 0)
+            self._set_bar0(bdf, 0)
 
         device_info.bars[0].base_address = memory_base
         device_info.bars[0].size = size
         return size
 
-    async def scan_pcie_cap_helper(self, bdf: int, offset: int, device_info: PciDeviceInfo):
-        data = await self.read_config(bdf, offset, PCIE_CONFIG_HEADER_SIZE)
+    def scan_pcie_cap_helper(self, bdf: int, offset: int, device_info: PciDeviceInfo):
+        data = self.read_config(bdf, offset, PCIE_CONFIG_HEADER_SIZE)
         if data is None:
             return
 
@@ -455,20 +455,20 @@ class PciBusDriver(LabeledComponent):
         )
 
         if next_cap_offset != 0:
-            await self.scan_pcie_cap_helper(bdf, next_cap_offset, device_info)
+            self.scan_pcie_cap_helper(bdf, next_cap_offset, device_info)
 
-    async def scan_pci_cap_pci_express(self, bdf: int, capability_info: PciExpressCapabilityInfo):
+    def scan_pci_cap_pci_express(self, bdf: int, capability_info: PciExpressCapabilityInfo):
         offset = capability_info.offset
 
         pci_express_register_offset = offset + 0x02
-        pci_express_register = await self.read_config(bdf, pci_express_register_offset, 2)
+        pci_express_register = self.read_config(bdf, pci_express_register_offset, 2)
         capability_info.device_port_type = PCI_DEVICE_PORT_TYPE((pci_express_register >> 4) & 0xF)
         link_capability_register_offset = offset + 0x0C
-        link_capability_register = await self.read_config(bdf, link_capability_register_offset, 4)
+        link_capability_register = self.read_config(bdf, link_capability_register_offset, 4)
         capability_info.port_number = (link_capability_register >> 24) & 0xFF
 
-    async def scan_pci_cap_helper(self, bdf: int, offset: int, device_info: PciDeviceInfo):
-        data = await self.read_config(bdf, offset, PCI_CONFIG_HEADER_SIZE)
+    def scan_pci_cap_helper(self, bdf: int, offset: int, device_info: PciDeviceInfo):
+        data = self.read_config(bdf, offset, PCI_CONFIG_HEADER_SIZE)
         if data is None:
             return
 
@@ -496,21 +496,21 @@ class PciBusDriver(LabeledComponent):
                 is_extended=False, id=cap_id, version=0, offset=offset
             )
             device_info.capabilities.append(capability_info)
-            await self.scan_pci_cap_pci_express(bdf, capability_info)
+            self.scan_pci_cap_pci_express(bdf, capability_info)
         else:
             device_info.capabilities.append(
                 PciCapabilityInfo(is_extended=False, id=cap_id, version=0, offset=offset)
             )
 
         if next_cap_offset != 0:
-            await self.scan_pci_cap_helper(bdf, next_cap_offset, device_info)
+            self.scan_pci_cap_helper(bdf, next_cap_offset, device_info)
 
-    async def _scan_pci_capabilities(self, bdf: int, device_info: PciDeviceInfo):
-        pci_cap_pointer = await self.read_config(bdf, PCI_CAPABILITY_POINTER, 2)
-        await self.scan_pci_cap_helper(bdf, pci_cap_pointer, device_info)
-        await self.scan_pcie_cap_helper(bdf, PCIE_CONFIG_BASE, device_info)
+    def _scan_pci_capabilities(self, bdf: int, device_info: PciDeviceInfo):
+        pci_cap_pointer = self.read_config(bdf, PCI_CAPABILITY_POINTER, 2)
+        self.scan_pci_cap_helper(bdf, pci_cap_pointer, device_info)
+        self.scan_pcie_cap_helper(bdf, PCIE_CONFIG_BASE, device_info)
 
-    async def _scan_sn(self, pci_device_info: PciDeviceInfo):
+    def _scan_sn(self, pci_device_info: PciDeviceInfo):
         for capability in pci_device_info.capabilities:
             is_sn = (
                 capability.id == PCI_EXTENDED_CAPABILITY_ID.DEVICE_SERIAL_NUMBER
@@ -522,28 +522,28 @@ class PciBusDriver(LabeledComponent):
             bdf = pci_device_info.bdf
             offset = capability.offset
 
-            sn_low = await self._root_complex.read_config(bdf, offset + 0x04, 4)
-            sn_high = await self._root_complex.read_config(bdf, offset + 0x08, 4)
+            sn_low = self._root_complex.read_config(bdf, offset + 0x04, 4)
+            sn_high = self._root_complex.read_config(bdf, offset + 0x08, 4)
 
             sn_int = (sn_high << 32) | sn_low
             sn_str = f"{sn_int:016x}"
             pci_device_info.serial_number = sn_str
 
-    async def scan_bus_unbind(self):
+    def scan_bus_unbind(self):
         remaining_devices = []
         for device in self._devices:
             bdf = device.bdf
-            vid_did = await self._read_vid_did(bdf)
+            vid_did = self._read_vid_did(bdf)
             if vid_did is not None:
                 remaining_devices.append(device)
 
         self._devices = remaining_devices
 
-    async def scan_bus_bind(self, memory_start: int):
-        (_, mmio_base) = await self._scan_bus(self._root_complex.get_root_bus(), memory_start)
+    def scan_bus_bind(self, memory_start: int):
+        (_, mmio_base) = self._scan_bus(self._root_complex.get_root_bus(), memory_start)
         return mmio_base
 
-    async def _scan_bus(
+    def _scan_bus(
         self, bus: int, memory_start: int, parent_device_info: Optional[PciDeviceInfo] = None
     ) -> Tuple[int, int]:
         existing_bdfs = [device.bdf for device in self._devices]
@@ -558,15 +558,15 @@ class PciBusDriver(LabeledComponent):
             if function_number != 0 and device_number not in multi_function_devices:
                 continue
 
-            vid_did = await self._read_vid_did(bdf)
+            vid_did = self._read_vid_did(bdf)
             if vid_did is None:
                 continue
 
-            is_multifunction = (await self.read_config(bdf, 0x0E, 1) & 0x80) >> 7
+            is_multifunction = (self.read_config(bdf, 0x0E, 1) & 0x80) >> 7
             if is_multifunction:
                 multi_function_devices.add(device_number)
 
-            class_code = await self._read_class_code(bdf)
+            class_code = self._read_class_code(bdf)
 
             vendor_id = 0xFFFF & vid_did
             device_id = (vid_did >> 4) & 0xFFFF
@@ -589,11 +589,11 @@ class PciBusDriver(LabeledComponent):
                 self._devices.append(pci_device_info)
 
                 # Scan PCI capabilities
-                await self._scan_pci_capabilities(bdf, pci_device_info)
-                await self._scan_sn(pci_device_info)
+                self._scan_pci_capabilities(bdf, pci_device_info)
+                self._scan_sn(pci_device_info)
 
                 # Set memory base and memory limit
-                size = await self._check_bar_size_and_set(bdf, memory_start, pci_device_info)
+                size = self._check_bar_size_and_set(bdf, memory_start, pci_device_info)
                 # NOTE: assume size is less than 0x100000
                 if size > 0:
                     memory_start += 0x100000
@@ -613,22 +613,22 @@ class PciBusDriver(LabeledComponent):
                     )
                 )
 
-                await self._set_secondary_bus(bdf, bus + 1)
-                await self._set_subordinate_bus(bdf, 0xFF)
+                self._set_secondary_bus(bdf, bus + 1)
+                self._set_subordinate_bus(bdf, 0xFF)
 
-                (bus, memory_end) = await self._scan_bus(bus + 1, memory_start, pci_device_info)
+                (bus, memory_end) = self._scan_bus(bus + 1, memory_start, pci_device_info)
 
                 if memory_start != memory_end:
-                    await self._set_memory_base(bdf, memory_start)
-                    await self._set_memory_limit(bdf, memory_end - 1)
+                    self._set_memory_base(bdf, memory_start)
+                    self._set_memory_limit(bdf, memory_end - 1)
 
                 memory_start = memory_end
-                await self._set_subordinate_bus(bdf, bus)
+                self._set_subordinate_bus(bdf, bus)
 
                 # NOTE: Set prefetchable base and limit. Assuming there are no devices
                 # requesting prefetchable memory
-                await self._set_prefetchable_memory_base(bdf, 0xFFF00000)
-                await self._set_prefetchable_memory_limit(bdf, 0xFFE00000)
+                self._set_prefetchable_memory_base(bdf, 0xFFF00000)
+                self._set_prefetchable_memory_limit(bdf, 0xFFE00000)
             else:
                 logger.debug(
                     self._create_message(

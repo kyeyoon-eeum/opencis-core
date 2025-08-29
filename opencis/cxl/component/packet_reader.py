@@ -39,7 +39,7 @@ class PacketReader(LabeledComponent):
         self._reader = _prc.ShmPacketReader(reader)
         self._aborted = False
 
-    async def get_packet(self):
+    def get_packet(self):
         if self._aborted:
             raise Exception("PacketReader is already aborted")
         # Cython path returns already-parsed packet object

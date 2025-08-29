@@ -5,7 +5,7 @@ This software is licensed under the terms of the Revised BSD License.
 See LICENSE for details.
 """
 
-from asyncio import gather, create_task
+import threading
 from typing import List
 
 from opencis.apps.single_logical_device import SingleLogicalDevice
@@ -47,23 +47,16 @@ class MultiHeadedSingleLogicalDevice(RunnableComponent):
                 )
             )
 
-    async def _run(self):
-        run_tasks = []
+    def _run(self):
         for sld_device in self._sld_devices:
-            run_tasks.append(create_task(sld_device.run()))
-        wait_tasks = []
+            sld_device.start_wait_ready()
+        self._change_status_to_running()
         for sld_device in self._sld_devices:
-            wait_tasks.append(create_task(sld_device.wait_for_ready()))
+            sld_device.join()
 
-        await gather(*wait_tasks)
-        await self._change_status_to_running()
-        await gather(*run_tasks)
-
-    async def _stop(self):
-        tasks = []
+    def _stop(self):
         for sld_device in self._sld_devices:
-            tasks.append(create_task(sld_device.stop()))
-        await gather(*tasks)
+            sld_device.stop_sync()
 
     def get_sld_devices(self):
         return self._sld_devices

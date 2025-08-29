@@ -5,7 +5,6 @@ This software is licensed under the terms of the Revised BSD License.
 See LICENSE for details.
 """
 
-import asyncio
 from typing import Final
 
 
@@ -27,8 +26,8 @@ class FileAccessor:
             data = file.read(size)
             return int.from_bytes(data, byteorder="little")
 
-    async def write(self, offset: int, data: int, size: int) -> None:
-        await asyncio.to_thread(self._write_blocking, offset, data, size)
+    def write(self, offset: int, data: int, size: int) -> None:
+        self._write_blocking(offset, data, size)
 
-    async def read(self, offset: int, size: int) -> int:
-        return await asyncio.to_thread(self._read_blocking, offset, size)
+    def read(self, offset: int, size: int) -> int:
+        return self._read_blocking(offset, size)

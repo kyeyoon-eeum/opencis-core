@@ -6,10 +6,8 @@ See LICENSE for details.
 """
 
 from typing import Optional, Tuple, cast
-from asyncio import create_task, gather, sleep
-import asyncio
 import threading
-from opencis.util.async_queue import AsyncQueue as Queue
+from queue import Queue
 from dataclasses import dataclass, field
 from enum import Enum, auto
 
@@ -100,7 +98,6 @@ class CxlMemDcoh(PacketProcessor):
 
         # emulated .mem m2s channels
         self._cxl_channel = MemDcohCxlChannel()
-        self._loop: asyncio.AbstractEventLoop | None = None
         self._demux_thread: threading.Thread | None = None
         self._demux_stop = threading.Event()
         self._main_thread: threading.Thread | None = None
@@ -135,7 +132,7 @@ class CxlMemDcoh(PacketProcessor):
         )
 
     # .mem m2s req (MemRd, MemRdData, and MemInv) handler
-    async def _process_cxl_m2s_req_packet(self, m2sreq_packet: CxlMemM2SReqPacket):
+    def _process_cxl_m2s_req_packet(self, m2sreq_packet: CxlMemM2SReqPacket):
         if self._memory_device_component is None:
             raise Exception("CxlMemoryDeviceComponent isn't set yet")
 
@@ -146,10 +143,10 @@ class CxlMemDcoh(PacketProcessor):
             dpa = self._memory_device_component.get_dpa(addr)
 
         if m2sreq_packet.m2sreq_header.meta_field == CXL_MEM_META_FIELD.NO_OP:
-            data = await self._memory_device_component.read_mem_dpa(dpa)
+            data = self._memory_device_component.read_mem_dpa(dpa)
 
             _, packet = self._create_mem_rsp_packet(CXL_MEM_S2MNDR_OPCODE.CMP, data)
-            await self._upstream_fifo.target_to_host.put(packet)
+            self._upstream_fifo.target_to_host.put(packet)
             self._cur_state.state = COH_STATE_MACHINE.COH_STATE_INIT
             return
 
@@ -170,8 +167,8 @@ class CxlMemDcoh(PacketProcessor):
             type = CACHE_REQUEST_TYPE.SNP_CUR
 
         packet = CacheRequest(type, dpa)
-        await self._coh_agent_to_cache_fifo.request.put(packet)
-        packet = await self._coh_agent_to_cache_fifo.response.get()
+        self._coh_agent_to_cache_fifo.request.put(packet)
+        packet = self._coh_agent_to_cache_fifo.response.get()
 
         if packet.status == CACHE_RESPONSE_STATUS.RSP_MISS:
             if m2sreq_packet.m2sreq_header.snp_type == CXL_MEM_M2S_SNP_TYPE.SNP_DATA:
@@ -190,7 +187,7 @@ class CxlMemDcoh(PacketProcessor):
                 pass
 
             if data_read is True:
-                data = await self._memory_device_component.read_mem_dpa(dpa)
+                data = self._memory_device_component.read_mem_dpa(dpa)
         else:
             if packet.status in (CACHE_RESPONSE_STATUS.RSP_S, CACHE_RESPONSE_STATUS.RSP_M):
                 # TODO: Table 3-50 shows Cmp-M should be optionally suported by host implementations
@@ -214,20 +211,20 @@ class CxlMemDcoh(PacketProcessor):
             self._snoop_filter_update(dpa, sf_update_list)
 
         if data_flush is True:
-            await self._memory_device_component.write_mem_dpa(dpa, data)
+            self._memory_device_component.write_mem_dpa(dpa, data)
 
         if data_read is True:
             ndr_packet, drs_packet = self._create_mem_rsp_packet(
                 rsp_code, data, meta_value=CXL_MEM_META_VALUE.ANY
             )
-            await self._upstream_fifo.target_to_host.put(ndr_packet)
-            await self._upstream_fifo.target_to_host.put(drs_packet)
+            self._upstream_fifo.target_to_host.put(ndr_packet)
+            self._upstream_fifo.target_to_host.put(drs_packet)
         else:
             ndr_packet, _ = self._create_mem_rsp_packet(rsp_code, data)
-            await self._upstream_fifo.target_to_host.put(ndr_packet)
+            self._upstream_fifo.target_to_host.put(ndr_packet)
 
     # .mem m2s rwd (MemWr) handler
-    async def _process_cxl_m2s_rwd_packet(self, m2srwd_packet: CxlMemM2SRwDPacket):
+    def _process_cxl_m2s_rwd_packet(self, m2srwd_packet: CxlMemM2SRwDPacket):
         if self._memory_device_component is None:
             raise Exception("CxlMemoryDeviceComponent isn't set yet")
 
@@ -238,12 +235,12 @@ class CxlMemDcoh(PacketProcessor):
             dpa = self._memory_device_component.get_dpa(addr)
 
         if m2srwd_packet.m2srwd_header.meta_field == CXL_MEM_META_FIELD.NO_OP:
-            await self._memory_device_component.write_mem_dpa(dpa, m2srwd_packet.get_data_as_int())
+            self._memory_device_component.write_mem_dpa(dpa, m2srwd_packet.get_data_as_int())
 
             packet, _ = self._create_mem_rsp_packet(
                 CXL_MEM_S2MNDR_OPCODE.CMP, m2srwd_packet.get_data_as_int()
             )
-            await self._upstream_fifo.target_to_host.put(packet)
+            self._upstream_fifo.target_to_host.put(packet)
             self._cur_state.state = COH_STATE_MACHINE.COH_STATE_INIT
             return
 
@@ -258,22 +255,22 @@ class CxlMemDcoh(PacketProcessor):
         elif m2srwd_packet.m2srwd_header.meta_value == CXL_MEM_META_VALUE.INVALID:
             packet = CacheRequest(CACHE_REQUEST_TYPE.SNP_INV, dpa)
             sf_update_list.append(SF_UPDATE_TYPE.SF_HOST_OUT)
-        await self._coh_agent_to_cache_fifo.request.put(packet)
-        packet = await self._coh_agent_to_cache_fifo.response.get()
+        self._coh_agent_to_cache_fifo.request.put(packet)
+        packet = self._coh_agent_to_cache_fifo.response.get()
 
         if sf_update_list:
             self._snoop_filter_update(dpa, sf_update_list)
 
         if data_flush is True:
-            await self._memory_device_component.write_mem_dpa(dpa, m2srwd_packet.get_data_as_int())
+            self._memory_device_component.write_mem_dpa(dpa, m2srwd_packet.get_data_as_int())
 
         ndr_packet, _ = self._create_mem_rsp_packet(rsp_code)
-        await self._upstream_fifo.target_to_host.put(ndr_packet)
+        self._upstream_fifo.target_to_host.put(ndr_packet)
 
     # .mem m2s birsp handler
-    async def _process_cxl_m2s_birsp_packet(self, m2sbirsp_packet: CxlMemM2SBIRspPacket):
+    def _process_cxl_m2s_birsp_packet(self, m2sbirsp_packet: CxlMemM2SBIRspPacket):
         dpa = self._cur_state.packet.addr
-        data = await self._memory_device_component.read_mem_dpa(dpa)
+        data = self._memory_device_component.read_mem_dpa(dpa)
 
         if m2sbirsp_packet.m2sbirsp_header.opcode == CXL_MEM_M2SBIRSP_OPCODE.BIRSP_S:
             packet = CacheResponse(CACHE_RESPONSE_STATUS.RSP_S, data)
@@ -283,11 +280,11 @@ class CxlMemDcoh(PacketProcessor):
             raise Exception(
                 f"Unsupported M2SBIRsp Opcode: {m2sbirsp_packet.m2sbirsp_header.opcode}"
             )
-        await self._cache_to_coh_agent_fifo.response.put(packet)
+        self._cache_to_coh_agent_fifo.response.put(packet)
         self._cur_state.state = COH_STATE_MACHINE.COH_STATE_INIT
 
     # .mem s2m device req handler
-    async def _process_cache_to_dcoh(self, cache_packet: CacheRequest):
+    def _process_cache_to_dcoh(self, cache_packet: CacheRequest):
         if self._memory_device_component is None:
             raise Exception("CxlMemoryDeviceComponent isn't set yet")
 
@@ -297,9 +294,9 @@ class CxlMemDcoh(PacketProcessor):
         if self._cur_state.state == COH_STATE_MACHINE.COH_STATE_START:
             dpa = cache_packet.addr
             if cache_packet.type == CACHE_REQUEST_TYPE.READ:
-                data = await self._memory_device_component.read_mem_dpa(dpa)
+                data = self._memory_device_component.read_mem_dpa(dpa)
                 packet = CacheResponse(CACHE_RESPONSE_STATUS.OK, data)
-                await self._cache_to_coh_agent_fifo.response.put(packet)
+                self._cache_to_coh_agent_fifo.response.put(packet)
                 self._cur_state.state = COH_STATE_MACHINE.COH_STATE_INIT
             elif cache_packet.type in (
                 CACHE_REQUEST_TYPE.WRITE,
@@ -307,21 +304,21 @@ class CxlMemDcoh(PacketProcessor):
                 CACHE_REQUEST_TYPE.WRITE_BACK_CLEAN,
             ):
                 # if not CACHE_REQUEST_TYPE.WRITE_BACK_CLEAN:
-                await self._memory_device_component.write_mem_dpa(dpa, cache_packet.data)
+                self._memory_device_component.write_mem_dpa(dpa, cache_packet.data)
                 packet = CacheResponse(CACHE_RESPONSE_STATUS.OK)
-                await self._cache_to_coh_agent_fifo.response.put(packet)
+                self._cache_to_coh_agent_fifo.response.put(packet)
                 self._cur_state.state = COH_STATE_MACHINE.COH_STATE_INIT
             else:
                 # host cache snoop filter miss
                 if not self._sf_host_is_hit(dpa):
                     if cache_packet.type == CACHE_REQUEST_TYPE.SNP_DATA:
-                        data = await self._memory_device_component.read_mem_dpa(dpa)
+                        data = self._memory_device_component.read_mem_dpa(dpa)
                         packet = CacheResponse(CACHE_RESPONSE_STATUS.RSP_I, data)
                     elif cache_packet.type == CACHE_REQUEST_TYPE.SNP_INV:
                         packet = CacheResponse(CACHE_RESPONSE_STATUS.RSP_I)
                     elif cache_packet.type == CACHE_REQUEST_TYPE.SNP_CUR:
                         packet = CacheResponse(CACHE_RESPONSE_STATUS.RSP_V)
-                    await self._cache_to_coh_agent_fifo.response.put(packet)
+                    self._cache_to_coh_agent_fifo.response.put(packet)
                     self._cur_state.state = COH_STATE_MACHINE.COH_STATE_INIT
                 # host cache snoop filter hit
                 else:
@@ -335,7 +332,7 @@ class CxlMemDcoh(PacketProcessor):
                         bi_opcode = CXL_MEM_S2MBISNP_OPCODE.BISNP_CUR
                     hpa = self._memory_device_component.get_hpa(dpa)
                     cxl_packet = CxlMemBISnpPacket.create(hpa, bi_opcode, self._bi_id, self._bi_tag)
-                    await self._upstream_fifo.target_to_host.put(cxl_packet)
+                    self._upstream_fifo.target_to_host.put(cxl_packet)
 
                     if sf_update_list:
                         self._snoop_filter_update(dpa, sf_update_list)
@@ -343,11 +340,8 @@ class CxlMemDcoh(PacketProcessor):
 
     # .mem m2s host packet handler (threaded demux)
     def _process_host_to_target_worker(self) -> None:
-        assert self._loop is not None
         while not self._demux_stop.is_set():
-            packet = asyncio.run_coroutine_threadsafe(
-                self._upstream_fifo.host_to_target.get(), self._loop
-            ).result()
+            packet = self._upstream_fifo.host_to_target.get()
             if packet is None:
                 break
             base_packet = cast(BasePacket, packet)
@@ -355,30 +349,21 @@ class CxlMemDcoh(PacketProcessor):
                 raise Exception(f"Received unexpected packet: {base_packet.get_type()}")
             cxl_packet = cast(CxlMemBasePacket, packet)
             if cxl_packet.is_m2sreq():
-                asyncio.run_coroutine_threadsafe(
-                    self._cxl_channel.m2s_req.put(cast(CxlMemM2SReqPacket, packet)), self._loop
-                ).result()
+                self._cxl_channel.m2s_req.put(cast(CxlMemM2SReqPacket, packet))
             elif cxl_packet.is_m2srwd():
-                asyncio.run_coroutine_threadsafe(
-                    self._cxl_channel.m2s_rwd.put(cast(CxlMemM2SRwDPacket, packet)), self._loop
-                ).result()
+                self._cxl_channel.m2s_rwd.put(cast(CxlMemM2SRwDPacket, packet))
             elif cxl_packet.is_m2sbirsp():
-                asyncio.run_coroutine_threadsafe(
-                    self._cxl_channel.m2s_birsp.put(cast(CxlMemM2SBIRspPacket, packet)), self._loop
-                ).result()
+                self._cxl_channel.m2s_birsp.put(cast(CxlMemM2SBIRspPacket, packet))
             else:
                 raise Exception(f"Received unexpected packet: {cxl_packet.get_type()}")
 
     def _cxl_mem_dcoh_main_worker(self) -> None:
-        assert self._loop is not None
         while not self._main_stop.is_set():
             # fetch device request packet
             if self._cur_state.state == COH_STATE_MACHINE.COH_STATE_INIT:
                 try:
                     if not self._cache_to_coh_agent_fifo.request.empty():
-                        self._cur_state.packet = asyncio.run_coroutine_threadsafe(
-                            self._cache_to_coh_agent_fifo.request.get(), self._loop
-                        ).result()
+                        self._cur_state.packet = self._cache_to_coh_agent_fifo.request.get()
                         if self._cur_state.packet is None:
                             break
                         self._cur_state.state = COH_STATE_MACHINE.COH_STATE_START
@@ -386,37 +371,22 @@ class CxlMemDcoh(PacketProcessor):
                     pass
             else:
                 # run request processing and response checking code continuously until state changed
-                asyncio.run_coroutine_threadsafe(
-                    self._process_cache_to_dcoh(self._cur_state.packet), self._loop
-                ).result()
+                self._process_cache_to_dcoh(self._cur_state.packet)
                 if not self._cxl_channel.m2s_birsp.empty():
-                    packet = asyncio.run_coroutine_threadsafe(
-                        self._cxl_channel.m2s_birsp.get(), self._loop
-                    ).result()
-                    asyncio.run_coroutine_threadsafe(
-                        self._process_cxl_m2s_birsp_packet(packet), self._loop
-                    ).result()
+                    packet = self._cxl_channel.m2s_birsp.get()
+                    self._process_cxl_m2s_birsp_packet(packet)
 
             # process host request regardless of device processing state
             if not self._cxl_channel.m2s_req.empty():
-                packet = asyncio.run_coroutine_threadsafe(
-                    self._cxl_channel.m2s_req.get(), self._loop
-                ).result()
-                asyncio.run_coroutine_threadsafe(
-                    self._process_cxl_m2s_req_packet(packet), self._loop
-                ).result()
+                packet = self._cxl_channel.m2s_req.get()
+                self._process_cxl_m2s_req_packet(packet)
 
             if not self._cxl_channel.m2s_rwd.empty():
-                packet = asyncio.run_coroutine_threadsafe(
-                    self._cxl_channel.m2s_rwd.get(), self._loop
-                ).result()
-                asyncio.run_coroutine_threadsafe(
-                    self._process_cxl_m2s_rwd_packet(packet), self._loop
-                ).result()
+                packet = self._cxl_channel.m2s_rwd.get()
+                self._process_cxl_m2s_rwd_packet(packet)
 
     # pylint: disable=duplicate-code
-    async def _run(self):
-        self._loop = asyncio.get_running_loop()
+    def _run(self):
         self._demux_stop.clear()
         self._demux_thread = threading.Thread(
             target=self._process_host_to_target_worker,
@@ -432,25 +402,25 @@ class CxlMemDcoh(PacketProcessor):
             daemon=True,
         )
         self._main_thread.start()
-        await self._change_status_to_running()
+        self._change_status_to_running()
         # keep alive until stop requested
-        stopper = asyncio.Event()
-        try:
-            await stopper.wait()
-        except asyncio.CancelledError:
-            pass
+        stop_event = threading.Event()
+        stop_event.wait()
 
-    async def _stop(self):
+    def _stop(self):
         self._demux_stop.set()
-        await self._upstream_fifo.host_to_target.put(None)
+        self._upstream_fifo.host_to_target.put(None)
         if self._demux_thread is not None:
             self._demux_thread.join(timeout=1.0)
         self._main_stop.set()
         # nudge queues
         try:
-            await self._cache_to_coh_agent_fifo.request.put(None)
+            self._cache_to_coh_agent_fifo.request.put(None)
         except Exception:
             pass
         if self._main_thread is not None:
             self._main_thread.join(timeout=1.0)
-        await self._cache_to_coh_agent_fifo.request.put(None)
+        try:
+            self._cache_to_coh_agent_fifo.request.put(None)
+        except Exception:
+            pass

@@ -96,7 +96,7 @@ class IdentifySwitchDeviceCommand(CciForegroundCommand):
         self._virtual_switch_manager = virtual_switch_manager
         super().__init__(CCI_FM_API_COMMAND_OPCODE.IDENTIFY_SWITCH_DEVICE)
 
-    async def _execute(self, _: CciRequest) -> CciResponse:
+    def _execute(self, _: CciRequest) -> CciResponse:
         number_of_physical_ports = self._physical_port_manager.get_port_counts()
         number_of_vcss = self._virtual_switch_manager.get_virtual_switch_counts()
         response_payload = IdentifySwitchDeviceResponsePayload(

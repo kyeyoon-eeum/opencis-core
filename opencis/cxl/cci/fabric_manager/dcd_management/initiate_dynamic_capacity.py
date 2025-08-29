@@ -126,7 +126,7 @@ class InitiateDynamicCapacityAdd(CciForegroundCommand):
         self._virtual_switch_manager = virtual_switch_manager
         super().__init__(CCI_FM_API_COMMAND_OPCODE.INITIATE_DYNAMIC_CAPACITY_ADD)
 
-    async def _execute(self, request: CciRequest) -> CciResponse:
+    def _execute(self, request: CciRequest) -> CciResponse:
         # pylint: disable=unused-variable
         request_payload = InitiateDynamicCapacityAddRequestPayload.parse(request.payload)
         ######################################################################
@@ -268,7 +268,7 @@ class InitiateDynamicCapacityRelease(CciForegroundCommand):
         self._virtual_switch_manager = virtual_switch_manager
         super().__init__(CCI_FM_API_COMMAND_OPCODE.INITIATE_DYNAMIC_CAPACITY_RELEASE)
 
-    async def _execute(self, request: CciRequest) -> CciResponse:
+    def _execute(self, request: CciRequest) -> CciResponse:
         # pylint: disable=unused-variable
         request_payload = InitiateDynamicCapacityReleaseRequestPayload.parse(request.payload)
         ######################################################################

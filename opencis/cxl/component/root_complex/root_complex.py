@@ -7,7 +7,6 @@ See LICENSE for details.
 
 from typing import Optional, List
 from dataclasses import dataclass, field
-import asyncio
 from opencis.util.component import RunnableComponent
 from opencis.cxl.component.cxl_connection import CxlConnection
 from opencis.cxl.component.root_complex.io_bridge import IoBridge, IoBridgeConfig
@@ -137,62 +136,52 @@ class RootComplex(RunnableComponent):
     def get_mmio_base_address(self) -> int:
         return self._mmio_base_address
 
-    async def write_config(self, bdf: int, offset: int, size: int, value: int):
-        await self._io_bridge.write_config(bdf, offset, size, value)
+    def write_config(self, bdf: int, offset: int, size: int, value: int):
+        # IoBridge methods are still async signatures but operate synchronously
+        self._io_bridge.write_config(bdf, offset, size, value)  # type: ignore[arg-type]
 
-    async def read_config(self, bdf: int, offset: int, size: int) -> int:
-        return await self._io_bridge.read_config(bdf, offset, size)
+    def read_config(self, bdf: int, offset: int, size: int) -> int:
+        return self._io_bridge.read_config(bdf, offset, size)  # type: ignore[arg-type]
 
-    async def write_mmio(self, address: int, size: int, value: int):
-        await self._io_bridge.write_mmio(address, size, value)
+    def write_mmio(self, address: int, size: int, value: int):
+        self._io_bridge.write_mmio(address, size, value)  # type: ignore[arg-type]
 
-    async def read_mmio(self, address: int, size: int) -> int:
-        return await self._io_bridge.read_mmio(address, size)
+    def read_mmio(self, address: int, size: int) -> int:
+        return self._io_bridge.read_mmio(address, size)  # type: ignore[arg-type]
 
-    async def write_cxl_mem(self, address: int, size: int, value: int) -> int:
-        return await self._home_agent.write_cxl_mem(address, size, value)
+    def write_cxl_mem(self, address: int, size: int, value: int) -> int:
+        return self._home_agent.write_cxl_mem(address, size, value)
 
-    async def read_cxl_mem(self, address: int, size: int) -> int:
-        return await self._home_agent.read_cxl_mem(address, size)
+    def read_cxl_mem(self, address: int, size: int) -> int:
+        return self._home_agent.read_cxl_mem(address, size)
 
     def set_cache_coh_dev_count(self, count: int):
         self._cache_coherency_bridge.set_cache_coh_dev_count(count)
 
-    async def _run(self):
-        run_tasks = [
-            asyncio.create_task(self._root_port_switch.run()),
-            asyncio.create_task(self._io_bridge.run()),
-            asyncio.create_task(self._cache_coherency_bridge.run()),
-            asyncio.create_task(self._home_agent.run()),
-            asyncio.create_task(self._memory_controller.run()),
-        ]
+    def _run(self):
         from opencis.util.logger import logger
 
-        logger.info(self._create_message("Waiting RootPortSwitch READY"))
-        await self._root_port_switch.wait_for_ready()
+        self._root_port_switch.start_wait_ready()
         logger.info(self._create_message("RootPortSwitch READY"))
-        logger.info(self._create_message("Waiting IoBridge READY"))
-        await self._io_bridge.wait_for_ready()
+        self._io_bridge.start_wait_ready()
         logger.info(self._create_message("IoBridge READY"))
-        logger.info(self._create_message("Waiting CacheCoherencyBridge READY"))
-        await self._cache_coherency_bridge.wait_for_ready()
+        self._cache_coherency_bridge.start_wait_ready()
         logger.info(self._create_message("CacheCoherencyBridge READY"))
-        logger.info(self._create_message("Waiting HomeAgent READY"))
-        await self._home_agent.wait_for_ready()
+        self._home_agent.start_wait_ready()
         logger.info(self._create_message("HomeAgent READY"))
-        logger.info(self._create_message("Waiting MemoryController READY"))
-        await self._memory_controller.wait_for_ready()
+        self._memory_controller.start_wait_ready()
         logger.info(self._create_message("MemoryController READY"))
-        await self._change_status_to_running()
+        self._change_status_to_running()
         logger.info(self._create_message("RootComplex RUNNING"))
-        await asyncio.gather(*run_tasks)
+        self._root_port_switch.join()
+        self._io_bridge.join()
+        self._cache_coherency_bridge.join()
+        self._home_agent.join()
+        self._memory_controller.join()
 
-    async def _stop(self):
-        tasks = [
-            asyncio.create_task(self._root_port_switch.stop()),
-            asyncio.create_task(self._io_bridge.stop()),
-            asyncio.create_task(self._cache_coherency_bridge.stop()),
-            asyncio.create_task(self._home_agent.stop()),
-            asyncio.create_task(self._memory_controller.stop()),
-        ]
-        await asyncio.gather(*tasks)
+    def _stop(self):
+        self._root_port_switch.stop_sync()
+        self._io_bridge.stop_sync()
+        self._cache_coherency_bridge.stop_sync()
+        self._home_agent.stop_sync()
+        self._memory_controller.stop_sync()

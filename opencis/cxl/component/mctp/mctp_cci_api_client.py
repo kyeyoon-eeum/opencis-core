@@ -5,10 +5,8 @@ This software is licensed under the terms of the Revised BSD License.
 See LICENSE for details.
 """
 
-from asyncio import Condition
-import asyncio
 import threading
-from typing import cast, Any, Tuple, Optional, Callable, Dict, Coroutine
+from typing import cast, Any, Tuple, Optional, Callable, Dict
 
 from opencis.cxl.component.mctp.mctp_connection import MctpConnection
 from opencis.cxl.transport.packet_constants import CCI_MCTP_MESSAGE_CATEGORY
@@ -58,7 +56,7 @@ from opencis.util.component import RunnableComponent
 from opencis.util.logger import logger
 
 CreateRequestFuncType = Callable[[Optional[Any]], CciRequest]
-AsyncEventHandlerType = Callable[[CciMessagePacket], Coroutine[Any, Any, None]]
+EventHandlerType = Callable[[CciMessagePacket], None]
 
 
 class MctpCciApiClient(RunnableComponent):
@@ -67,15 +65,14 @@ class MctpCciApiClient(RunnableComponent):
         self._mctp_connection = mctp_connection
         self._tag = 0
         self._responses: Dict[int, CciMessagePacket] = {}
-        self._condition = Condition()
+        self._condition = threading.Condition()
         self._notification_handler = None
-        self._loop: asyncio.AbstractEventLoop | None = None
         self._in_thread: threading.Thread | None = None
         self._in_stop = threading.Event()
 
-    async def _process_incoming_packets(self):
+    def _process_incoming_packets(self):
         while True:
-            raw_response = await self._mctp_connection.ep_to_controller.get()
+            raw_response = self._mctp_connection.ep_to_controller.get()
             if raw_response is None:
                 break
 
@@ -90,16 +87,14 @@ class MctpCciApiClient(RunnableComponent):
                     logger.debug(
                         self._create_message(f"Calling handler for {opcode_str} notification")
                     )
-                    await self._notification_handler(cci_message)
+                    self._notification_handler(cci_message)
             else:
                 logger.debug(self._create_message("Received response packet"))
-                await self._condition.acquire()
-                self._responses[cci_message.cci_msg_header.message_tag] = cci_message
-                self._condition.notify_all()
-                self._condition.release()
+                with self._condition:
+                    self._responses[cci_message.cci_msg_header.message_tag] = cci_message
+                    self._condition.notify_all()
 
-    async def _run(self):
-        self._loop = asyncio.get_running_loop()
+    def _run(self):
         # Start incoming worker thread
         self._in_stop.clear()
         self._in_thread = threading.Thread(
@@ -108,34 +103,33 @@ class MctpCciApiClient(RunnableComponent):
             daemon=True,
         )
         self._in_thread.start()
-        await self._change_status_to_running()
+        self._change_status_to_running()
         # Keep component alive; thread will handle packets
-        stopper = asyncio.Event()
+        stopper = threading.Event()
         try:
-            await stopper.wait()
-        except asyncio.CancelledError:
+            stopper.wait()
+        except KeyboardInterrupt:
             pass
 
-    async def _stop(self):
+    def _stop(self):
         self._in_stop.set()
         try:
-            await self._mctp_connection.ep_to_controller.put(None)
+            self._mctp_connection.ep_to_controller.put(None)
         except Exception:
             pass
         if self._in_thread is not None:
             self._in_thread.join(timeout=1.0)
 
-    async def _get_response(self, message_tag: int) -> CciMessagePacket:
-        await self._condition.acquire()
-        logger.debug(self._create_message(f"Waiting for Message {message_tag}"))
-        while message_tag not in self._responses:
-            await self._condition.wait()
-        logger.debug(self._create_message(f"Received Message {message_tag}"))
-        response = self._responses[message_tag]
-        self._condition.release()
-        return response
+    def _get_response(self, message_tag: int) -> CciMessagePacket:
+        with self._condition:
+            logger.debug(self._create_message(f"Waiting for Message {message_tag}"))
+            while message_tag not in self._responses:
+                self._condition.wait()
+            logger.debug(self._create_message(f"Received Message {message_tag}"))
+            response = self._responses[message_tag]
+            return response
 
-    async def _send_request(self, request: CciMessagePacket, port_index=0, _=0) -> CciMessagePacket:
+    def _send_request(self, request: CciMessagePacket, port_index=0, _=0) -> CciMessagePacket:
         request.cci_msg_header.message_tag = self._get_next_tag()
         opcode_name = get_opcode_string(request.cci_msg_header.command_opcode)
         req_tag = request.cci_msg_header.message_tag
@@ -143,8 +137,8 @@ class MctpCciApiClient(RunnableComponent):
         # wrapping
         request_tmc = CciPayloadPacket.create(request, port_index)
 
-        await self._mctp_connection.controller_to_ep.put(request_tmc)
-        response = await self._get_response(req_tag)
+        self._mctp_connection.controller_to_ep.put(request_tmc)
+        response = self._get_response(req_tag)
         res_tag = response.cci_msg_header.message_tag
         logger.debug(self._create_message(f"Received Response (Tag: {res_tag})"))
 
@@ -175,10 +169,10 @@ class MctpCciApiClient(RunnableComponent):
         )
         return message_packet
 
-    async def _wait_for_background_operation(self) -> CCI_RETURN_CODE:
+    def _wait_for_background_operation(self) -> CCI_RETURN_CODE:
         completed = False
         while not completed:
-            (return_code, result) = await self.background_operation_status()
+            (return_code, result) = self.background_operation_status()
             if not result:
                 continue
             completed = not result.background_operation_status.operation_in_progress
@@ -186,20 +180,20 @@ class MctpCciApiClient(RunnableComponent):
                 return return_code
         # TODO: Handle timeout
 
-    async def _send_cci_command(
+    def _send_cci_command(
         self, create_request_func: CreateRequestFuncType, request=None, port_index=0, ld_id=0
     ):
         cci_request = create_request_func() if request is None else create_request_func(request)
         request_message_packet = self._create_request_packet(cci_request)
-        return await self._send_request(request_message_packet, port_index, ld_id)
+        return self._send_request(request_message_packet, port_index, ld_id)
 
-    def register_notification_handler(self, notification_handler: AsyncEventHandlerType):
+    def register_notification_handler(self, notification_handler: EventHandlerType):
         self._notification_handler = notification_handler
 
-    async def background_operation_status(
+    def background_operation_status(
         self,
     ) -> Tuple[CCI_RETURN_CODE, Optional[BackgroundOperationStatusResponsePayload]]:
-        response_message_packet = await self._send_cci_command(
+        response_message_packet = self._send_cci_command(
             BackgroundOperationStatusCommand.create_cci_request
         )
 
@@ -212,10 +206,10 @@ class MctpCciApiClient(RunnableComponent):
         # logger.debug(self._create_message(response.get_pretty_print()))
         return (return_code, response)
 
-    async def identify_switch_device(
+    def identify_switch_device(
         self,
     ) -> Tuple[CCI_RETURN_CODE, Optional[IdentifySwitchDeviceResponsePayload]]:
-        response_message_packet = await self._send_cci_command(
+        response_message_packet = self._send_cci_command(
             IdentifySwitchDeviceCommand.create_cci_request
         )
 
@@ -228,10 +222,10 @@ class MctpCciApiClient(RunnableComponent):
         logger.debug(self._create_message(response.get_pretty_print()))
         return (return_code, response)
 
-    async def get_physical_port_state(
+    def get_physical_port_state(
         self, request: GetPhysicalPortStateRequestPayload
     ) -> Tuple[CCI_RETURN_CODE, Optional[GetPhysicalPortStateResponsePayload]]:
-        response_message_packet = await self._send_cci_command(
+        response_message_packet = self._send_cci_command(
             GetPhysicalPortStateCommand.create_cci_request, request
         )
 
@@ -244,10 +238,10 @@ class MctpCciApiClient(RunnableComponent):
         # logger.debug(self._create_message(response.get_pretty_print()))
         return (return_code, response)
 
-    async def get_virtual_cxl_switch_info(
+    def get_virtual_cxl_switch_info(
         self, request: GetVirtualCxlSwitchInfoRequestPayload
     ) -> Tuple[CCI_RETURN_CODE, Optional[GetVirtualCxlSwitchInfoResponsePayload]]:
-        response_message_packet = await self._send_cci_command(
+        response_message_packet = self._send_cci_command(
             GetVirtualCxlSwitchInfoCommand.create_cci_request, request
         )
 
@@ -262,16 +256,16 @@ class MctpCciApiClient(RunnableComponent):
         logger.debug(self._create_message(response.get_pretty_print()))
         return (return_code, response)
 
-    async def bind_vppb(
+    def bind_vppb(
         self, request: BindVppbRequestPayload, wait_for_completion: bool = True
     ) -> Tuple[CCI_RETURN_CODE, Optional[CCI_RETURN_CODE]]:
-        response_message_packet = await self._send_cci_command(
+        response_message_packet = self._send_cci_command(
             BindVppbCommand.create_cci_request, request
         )
 
         return_code = CCI_RETURN_CODE(response_message_packet.cci_msg_header.return_code)
         if wait_for_completion:
-            return_code = await self._wait_for_background_operation()
+            return_code = self._wait_for_background_operation()
         if return_code not in (
             CCI_RETURN_CODE.SUCCESS,
             CCI_RETURN_CODE.BACKGROUND_COMMAND_STARTED,
@@ -279,16 +273,16 @@ class MctpCciApiClient(RunnableComponent):
             return (return_code, None)
         return (return_code, return_code)
 
-    async def unbind_vppb(
+    def unbind_vppb(
         self, request: UnbindVppbRequestPayload, wait_for_completion: bool = True
     ) -> Tuple[CCI_RETURN_CODE, Optional[CCI_RETURN_CODE]]:
-        response_message_packet = await self._send_cci_command(
+        response_message_packet = self._send_cci_command(
             UnbindVppbCommand.create_cci_request, request
         )
 
         return_code = CCI_RETURN_CODE(response_message_packet.cci_msg_header.return_code)
         if wait_for_completion:
-            return_code = await self._wait_for_background_operation()
+            return_code = self._wait_for_background_operation()
         if return_code not in (
             CCI_RETURN_CODE.SUCCESS,
             CCI_RETURN_CODE.BACKGROUND_COMMAND_STARTED,
@@ -296,10 +290,10 @@ class MctpCciApiClient(RunnableComponent):
             return (return_code, None)
         return (return_code, return_code)
 
-    async def get_connected_devices(
+    def get_connected_devices(
         self,
     ) -> Tuple[CCI_RETURN_CODE, Optional[GetConnectedDevicesResponsePayload]]:
-        response_message_packet = await self._send_cci_command(
+        response_message_packet = self._send_cci_command(
             GetConnectedDevicesCommand.create_cci_request
         )
 
@@ -311,10 +305,10 @@ class MctpCciApiClient(RunnableComponent):
         )
         return (return_code, response)
 
-    async def get_ld_info(
+    def get_ld_info(
         self, port_index: int
     ) -> Tuple[CCI_RETURN_CODE, Optional[GetLdInfoResponsePayload]]:
-        response_message_packet = await self._send_cci_command(
+        response_message_packet = self._send_cci_command(
             GetLdInfoCommand.create_cci_request, port_index=port_index
         )
 
@@ -324,10 +318,10 @@ class MctpCciApiClient(RunnableComponent):
         response = GetLdInfoCommand.parse_response_payload(response_message_packet.get_payload())
         return (return_code, response)
 
-    async def get_ld_alloctaion(
+    def get_ld_alloctaion(
         self, request: GetLdAllocationsRequestPayload, port_index: int
     ) -> Tuple[CCI_RETURN_CODE, Optional[GetLdAllocationsResponsePayload]]:
-        response_message_packet = await self._send_cci_command(
+        response_message_packet = self._send_cci_command(
             GetLdAllocationsCommand.create_cci_request, request, port_index=port_index
         )
 
@@ -339,10 +333,10 @@ class MctpCciApiClient(RunnableComponent):
         )
         return (return_code, response)
 
-    async def set_ld_alloctaion(
+    def set_ld_alloctaion(
         self, request: SetLdAllocationsRequestPayload, port_index: int
     ) -> Tuple[CCI_RETURN_CODE, Optional[SetLdAllocationsResponsePayload]]:
-        response_message_packet = await self._send_cci_command(
+        response_message_packet = self._send_cci_command(
             SetLdAllocationsCommand.create_cci_request, request, port_index=port_index
         )
 
@@ -354,16 +348,16 @@ class MctpCciApiClient(RunnableComponent):
         )
         return (return_code, response)
 
-    async def freeze_vppb(
+    def freeze_vppb(
         self, request: FreezeVppbRequestPayload, wait_for_completion: bool = True
     ) -> Tuple[CCI_RETURN_CODE, Optional[CCI_RETURN_CODE]]:
-        response_message_packet = await self._send_cci_command(
+        response_message_packet = self._send_cci_command(
             FreezeVppbCommand.create_cci_request, request
         )
 
         return_code = CCI_RETURN_CODE(response_message_packet.cci_msg_header.return_code)
         if wait_for_completion:
-            return_code = await self._wait_for_background_operation()
+            return_code = self._wait_for_background_operation()
         if return_code not in (
             CCI_RETURN_CODE.SUCCESS,
             CCI_RETURN_CODE.BACKGROUND_COMMAND_STARTED,
@@ -371,16 +365,16 @@ class MctpCciApiClient(RunnableComponent):
             return (return_code, None)
         return (return_code, return_code)
 
-    async def unfreeze_vppb(
+    def unfreeze_vppb(
         self, request: UnfreezeVppbRequestPayload, wait_for_completion: bool = True
     ) -> Tuple[CCI_RETURN_CODE, Optional[CCI_RETURN_CODE]]:
-        response_message_packet = await self._send_cci_command(
+        response_message_packet = self._send_cci_command(
             UnfreezeVppbCommand.create_cci_request, request
         )
 
         return_code = CCI_RETURN_CODE(response_message_packet.cci_msg_header.return_code)
         if wait_for_completion:
-            return_code = await self._wait_for_background_operation()
+            return_code = self._wait_for_background_operation()
         if return_code not in (
             CCI_RETURN_CODE.SUCCESS,
             CCI_RETURN_CODE.BACKGROUND_COMMAND_STARTED,
@@ -389,11 +383,8 @@ class MctpCciApiClient(RunnableComponent):
         return (return_code, return_code)
 
     def _incoming_worker(self) -> None:
-        assert self._loop is not None
         while not self._in_stop.is_set():
-            packet = asyncio.run_coroutine_threadsafe(
-                self._mctp_connection.ep_to_controller.get(), self._loop
-            ).result()
+            packet = self._mctp_connection.ep_to_controller.get()
             if packet is None:
                 break
             response_tmc1 = cast(CciPayloadPacket, packet)
@@ -404,17 +395,11 @@ class MctpCciApiClient(RunnableComponent):
                     self._create_message(f"Received request (notification) packet {opcode_str}")
                 )
                 if self._notification_handler is not None:
-                    asyncio.run_coroutine_threadsafe(
-                        self._notification_handler(cci_message), self._loop
-                    ).result()
+                    self._notification_handler(cci_message)
             else:
                 logger.debug(self._create_message("Received response packet"))
 
-                # Use condition in the same loop context
-                async def _notify() -> None:
-                    await self._condition.acquire()
+                # Use condition in the same thread context
+                with self._condition:
                     self._responses[cci_message.cci_msg_header.message_tag] = cci_message
                     self._condition.notify_all()
-                    self._condition.release()
-
-                asyncio.run_coroutine_threadsafe(_notify(), self._loop).result()

@@ -5,7 +5,6 @@ This software is licensed under the terms of the Revised BSD License.
 See LICENSE for details.
 """
 
-import asyncio
 from typing import Optional, Callable
 
 from opencis.cxl.component.cxl_io_callback_data import CxlIoCallbackData
@@ -44,22 +43,15 @@ class CxlIoManager(RunnableComponent):
     def get_cfg_reg_vals(self):
         return self._config_space_manager.get_register()
 
-    async def _run(self):
-        run_tasks = [
-            asyncio.create_task(self._mmio_manager.run()),
-            asyncio.create_task(self._config_space_manager.run()),
-        ]
-        wait_tasks = [
-            asyncio.create_task(self._mmio_manager.wait_for_ready()),
-            asyncio.create_task(self._config_space_manager.wait_for_ready()),
-        ]
-        await asyncio.gather(*wait_tasks)
-        await self._change_status_to_running()
-        await asyncio.gather(*run_tasks)
+    def _run(self):
+        # Start subcomponents synchronously via threads
+        self._mmio_manager.start_wait_ready()
+        self._config_space_manager.start_wait_ready()
+        self._change_status_to_running()
+        # Join subcomponents until stop
+        self._mmio_manager.join()
+        self._config_space_manager.join()
 
-    async def _stop(self):
-        tasks = [
-            asyncio.create_task(self._mmio_manager.stop()),
-            asyncio.create_task(self._config_space_manager.stop()),
-        ]
-        await asyncio.gather(*tasks)
+    def _stop(self):
+        self._mmio_manager.stop_sync()
+        self._config_space_manager.stop_sync()

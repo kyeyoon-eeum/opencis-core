@@ -8,7 +8,6 @@ See LICENSE for details.
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Optional, List, Tuple, cast
-import asyncio
 import threading
 
 from opencis.util.logger import logger
@@ -60,7 +59,7 @@ class MmioManager(PacketProcessor):
         self._prefetchable_memory_base = 0
         self._prefetchable_memory_limit = 0
         self._bar_entries: List[BarEntry] = []
-        self._loop: asyncio.AbstractEventLoop | None = None
+        self._loop = None
         self._h2t_thread: threading.Thread | None = None
         self._h2t_stop = threading.Event()
         self._t2h_thread: threading.Thread | None = None
@@ -137,7 +136,7 @@ class MmioManager(PacketProcessor):
             return entry.register, offset
         return None, None
 
-    async def _send_completion(
+    def _send_completion_sync(
         self,
         req_id: int,
         tag: int,
@@ -152,24 +151,23 @@ class MmioManager(PacketProcessor):
         packet = CxlIoCompletionPacket.create(
             req_id, tag, cpl_id=cpl_id, data=data, length=length, ld_id=ld_id
         )
+        self._upstream_fifo.target_to_host.put(packet)
 
-        await self._upstream_fifo.target_to_host.put(packet)
-
-    async def _forward_request(self, packet: CxlIoBasePacket):
+    def _forward_request_sync(self, packet: CxlIoBasePacket):
         logger.debug(self._create_message("Forwarding request to the next child device"))
-        await self._downstream_fifo.host_to_target.put(packet)
+        self._downstream_fifo.host_to_target.put(packet)
 
-    async def read_mmio(self, addr: int, size: int, bar_id: int = 0):
+    def read_mmio(self, addr: int, size: int, bar_id: int = 0):
         addr = self._bar_entries[bar_id].base_address + addr
         register, offset = self._get_register_and_offset(addr, size)
         return register.read_bytes(offset, offset + size - 1)
 
-    async def write_mmio(self, addr: int, size: int, data: int, bar_id: int = 0):
+    def write_mmio(self, addr: int, size: int, data: int, bar_id: int = 0):
         addr = self._bar_entries[bar_id].base_address + addr
         register, offset = self._get_register_and_offset(addr, size)
         register.write_bytes(offset, offset + size - 1, data)
 
-    async def _process_mmio_packet(self, mem_req_packet: CxlIoMemReqPacket):
+    def _process_mmio_packet_sync(self, mem_req_packet: CxlIoMemReqPacket):
         address = mem_req_packet.get_address()
         size = mem_req_packet.get_data_size()
         req_id = tlptoh16(mem_req_packet.mreq_header.req_id)
@@ -179,12 +177,12 @@ class MmioManager(PacketProcessor):
         register, offset = self._get_register_and_offset(address, size)
         if register is None and offset is None:
             if self._should_forward_packet(address, size):
-                await self._forward_request(mem_req_packet)
+                self._forward_request_sync(mem_req_packet)
             else:
                 if mem_req_packet.is_mem_read():
                     logger.debug(self._create_message(f"RD: 0x{address:x}[{size}] OOB"))
-                    await self._send_completion(
-                        req_id=req_id, tag=tag, cpl_id=0, data=None, ld_id=ld_id
+                    self._send_completion_sync(
+                        req_id=req_id, tag=tag, cpl_id=0, data=None, length=0, ld_id=ld_id
                     )
                 elif mem_req_packet.is_mem_write():
                     logger.debug(self._create_message(f"WR: 0x{address:x}[{size}] OOB"))
@@ -202,7 +200,7 @@ class MmioManager(PacketProcessor):
             logger.debug(self._create_message(f"RD: 0x{address:x}[{size}]"))
             data = register.read_bytes(start_offset, end_offset)
             logger.debug(self._create_message(f"RD: data - 0x{data:x}"))
-            await self._send_completion(
+            self._send_completion_sync(
                 req_id=req_id, tag=tag, cpl_id=0, data=data, length=size, ld_id=ld_id
             )
         else:
@@ -230,29 +228,9 @@ class MmioManager(PacketProcessor):
         logger.debug(self._create_message("Requested address is out of the memory range"))
         return False
 
-    async def _process_host_to_target(self, run_once: bool = False):
-        # Async fallback if thread not used
-        logger.debug(self._create_message("Started processing host to target fifo (async)"))
-        while True:
-            packet = await self._upstream_fifo.host_to_target.get()
-            if packet is None:
-                logger.debug(self._create_message("Stopped processing host to target fifo (async)"))
-                break
+    # Removed async fallback; this component uses worker threads
 
-            base_packet = cast(BasePacket, packet)
-            cxl_io_packet = cast(CxlIoBasePacket, packet)
-            if not base_packet.is_cxl_io() or not (
-                cxl_io_packet.is_mem_read() or cxl_io_packet.is_mem_write()
-            ):
-                raise Exception(f"Received unexpected packet: {base_packet.get_type()}")
-            logger.debug(self._create_message("Received host to target packet"))
-            await self._process_mmio_packet(cast(CxlIoMemReqPacket, packet))
-
-            if run_once:
-                break
-
-    async def _run(self):
-        self._loop = asyncio.get_running_loop()
+    def _run(self):
         self._h2t_stop.clear()
         self._h2t_thread = threading.Thread(
             target=self._host_to_target_worker, name=f"{self._label or ''}-mmio-h2t", daemon=True
@@ -266,18 +244,19 @@ class MmioManager(PacketProcessor):
                 daemon=True,
             )
             self._t2h_thread.start()
-        await self._change_status_to_running()
-        # keep alive until stop
-        stopper = asyncio.Event()
-        while not self._h2t_stop.is_set():
-            try:
-                await asyncio.wait_for(stopper.wait(), timeout=0.1)
-            except asyncio.TimeoutError:
-                pass
+        self._change_status_to_running()
+        # Join threads until stopped
+        if self._h2t_thread is not None:
+            self._h2t_thread.join()
+        if self._t2h_thread is not None:
+            self._t2h_thread.join()
 
-    async def _stop(self):
+    def _stop(self):
         self._h2t_stop.set()
-        await self._upstream_fifo.host_to_target.put(None)
+        try:
+            self._upstream_fifo.host_to_target.put(None)
+        except Exception:
+            pass
         try:
             if self._h2t_thread is not None:
                 self._h2t_thread.join(timeout=1.0)
@@ -286,7 +265,7 @@ class MmioManager(PacketProcessor):
         if self._downstream_fifo is not None:
             self._t2h_stop.set()
             try:
-                await self._downstream_fifo.target_to_host.put(None)
+                self._downstream_fifo.target_to_host.put(None)
             except Exception:
                 pass
             try:
@@ -296,11 +275,8 @@ class MmioManager(PacketProcessor):
                 pass
 
     def _host_to_target_worker(self) -> None:
-        assert self._loop is not None
         while not self._h2t_stop.is_set():
-            packet = asyncio.run_coroutine_threadsafe(
-                self._upstream_fifo.host_to_target.get(), self._loop
-            ).result()
+            packet = self._upstream_fifo.host_to_target.get()
             if packet is None:
                 break
             base_packet = cast(BasePacket, packet)
@@ -309,20 +285,13 @@ class MmioManager(PacketProcessor):
                 cxl_io_packet.is_mem_read() or cxl_io_packet.is_mem_write()
             ):
                 raise Exception(f"Received unexpected packet: {base_packet.get_type()}")
-            asyncio.run_coroutine_threadsafe(
-                self._process_mmio_packet(cast(CxlIoMemReqPacket, packet)), self._loop
-            ).result()
+            self._process_mmio_packet_sync(cast(CxlIoMemReqPacket, packet))
 
     def _target_to_host_worker(self) -> None:
         if self._downstream_fifo is None:
             return
-        assert self._loop is not None
         while not self._t2h_stop.is_set():
-            packet = asyncio.run_coroutine_threadsafe(
-                self._downstream_fifo.target_to_host.get(), self._loop
-            ).result()
+            packet = self._downstream_fifo.target_to_host.get()
             if packet is None:
                 break
-            asyncio.run_coroutine_threadsafe(
-                self._upstream_fifo.target_to_host.put(packet), self._loop
-            ).result()
+            self._upstream_fifo.target_to_host.put(packet)

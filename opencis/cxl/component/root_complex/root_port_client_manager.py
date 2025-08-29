@@ -5,7 +5,6 @@ This software is licensed under the terms of the Revised BSD License.
 See LICENSE for details.
 """
 
-import asyncio
 from dataclasses import dataclass, field
 from typing import List
 from opencis.util.component import RunnableComponent
@@ -65,24 +64,18 @@ class RootPortClientManager(RunnableComponent):
             )
         return connections
 
-    async def _run(self):
+    def _run(self):
         from opencis.util.logger import logger
 
         logger.info(self._create_message("RootPortClientManager starting"))
-        run_tasks = [asyncio.create_task(client.run()) for client in self._sw_conn_clients]
-        logger.info(
-            self._create_message(f"Waiting for {len(self._sw_conn_clients)} client(s) READY")
-        )
-        # Await each client sequentially to avoid scheduler races and to get clear logs
-        for idx, client in enumerate(self._sw_conn_clients):
-            logger.info(self._create_message(f"Waiting for client {idx} READY"))
-            await client.wait_for_ready()
-            logger.info(self._create_message(f"Client {idx} READY"))
+        for client in self._sw_conn_clients:
+            client.start_wait_ready()
         logger.info(self._create_message("All clients READY"))
-        await self._change_status_to_running()
+        self._change_status_to_running()
         logger.info(self._create_message("RootPortClientManager RUNNING"))
-        await asyncio.gather(*run_tasks)
+        for client in self._sw_conn_clients:
+            client.join()
 
-    async def _stop(self):
-        stop_tasks = [asyncio.create_task(client.stop()) for client in self._sw_conn_clients]
-        await asyncio.gather(*stop_tasks)
+    def _stop(self):
+        for client in self._sw_conn_clients:
+            client.stop_sync()

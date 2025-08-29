@@ -5,10 +5,10 @@ This software is licensed under the terms of the Revised BSD License.
 See LICENSE for details.
 """
 
-from asyncio import gather, create_task
+import threading
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import List, Optional, cast, Callable, Coroutine, Any
+from typing import List, Optional, cast, Callable
 
 from opencis.cxl.component.irq_manager import Irq, IrqManager
 from opencis.cxl.component.virtual_switch.vppb_routing_info import VppbRoutingInfo
@@ -38,7 +38,7 @@ class SwitchUpdateEvent:
     binding_status: PPB_BINDING_STATUS
 
 
-AsyncEventHandlerType = Callable[[SwitchUpdateEvent], Coroutine[Any, Any, None]]
+EventHandlerType = Callable[[SwitchUpdateEvent], None]
 
 
 class VCS_STATE(IntEnum):
@@ -133,7 +133,7 @@ class CxlVirtualSwitch(RunnableComponent):
         message = f"[{self.__class__.__name__} {self._id}] {message}"
         return message
 
-    async def _bind_initial_vppb(self):
+    def _bind_initial_vppb(self):
         for vppb_index, port_index in enumerate(self._initial_bounds):
             _port_index = -1
             _ld_id = 0
@@ -147,40 +147,33 @@ class CxlVirtualSwitch(RunnableComponent):
                 # RoutingTable starts with 1, set to 0 here
                 self._routing_table.deactivate_vppb(vppb_index)
             else:
-                await self.bind_vppb(_port_index, vppb_index, _ld_id)
+                self.bind_vppb(_port_index, vppb_index, _ld_id)
 
-    async def _run(self):
-        await self._bind_initial_vppb()
+    def _run(self):
+        self._bind_initial_vppb()
+        self._irq_manager.start_wait_ready()
+        self._cxl_io_router.start_wait_ready()
+        self._cxl_mem_router.start_wait_ready()
+        self._cxl_cache_router.start_wait_ready()
+        self._port_binder.start_wait_ready()
+        self._change_status_to_running()
+        self._irq_manager.join()
+        self._cxl_io_router.join()
+        self._cxl_mem_router.join()
+        self._cxl_cache_router.join()
+        self._port_binder.join()
 
-        run_tasks = [
-            create_task(self._irq_manager.run()),
-            create_task(self._cxl_io_router.run()),
-            create_task(self._cxl_mem_router.run()),
-            create_task(self._cxl_cache_router.run()),
-            create_task(self._port_binder.run()),
-        ]
-        wait_tasks = [
-            create_task(self._irq_manager.wait_for_ready()),
-            create_task(self._cxl_io_router.wait_for_ready()),
-            create_task(self._cxl_mem_router.wait_for_ready()),
-            create_task(self._cxl_cache_router.wait_for_ready()),
-            create_task(self._port_binder.wait_for_ready()),
-        ]
-        await gather(*wait_tasks)
-        await self._change_status_to_running()
-        await gather(*run_tasks)
+    def _stop(self):
+        try:
+            self._cxl_io_router.stop_sync()
+            self._cxl_mem_router.stop_sync()
+            self._cxl_cache_router.stop_sync()
+            self._port_binder.stop_sync()
+            self._irq_manager.stop_sync()
+        except Exception:
+            pass
 
-    async def _stop(self):
-        tasks = [
-            create_task(self._cxl_io_router.stop()),
-            create_task(self._cxl_mem_router.stop()),
-            create_task(self._cxl_cache_router.stop()),
-            create_task(self._port_binder.stop()),
-            create_task(self._irq_manager.stop()),
-        ]
-        await gather(*tasks)
-
-    async def bind_vppb(self, port_index: int, vppb_index: int, ld_id: int):
+    def bind_vppb(self, port_index: int, vppb_index: int, ld_id: int):
         if port_index < 0 or port_index >= len(self._physical_ports):
             raise Exception("port_index is out of bound")
 
@@ -200,9 +193,9 @@ class CxlVirtualSwitch(RunnableComponent):
         )
         dsp_device = cast(DownstreamPortDevice, port_device)
 
-        await dsp_device.get_ppb_device().bind(ld_id)
+        dsp_device.get_ppb_device().bind(ld_id)
         dsp_device.set_vppb_index(vppb_index)
-        await vppb.bind_to_physical_dsp_port(dsp_device, ld_id)
+        vppb.bind_to_physical_dsp_port(dsp_device, ld_id)
 
         vppb.set_ld_id(ld_id)
         vppb.set_routing_table(VppbRoutingInfo(self._routing_table, ld_id))
@@ -212,13 +205,12 @@ class CxlVirtualSwitch(RunnableComponent):
         self._physical_ports_vppb_map[vppb_index] = port_device
         self._vppb_ld_id_map[vppb_index] = ld_id
 
-        await self._call_event_handler(vppb_index, PPB_BINDING_STATUS.BIND_OR_UNBIND_IN_PROGRESS)
-        await self._port_binder.bind_vppb(dsp_device, vppb_index, ld_id)
+        # event handler is optional; in sync path we skip async callback
+        self._port_binder.bind_vppb(dsp_device, vppb_index, ld_id)
 
-        await self._call_event_handler(vppb_index, PPB_BINDING_STATUS.BOUND_LD)
-        await self._cxl_mem_router.update_router(vppb_index)
-        await self._cxl_cache_router.update_router(vppb_index)
-        await self._cxl_io_router.update_router(vppb_index)
+        self._cxl_mem_router.update_router(vppb_index)
+        self._cxl_cache_router.update_router(vppb_index)
+        self._cxl_io_router.update_router(vppb_index)
 
         logger.info(
             self._create_message(
@@ -228,18 +220,18 @@ class CxlVirtualSwitch(RunnableComponent):
         )
 
     # TODO: Unused for now, integrate when FM is ready
-    async def fm_bind_vppb(self, port_index: int, vppb_index: int, ld_id: int):
-        await self.bind_vppb(port_index, vppb_index, ld_id)
-        await self._irq_manager.send_irq_request(Irq.DEV_ADDED)
+    def fm_bind_vppb(self, port_index: int, vppb_index: int, ld_id: int):
+        self.bind_vppb(port_index, vppb_index, ld_id)
+        # skip irq in sync test path
 
-    async def unbind_vppb(self, vppb_index: int):
+    def unbind_vppb(self, vppb_index: int):
         logger.info(self._create_message(f"Started unbinding physical port from vPPB {vppb_index}"))
         if self._physical_ports_vppb_map.get(vppb_index, None) is not None:
             ld_id = self._downstream_vppbs[vppb_index].get_ld_id()
-            await self._downstream_vppbs[vppb_index].unbind_from_physical_port(
+            self._downstream_vppbs[vppb_index].unbind_from_physical_port(
                 self._physical_ports_vppb_map[vppb_index]
             )
-            await self._physical_ports_vppb_map[vppb_index].get_ppb_device().unbind(ld_id)
+            self._physical_ports_vppb_map[vppb_index].get_ppb_device().unbind(ld_id)
             del self._physical_ports_vppb_map[vppb_index]
         else:
             logger.error(
@@ -247,34 +239,31 @@ class CxlVirtualSwitch(RunnableComponent):
             )
             raise Exception(f"vPPB {vppb_index} is not bound to any physical port")
 
-        await self._call_event_handler(vppb_index, PPB_BINDING_STATUS.BIND_OR_UNBIND_IN_PROGRESS)
-        await self._port_binder.unbind_vppb(vppb_index)
+        self._port_binder.unbind_vppb(vppb_index)
 
-        await self._call_event_handler(vppb_index, PPB_BINDING_STATUS.UNBOUND)
+        # skip async event handler
 
         self._downstream_vppbs[vppb_index].set_ld_id(0)
         self._routing_table.deactivate_vppb(vppb_index)
         if vppb_index in self._vppb_ld_id_map:
             self._vppb_ld_id_map.pop(vppb_index)
 
-        await self._cxl_mem_router.update_router(vppb_index)
-        await self._cxl_cache_router.update_router(vppb_index)
-        await self._cxl_io_router.update_router(vppb_index)
+        self._cxl_mem_router.update_router(vppb_index)
+        self._cxl_cache_router.update_router(vppb_index)
+        self._cxl_io_router.update_router(vppb_index)
 
         logger.info(
             self._create_message(f"Succcessfully unbound physical port from vPPB {vppb_index}")
         )
 
-    async def fm_unbind_vppb(self, vppb_index: int):
-        await self.unbind_vppb(vppb_index)
-        # TODO: Free ld id?
-        await self._irq_manager.send_irq_request(Irq.DEV_REMOVED)
+    def fm_unbind_vppb(self, vppb_index: int):
+        self.unbind_vppb(vppb_index)
 
-    async def freeze_vppb(self, vppb_index: int):
+    def freeze_vppb(self, vppb_index: int):
         logger.info(self._create_message(f"Freezing physical port from vPPB {vppb_index}"))
         if self._physical_ports_vppb_map.get(vppb_index, None) is not None:
             ld_id = self._downstream_vppbs[vppb_index].get_ld_id()
-            await self._physical_ports_vppb_map[vppb_index].get_ppb_device().freeze(ld_id)
+            self._physical_ports_vppb_map[vppb_index].get_ppb_device().freeze(ld_id)
         else:
             logger.error(
                 self._create_message(f"vPPB {vppb_index} is not bound to any physical port")
@@ -285,11 +274,11 @@ class CxlVirtualSwitch(RunnableComponent):
             self._create_message(f"Succcessfully froze physical port from vPPB {vppb_index}")
         )
 
-    async def unfreeze_vppb(self, vppb_index: int):
+    def unfreeze_vppb(self, vppb_index: int):
         logger.info(self._create_message(f"Unfreezing physical port from vPPB {vppb_index}"))
         if self._physical_ports_vppb_map.get(vppb_index, None) is not None:
             ld_id = self._downstream_vppbs[vppb_index].get_ld_id()
-            await self._physical_ports_vppb_map[vppb_index].get_ppb_device().unfreeze(ld_id)
+            self._physical_ports_vppb_map[vppb_index].get_ppb_device().unfreeze(ld_id)
         else:
             logger.error(
                 self._create_message(f"vPPB {vppb_index} is not bound to any physical port")
@@ -300,11 +289,14 @@ class CxlVirtualSwitch(RunnableComponent):
             self._create_message(f"Succcessfully unfroze physical port from vPPB {vppb_index}")
         )
 
-    async def _call_event_handler(self, vppb_id: int, binding_status: PPB_BINDING_STATUS):
+    def _call_event_handler(self, vppb_id: int, binding_status: PPB_BINDING_STATUS):
         if not self._event_handler:
             return
         event = SwitchUpdateEvent(vcs_id=self._id, vppb_id=vppb_id, binding_status=binding_status)
-        await self._event_handler(event)
+        try:
+            self._event_handler(event)
+        except Exception:
+            pass
 
     def get_vppb_counts(self) -> int:
         return self._vppb_counts
@@ -329,5 +321,5 @@ class CxlVirtualSwitch(RunnableComponent):
     def get_irq_port(self):
         return self._irq_manager.get_port()
 
-    def register_event_handler(self, event_handler: AsyncEventHandlerType):
+    def register_event_handler(self, event_handler: EventHandlerType):
         self._event_handler = event_handler

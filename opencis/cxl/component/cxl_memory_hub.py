@@ -5,7 +5,6 @@ This software is licensed under the terms of the Revised BSD License.
 See LICENSE for details.
 """
 
-import asyncio
 from dataclasses import dataclass, field
 from typing import Callable, List
 
@@ -116,7 +115,7 @@ class CxlMemoryHub(RunnableComponent):
         """
 
         def add_dev_callback():
-            async def _cb(_):
+            def _cb(_):
                 self._cache_controller.add_mem_range(addr, size, addr_type)
                 cb()
 
@@ -138,7 +137,7 @@ class CxlMemoryHub(RunnableComponent):
         self._cache_controller.remove_mem_range(addr, size, addr_type)
 
         def remove_dev_callback():
-            async def _cb(_):
+            def _cb(_):
                 cb()
 
             return _cb
@@ -169,47 +168,47 @@ class CxlMemoryHub(RunnableComponent):
             (cfg_addr >> 12) & 0x07,
         )
 
-    async def _send_mem_request(self, packet: MemoryRequest) -> MemoryResponse:
-        await self._processor_to_cache_fifo.request.put(packet)
-        resp = await self._processor_to_cache_fifo.response.get()
+    def _send_mem_request(self, packet: MemoryRequest) -> MemoryResponse:
+        self._processor_to_cache_fifo.request.put(packet)
+        resp = self._processor_to_cache_fifo.response.get()
         assert resp.status == MEMORY_RESPONSE_STATUS.OK
         return resp
 
-    async def load(self, addr: int, size: int) -> int:
+    def load(self, addr: int, size: int) -> int:
         addr_type = self._cache_controller.get_mem_addr_type(addr)
         match addr_type:
             case MEM_ADDR_TYPE.DRAM | MEM_ADDR_TYPE.CXL_CACHED | MEM_ADDR_TYPE.CXL_CACHED_BI:
                 packet = MemoryRequest(MEMORY_REQUEST_TYPE.READ, addr, size)
-                resp = await self._send_mem_request(packet)
+                resp = self._send_mem_request(packet)
                 return resp.data
             case MEM_ADDR_TYPE.CXL_UNCACHED:
                 packet = MemoryRequest(MEMORY_REQUEST_TYPE.UNCACHED_READ, addr, size)
-                resp = await self._send_mem_request(packet)
+                resp = self._send_mem_request(packet)
                 return resp.data
             case MEM_ADDR_TYPE.MMIO:
-                return await self._root_complex.read_mmio(addr, size)
+                return self._root_complex.read_mmio(addr, size)
             case MEM_ADDR_TYPE.CFG:
                 bdf = self._cfg_addr_to_bdf(addr)
                 offset = addr & 0xFFF
-                return await self._root_complex.read_config(bdf, offset, size)
+                return self._root_complex.read_config(bdf, offset, size)
             case MEM_ADDR_TYPE.OOB:
                 return False
 
-    async def store(self, addr: int, size: int, data: int):
+    def store(self, addr: int, size: int, data: int):
         addr_type = self._cache_controller.get_mem_addr_type(addr)
         match addr_type:
             case MEM_ADDR_TYPE.DRAM | MEM_ADDR_TYPE.CXL_CACHED | MEM_ADDR_TYPE.CXL_CACHED_BI:
                 packet = MemoryRequest(MEMORY_REQUEST_TYPE.WRITE, addr, size, data)
-                await self._send_mem_request(packet)
+                self._send_mem_request(packet)
             case MEM_ADDR_TYPE.CXL_UNCACHED:
                 packet = MemoryRequest(MEMORY_REQUEST_TYPE.UNCACHED_WRITE, addr, size, data)
-                await self._send_mem_request(packet)
+                self._send_mem_request(packet)
             case MEM_ADDR_TYPE.MMIO:
-                await self._root_complex.write_mmio(addr, size, data)
+                self._root_complex.write_mmio(addr, size, data)
             case MEM_ADDR_TYPE.CFG:
                 bdf = self._cfg_addr_to_bdf(addr)
                 offset = addr & 0xFFF
-                await self._root_complex.write_config(bdf, offset, size, data)
+                self._root_complex.write_config(bdf, offset, size, data)
             case MEM_ADDR_TYPE.OOB:
                 return False
         return True
@@ -220,63 +219,46 @@ class CxlMemoryHub(RunnableComponent):
     def get_root_port(self):
         return self._root_port
 
-    async def write_config(self, bdf: int, offset: int, size: int, value: int):
-        await self._root_complex.write_config(bdf, offset, size, value)
+    def write_config(self, bdf: int, offset: int, size: int, value: int):
+        self._root_complex.write_config(bdf, offset, size, value)
 
-    async def read_config(self, bdf: int, offset: int, size: int) -> int:
-        return await self._root_complex.read_config(bdf, offset, size)
+    def read_config(self, bdf: int, offset: int, size: int) -> int:
+        return self._root_complex.read_config(bdf, offset, size)
 
-    async def write_mmio(self, address: int, size: int, value: int):
-        await self._root_complex.write_mmio(address, size, value)
+    def write_mmio(self, address: int, size: int, value: int):
+        self._root_complex.write_mmio(address, size, value)
 
-    async def read_mmio(self, address: int, size: int) -> int:
-        return await self._root_complex.read_mmio(address, size)
+    def read_mmio(self, address: int, size: int) -> int:
+        return self._root_complex.read_mmio(address, size)
 
-    async def _run(self):
-        run_tasks = [
-            asyncio.create_task(self._root_port_client_manager.run()),
-            asyncio.create_task(self._root_complex.run()),
-            asyncio.create_task(self._cache_controller.run()),
-        ]
-        # Wait and log each subcomponent readiness for visibility
+    def _run(self):
+        # Start subcomponents synchronously and wait for readiness
         logger.info(self._create_message("Waiting for RootPortClientManager READY"))
-        try:
-            await asyncio.wait_for(self._root_port_client_manager.wait_for_ready(), timeout=5.0)
-            logger.info(self._create_message("RootPortClientManager READY"))
-        except asyncio.TimeoutError:
-            logger.warning(
-                self._create_message(
-                    "Timeout waiting for RootPortClientManager READY; proceeding to unblock host"
-                )
-            )
+        self._root_port_client_manager.start_wait_ready()
+        logger.info(self._create_message("RootPortClientManager READY"))
         logger.info(self._create_message("Waiting for RootComplex READY"))
-        try:
-            await asyncio.wait_for(self._root_complex.wait_for_ready(), timeout=5.0)
-            logger.info(self._create_message("RootComplex READY"))
-        except asyncio.TimeoutError:
-            logger.warning(
-                self._create_message(
-                    "Timeout waiting for RootComplex READY; proceeding to unblock host"
-                )
-            )
+        self._root_complex.start_wait_ready()
+        logger.info(self._create_message("RootComplex READY"))
         logger.info(self._create_message("Waiting for CacheController READY"))
-        try:
-            await asyncio.wait_for(self._cache_controller.wait_for_ready(), timeout=5.0)
-            logger.info(self._create_message("CacheController READY"))
-        except asyncio.TimeoutError:
-            logger.warning(
-                self._create_message(
-                    "Timeout waiting for CacheController READY; proceeding to unblock host"
-                )
-            )
-        await self._change_status_to_running()
+        self._cache_controller.start_wait_ready()
+        logger.info(self._create_message("CacheController READY"))
+        self._change_status_to_running()
         logger.info(self._create_message("CxlMemoryHub RUNNING"))
-        await asyncio.gather(*run_tasks)
+        # Join workers
+        self._root_port_client_manager.join()
+        self._root_complex.join()
+        self._cache_controller.join()
 
-    async def _stop(self):
-        tasks = [
-            asyncio.create_task(self._root_port_client_manager.stop()),
-            asyncio.create_task(self._root_complex.stop()),
-            asyncio.create_task(self._cache_controller.stop()),
-        ]
-        await asyncio.gather(*tasks)
+    def _stop(self):
+        try:
+            self._root_port_client_manager.stop_sync()
+        except Exception:
+            pass
+        try:
+            self._root_complex.stop_sync()
+        except Exception:
+            pass
+        try:
+            self._cache_controller.stop_sync()
+        except Exception:
+            pass

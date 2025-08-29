@@ -5,15 +5,7 @@ This software is licensed under the terms of the Revised BSD License.
 See LICENSE for details.
 """
 
-import asyncio
-from asyncio import (
-    Event,
-    Task,
-    create_task,
-    gather,
-    Lock,
-)
-from asyncio.exceptions import CancelledError
+import threading
 from enum import Enum
 from typing import Callable
 
@@ -35,7 +27,7 @@ class ShortMsgBase(Enum):
 class ShortMsgConn(RunnableComponent):
     _msg_to_interrupt_event: dict[int, dict[ShortMsgBase, Callable]]
     _callbacks: list[Callable]
-    _server_component: Task
+    _server_component: None
 
     def __init__(
         self,
@@ -58,15 +50,15 @@ class ShortMsgConn(RunnableComponent):
         self._server = server
         self._server_component = None
         self._connections: dict[int, tuple[StreamReaderLike, StreamWriterLike]] = {}
-        self._tasks: list[Task] = []
-        self._msg_handlers: list[Task] = []
-        self._lock = Lock()
-        self._end_signal = Event()
+        self._tasks: list[threading.Thread] = []
+        self._msg_handlers: list[threading.Thread] = []
+        self._lock = threading.Lock()
+        self._end_signal = threading.Event()
         self._reader_id = {}
         self._writer_id = {}
         self._device_id = device_id
         self._run_status = False
-        self._msg_tasks: list[Task] = []
+        self._msg_tasks: list[threading.Thread] = []
         self._msg_type = msg_type
         self._disabled = disabled
 
@@ -86,8 +78,8 @@ class ShortMsgConn(RunnableComponent):
             dev_id = 0
             device_name = "host"
 
-        async def _callback(dev_id):
-            await msg_recv_cb(dev_id)
+        def _callback(dev_id):
+            msg_recv_cb(dev_id)
 
         cb_func = _callback
         logger.debug(
@@ -107,8 +99,8 @@ class ShortMsgConn(RunnableComponent):
         Handlers registered here will be triggered disregard of the device.
         """
 
-        async def _callback(dev_id, data):
-            await msg_recv_cb(dev_id, data)
+        def _callback(dev_id, data):
+            msg_recv_cb(dev_id, data)
 
         cb_func = _callback
         logger.debug(
@@ -116,7 +108,7 @@ class ShortMsgConn(RunnableComponent):
         )
         self._general_interrupt_event[short_msg] = (cb_func, persistent)
 
-    async def _msg_handler(self, reader: StreamReaderLike, _: StreamWriterLike):
+    def _msg_handler(self, reader: StreamReaderLike, _: StreamWriterLike):
         this_dev_name = f"Device {self._device_id}"
         if self._server:
             this_dev_name = "Host"
@@ -126,7 +118,7 @@ class ShortMsgConn(RunnableComponent):
                 logger.debug(self._create_message(f"{this_dev_name} _msg_handler exiting"))
                 return
 
-            msg = await asyncio.to_thread(reader.readexactly_blocking, self._msg_width)
+            msg = reader.readexactly_blocking(self._msg_width)
             if not msg:
                 logger.debug(self._create_message(f"{this_dev_name} ShortMsg connection broken"))
                 return
@@ -148,14 +140,21 @@ class ShortMsgConn(RunnableComponent):
                 persistent = self._general_interrupt_event[msg][1]
                 if not persistent:
                     del self._general_interrupt_event[msg]
-                t = create_task(func(remote_dev_id, msg))
+                # run handler in a separate thread
+                t = threading.Thread(target=func, args=(remote_dev_id, msg), daemon=True)
+                t.start()
                 self._msg_tasks.append(t)
                 continue
 
             if msg not in self._msg_to_interrupt_event[remote_dev_id]:
                 raise RuntimeError(f"Invalid ShortMsg: {msg} for remote {remote_dev_name}")
 
-            t = create_task(self._msg_to_interrupt_event[remote_dev_id][msg](remote_dev_id))
+            t = threading.Thread(
+                target=self._msg_to_interrupt_event[remote_dev_id][msg],
+                args=(remote_dev_id,),
+                daemon=True,
+            )
+            t.start()
             self._msg_tasks.append(t)
             logger.debug(
                 self._create_message(
@@ -163,14 +162,16 @@ class ShortMsgConn(RunnableComponent):
                 )
             )
 
-    async def _new_conn(self, reader: StreamReaderLike, writer: StreamWriterLike):
+    def _new_conn(self, reader: StreamReaderLike, writer: StreamWriterLike):
         logger.debug(self._create_message("New ShortMsg connection established"))
-        remote_dev_id = await asyncio.to_thread(reader.readexactly_blocking, 16)
+        remote_dev_id = reader.readexactly_blocking(16)
         remote_dev_id_int = int.from_bytes(remote_dev_id, "little")
         self._connections[remote_dev_id_int] = (reader, writer)
-        self._msg_handlers.append(create_task(self._msg_handler(reader, writer)))
+        t = threading.Thread(target=self._msg_handler, args=(reader, writer), daemon=True)
+        t.start()
+        self._msg_handlers.append(t)
 
-    async def send_irq_request(self, request: ShortMsgBase, device: int = 0):
+    def send_irq_request(self, request: ShortMsgBase, device: int = 0):
         """
         Sends an ShortMsg request as the client.
         """
@@ -183,31 +184,32 @@ class ShortMsgConn(RunnableComponent):
         _, writer = self._connections[device]
         val_w_dev_id = request.real_val << 8 | self._device_id
         writer.write(val_w_dev_id.to_bytes(length=self._msg_width))
-        await asyncio.to_thread(writer.drain_blocking)
+        writer.drain_blocking()
 
-    async def start_connection(self):
+    def start_connection(self):
         logger.info(self._create_message("ShortMsg client starting shm connection"))
         shm = ShmStreamPair(port_index=self._port, is_server=False, namespace="shortmsg")
         reader, writer = shm.reader, shm.writer
         writer.write(int.to_bytes(self._device_id, 16, "little"))
-        await asyncio.to_thread(writer.drain_blocking)
+        writer.drain_blocking()
         logger.info(self._create_message("ShortMsg client sent device ID"))
         self._connections[0] = (reader, writer)
         self._run_status = True
-
-        self._msg_handlers.append(create_task(self._msg_handler(reader, writer)))
+        t = threading.Thread(target=self._msg_handler, args=(reader, writer), daemon=True)
+        t.start()
+        self._msg_handlers.append(t)
 
     def num_connections(self):
         return len(self._connections.items())
 
-    async def shutdown(self):
+    def shutdown(self):
         self._run_status = False
 
-    async def _run(self):
+    def _run(self):
         try:
             if self._disabled:
-                await self._change_status_to_running()
-                await self._end_signal.wait()
+                self._change_status_to_running()
+                self._end_signal.wait()
                 return
             if self._server:
                 logger.info(self._create_message("ShortMsg server starting shm listener"))
@@ -215,9 +217,9 @@ class ShortMsgConn(RunnableComponent):
                 reader, writer = shm.reader, shm.writer
                 self._run_status = True
 
-                # Accept connection and device ID in background so server can become READY immediately
-                async def _accept_first_client():
-                    remote_dev_id = await asyncio.to_thread(reader.readexactly_blocking, 16)
+                # Accept connection and device ID in background
+                def _accept_first_client():
+                    remote_dev_id = reader.readexactly_blocking(16)
                     remote_dev_id_int = int.from_bytes(remote_dev_id, "little")
                     logger.info(
                         self._create_message(
@@ -225,23 +227,24 @@ class ShortMsgConn(RunnableComponent):
                         )
                     )
                     self._connections[remote_dev_id_int] = (reader, writer)
-                    self._msg_handlers.append(create_task(self._msg_handler(reader, writer)))
+                    t = threading.Thread(
+                        target=self._msg_handler, args=(reader, writer), daemon=True
+                    )
+                    t.start()
+                    self._msg_handlers.append(t)
 
-                self._tasks.append(create_task(_accept_first_client()))
+                t = threading.Thread(target=_accept_first_client, daemon=True)
+                t.start()
+                self._tasks.append(t)
             else:
                 pass
-            await self._change_status_to_running()
+            self._change_status_to_running()
             logger.info(self._create_message("ShortMsg RUNNING"))
-            self._tasks.append(create_task(self._end_signal.wait()))
+            self._end_signal.wait()
+        except Exception:
+            logger.info(self._create_message("ShortMsg listener stopped"))
 
-            await gather(*self._tasks)
-        except CancelledError:
-            logger.info(self._create_message("ShortMsg enable listener stopped"))
-            for task in self._msg_tasks:
-                task.cancel()
-            logger.info(self._create_message("All ShortMsg tasks cancelled"))
-
-    async def _stop(self):
+    def _stop(self):
         logger.debug(self._create_message("ShortMsg Manager Stopping"))
-        for task in self._msg_tasks:
-            task.cancel()
+        self._run_status = False
+        self._end_signal.set()

@@ -5,13 +5,11 @@ This software is licensed under the terms of the Revised BSD License.
 See LICENSE for details.
 """
 
-import asyncio
 import click
 
 from opencis.util.logger import logger
 from opencis.cxl.environment import parse_cxl_environment
 from opencis.cxl.component.cxl_component import PORT_TYPE
-from opencis.cxl.component.host_manager import HostManager
 from opencis.apps.memory_pooling import run_host
 
 
@@ -22,41 +20,36 @@ def host_group():
 
 def start(port, ig, iw):
     logger.info(f"Starting CXL Host on Port{port}")
-    asyncio.run(run_host(port_index=port, irq_port=8500, ig=ig, iw=iw))
+    # Run synchronously
+    from opencis.apps.memory_pooling import run_host
+    run_host(port_index=port, irq_port=8500, ig=ig, iw=iw)
 
 
-async def start_host_manager():
+def start_host_manager():
     logger.info("Starting CXL HostManager")
     host_manager = HostManager()
-    await host_manager.run()
+    host_manager.start_wait_ready()
+    host_manager.join()
 
 
-async def run_host_group(ports, ig, iw):
-    irq_port = 8500
-    tasks = []
-    tasks.append(asyncio.create_task(start_host_manager()))
-    for idx in ports:
-        tasks.append(
-            asyncio.create_task(
-                run_host(
-                    port_index=idx,
-                    irq_port=irq_port,
-                    ig=ig,
-                    iw=iw,
-                )
-            )
-        )
-        irq_port += 1
+def run_host_group(ports, ig, iw):
+    from opencis.apps.memory_pooling import run_host
+    base_irq_port = 8500
     try:
-        await asyncio.gather(*tasks)
+        threads = []
+        for i, idx in enumerate(ports):
+            t = __import__("threading").Thread(
+                target=run_host,
+                args=(),
+                kwargs={"port_index": idx, "irq_port": base_irq_port + i, "ig": ig, "iw": iw},
+                daemon=True,
+            )
+            t.start()
+            threads.append(t)
+        for t in threads:
+            t.join()
     except Exception as e:
         logger.error("Error while running CXL Host Group", exc_info=e)
-        # Cancel remaining tasks
-        for task in tasks:
-            if not task.done():
-                task.cancel()
-        # Wait for cancelled tasks to finish
-        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 def start_group(config_file: str, ig: int = 0, iw: int = 0):
@@ -73,6 +66,6 @@ def start_group(config_file: str, ig: int = 0, iw: int = 0):
             ports.append(idx)
 
     try:
-        asyncio.run(run_host_group(ports, ig, iw))
+        run_host_group(ports, ig, iw)
     except Exception as e:
         logger.error("Error while running CXL Host Group", exc_info=e)

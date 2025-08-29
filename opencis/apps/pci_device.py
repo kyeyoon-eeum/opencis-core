@@ -5,7 +5,7 @@ This software is licensed under the terms of the Revised BSD License.
 See LICENSE for details.
 """
 
-from asyncio import gather, create_task
+import threading
 from opencis.util.component import RunnableComponent
 from opencis.pci.device.pci_device import PciDevice as PciDeviceInternal
 from opencis.pci.component.pci import (
@@ -48,22 +48,13 @@ class PciDevice(RunnableComponent):
             label=f"PCIDevice{port_index}",
         )
 
-    async def _run(self):
-        tasks = [
-            create_task(self._sw_conn_client.run()),
-            create_task(self._pci_device.run()),
-        ]
-        wait_tasks = [
-            create_task(self._sw_conn_client.wait_for_ready()),
-            create_task(self._pci_device.wait_for_ready()),
-        ]
-        await gather(*wait_tasks)
-        await self._change_status_to_running()
-        await gather(*tasks)
+    def _run(self):
+        self._sw_conn_client.start_wait_ready()
+        self._pci_device.start_wait_ready()
+        self._change_status_to_running()
+        self._sw_conn_client.join()
+        self._pci_device.join()
 
-    async def _stop(self):
-        tasks = [
-            create_task(self._sw_conn_client.stop()),
-            create_task(self._pci_device.stop()),
-        ]
-        await gather(*tasks)
+    def _stop(self):
+        self._sw_conn_client.stop_sync()
+        self._pci_device.stop_sync()

@@ -7,8 +7,6 @@ See LICENSE for details.
 
 from typing import Optional, cast
 from enum import Enum, auto
-from asyncio import create_task, gather
-import asyncio
 import threading
 from opencis.pci.component.fifo_pair import FifoPair
 from opencis.pci.config_space.pci import REG_ADDR
@@ -52,7 +50,7 @@ class ConfigSpaceManager(RunnableComponent):
         self._downstream_fifo = downstream_fifo
         self._device_type = device_type
         self._register = None
-        self._loop: asyncio.AbstractEventLoop | None = None
+        self._loop = None
         self._h2t_thread: threading.Thread | None = None
         self._t2h_thread: threading.Thread | None = None
         self._h2t_stop = threading.Event()
@@ -64,11 +62,11 @@ class ConfigSpaceManager(RunnableComponent):
     def get_register(self):
         return self._register
 
-    async def _forward_request(self, packet: CxlIoBasePacket):
+    def _forward_request(self, packet: CxlIoBasePacket):
         logger.debug(self._create_message("Forwarding request to the next child device"))
-        await self._downstream_fifo.host_to_target.put(packet)
+        self._downstream_fifo.host_to_target.put(packet)
 
-    async def _send_unsupported_request(self, req_id, tag, cpl_id, ld_id):
+    def _send_unsupported_request(self, req_id, tag, cpl_id, ld_id):
         packet = CxlIoCompletionPacket.create(
             req_id=req_id,
             tag=tag,
@@ -77,7 +75,7 @@ class ConfigSpaceManager(RunnableComponent):
             status=CXL_IO_CPL_STATUS.UR,
             ld_id=ld_id,
         )
-        await self._upstream_fifo.target_to_host.put(packet)
+        self._upstream_fifo.target_to_host.put(packet)
 
     def _is_bridge(self) -> bool:
         return self._device_type in (
@@ -85,7 +83,7 @@ class ConfigSpaceManager(RunnableComponent):
             PCI_DEVICE_TYPE.UPSTREAM_BRIDGE,
         )
 
-    async def _process_cxl_io_cfg_rd(self, cfg_rd_packet: CxlIoCfgRdPacket):
+    def _process_cxl_io_cfg_rd(self, cfg_rd_packet: CxlIoCfgRdPacket):
         dest_id = tlptoh16(cfg_rd_packet.cfg_req_header.dest_id)
         bdf_str = bdf_to_string(dest_id)
         req_id = tlptoh16(cfg_rd_packet.cfg_req_header.req_id)
@@ -99,7 +97,7 @@ class ConfigSpaceManager(RunnableComponent):
                     f"Received request for {bdf_str}, however, this device supports function 0 only"
                 )
             )
-            await self._send_unsupported_request(req_id, tag, dest_id, ld_id)
+            self._send_unsupported_request(req_id, tag, dest_id, ld_id)
             return
 
         if (
@@ -111,7 +109,7 @@ class ConfigSpaceManager(RunnableComponent):
                     f"Received request for {bdf_str}, however, this device supports device 0 only"
                 )
             )
-            await self._send_unsupported_request(req_id, tag, dest_id, ld_id)
+            self._send_unsupported_request(req_id, tag, dest_id, ld_id)
             return
 
         cfg_addr, size = cfg_rd_packet.get_cfg_addr_read_info()
@@ -127,9 +125,9 @@ class ConfigSpaceManager(RunnableComponent):
         cpl_packet = CxlIoCompletionPacket.create(
             req_id=req_id, tag=tag, cpl_id=dest_id, data=value, length=4, ld_id=ld_id
         )
-        await self._upstream_fifo.target_to_host.put(cpl_packet)
+        self._upstream_fifo.target_to_host.put(cpl_packet)
 
-    async def _process_cxl_io_cfg_wr(self, cfg_wr_packet: CxlIoCfgWrPacket):
+    def _process_cxl_io_cfg_wr(self, cfg_wr_packet: CxlIoCfgWrPacket):
         # NOTE: All PCIe devices are single function devices.
         dest_id = tlptoh16(cfg_wr_packet.cfg_req_header.dest_id)
         req_id = tlptoh16(cfg_wr_packet.cfg_req_header.req_id)
@@ -144,7 +142,7 @@ class ConfigSpaceManager(RunnableComponent):
                     f"Received request for {bdf_str}, however, this device supports function 0 only"
                 )
             )
-            await self._send_unsupported_request(req_id, tag, dest_id, ld_id)
+            self._send_unsupported_request(req_id, tag, dest_id, ld_id)
             return
 
         cfg_addr, size = cfg_wr_packet.get_cfg_addr_write_info()
@@ -165,16 +163,14 @@ class ConfigSpaceManager(RunnableComponent):
         cpl_packet = CxlIoCompletionPacket.create(
             req_id=req_id, tag=tag, cpl_id=dest_id, data=None, ld_id=ld_id
         )
-        await self._upstream_fifo.target_to_host.put(cpl_packet)
+        self._upstream_fifo.target_to_host.put(cpl_packet)
 
     def _process_host_to_target_worker(self) -> None:
         # pylint: disable=duplicate-code
-        assert self._loop is not None
+        
         logger.debug(self._create_message("Started processing host to target fifo (thread)"))
         while not self._h2t_stop.is_set():
-            packet = asyncio.run_coroutine_threadsafe(
-                self._upstream_fifo.host_to_target.get(), self._loop
-            ).result()
+            packet = self._upstream_fifo.host_to_target.get()
             if packet is None:
                 logger.debug(self._create_message("Stop processing host to target fifo (thread)"))
                 break
@@ -182,19 +178,13 @@ class ConfigSpaceManager(RunnableComponent):
             logger.debug(self._create_message("Received host to target packet"))
             if base_packet.is_cfg_type0():
                 if base_packet.is_cfg_read():
-                    asyncio.run_coroutine_threadsafe(
-                        self._process_cxl_io_cfg_rd(base_packet), self._loop
-                    ).result()
+                    self._process_cxl_io_cfg_rd(base_packet)
                 elif base_packet.is_cfg_write():
-                    asyncio.run_coroutine_threadsafe(
-                        self._process_cxl_io_cfg_wr(base_packet), self._loop
-                    ).result()
+                    self._process_cxl_io_cfg_wr(base_packet)
             elif base_packet.is_cfg_type1():
                 if self._downstream_fifo:
                     self._convert_request_type_when_needed(base_packet)
-                    asyncio.run_coroutine_threadsafe(
-                        self._forward_request(base_packet), self._loop
-                    ).result()
+                    self._forward_request(base_packet)
                 else:
                     logger.warning(
                         self._create_message("Endpoint device should not receive a type1 request")
@@ -204,9 +194,7 @@ class ConfigSpaceManager(RunnableComponent):
                     tag = cfg_req_packet.cfg_req_header.tag
                     cpl_id = tlptoh16(cfg_req_packet.cfg_req_header.dest_id)
                     ld_id = cfg_req_packet.tlp_prefix.ld_id
-                    asyncio.run_coroutine_threadsafe(
-                        self._send_unsupported_request(req_id, tag, cpl_id, ld_id=ld_id), self._loop
-                    ).result()
+                    self._send_unsupported_request(req_id, tag, cpl_id, ld_id=ld_id)
             else:
                 raise Exception("Unexpected packet received from ConfigSpaceManager")
 
@@ -229,25 +217,18 @@ class ConfigSpaceManager(RunnableComponent):
     def _process_target_to_host_worker(self) -> None:
         if not self._is_bridge():
             return
-        assert self._loop is not None
         logger.debug(
             self._create_message("Started processing downstream target to host fifo (thread)")
         )
         while not self._t2h_stop.is_set():
-            packet = asyncio.run_coroutine_threadsafe(
-                self._downstream_fifo.target_to_host.get(), self._loop
-            ).result()
+            packet = self._downstream_fifo.target_to_host.get()
             if packet is None:
                 break
             logger.debug(self._create_message("Received target to host packet"))
-            asyncio.run_coroutine_threadsafe(
-                self._upstream_fifo.target_to_host.put(packet), self._loop
-            ).result()
+            self._upstream_fifo.target_to_host.put(packet)
 
-    async def _run(self):
+    def _run(self):
         # pylint: disable=duplicate-code
-        # CE-94
-        self._loop = asyncio.get_running_loop()
         # start H2T thread
         self._h2t_stop.clear()
         self._h2t_thread = threading.Thread(
@@ -264,21 +245,17 @@ class ConfigSpaceManager(RunnableComponent):
             daemon=True,
         )
         self._t2h_thread.start()
-        await self._change_status_to_running()
-        # Keep alive until stop
-        stopper = asyncio.Event()
-        while not (self._h2t_stop.is_set() and self._t2h_stop.is_set()):
-            try:
-                await asyncio.wait_for(stopper.wait(), timeout=0.1)
-            except asyncio.TimeoutError:
-                pass
+        self._change_status_to_running()
+        # Block until threads finish
+        self._h2t_thread.join()
+        self._t2h_thread.join()
 
-    async def _stop(self):
+    def _stop(self):
         logger.info(self._create_message("Stopping ConfigSpaceManager"))
         # Signal threads
         self._h2t_stop.set()
         try:
-            await self._upstream_fifo.host_to_target.put(None)
+            self._upstream_fifo.host_to_target.put(None)
         except Exception:
             pass
         if self._h2t_thread is not None:
@@ -289,7 +266,7 @@ class ConfigSpaceManager(RunnableComponent):
         if self._is_bridge():
             self._t2h_stop.set()
             try:
-                await self._downstream_fifo.target_to_host.put(None)
+                self._downstream_fifo.target_to_host.put(None)
             except Exception:
                 pass
             if self._t2h_thread is not None:

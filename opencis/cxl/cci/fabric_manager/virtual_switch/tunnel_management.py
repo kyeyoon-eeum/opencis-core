@@ -34,19 +34,17 @@ class TunnelManagementCommand(CciForegroundCommand):
         self._physical_port_manager = physical_port_manager
         self._virtual_switch_manager = virtual_switch_manager
 
-    async def _execute(self, request: CciRequest) -> CciResponse:
+    def _execute(self, request: CciRequest) -> CciResponse:
         request_payload = self.parse_request_payload(request.payload)
         port_or_ld_id = request_payload.port_or_ld_id
         port_device = self._physical_port_manager.get_port_device(port_or_ld_id)
 
         real_payload = request_payload.command_payload
         real_payload_packet = cast(CciMessagePacket, real_payload)
-        await port_device.get_downstream_connection().cci_fifo.host_to_target.put(
-            real_payload_packet
-        )
+        port_device.get_downstream_connection().cci_fifo.host_to_target.put(real_payload_packet)
 
         dev_response: CciMessagePacket = (
-            await port_device.get_downstream_connection().cci_fifo.target_to_host.get()
+            port_device.get_downstream_connection().cci_fifo.target_to_host.get()
         )
 
         payload = TunnelManagementResponsePayload(

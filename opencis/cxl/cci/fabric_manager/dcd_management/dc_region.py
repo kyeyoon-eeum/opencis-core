@@ -153,7 +153,7 @@ class GetHostDCRegionConfiguration(CciForegroundCommand):
         self._virtual_switch_manager = virtual_switch_manager
         super().__init__(CCI_FM_API_COMMAND_OPCODE.GET_HOST_DC_REGION_CONFIGURATION)
 
-    async def _execute(self, request: CciRequest) -> CciResponse:
+    def _execute(self, request: CciRequest) -> CciResponse:
         # pylint: disable=unused-variable
         request_payload = GetHostDCRegionConfigRequestPayload.parse(request.payload)
         ######################################################################
@@ -273,7 +273,7 @@ class SetDCRegionConfiguration(CciForegroundCommand):
         self._virtual_switch_manager = virtual_switch_manager
         super().__init__(CCI_FM_API_COMMAND_OPCODE.SET_DC_REGION_CONFIGURATION)
 
-    async def _execute(self, request: CciRequest) -> CciResponse:
+    def _execute(self, request: CciRequest) -> CciResponse:
         # pylint: disable=unused-variable
         request_payload = SetDCRegionConfigRequestPayload.parse(request.payload)
         ######################################################################
@@ -439,7 +439,7 @@ class GetDCRegionExtentLists(CciForegroundCommand):
         self._virtual_switch_manager = virtual_switch_manager
         super().__init__(CCI_FM_API_COMMAND_OPCODE.GET_DC_REGION_EXTENT_LISTS)
 
-    async def _execute(self, request: CciRequest) -> CciResponse:
+    def _execute(self, request: CciRequest) -> CciResponse:
         # pylint: disable=unused-variable
         request_payload = GetDCRegionExtentListsRequestPayload.parse(request.payload)
         ######################################################################

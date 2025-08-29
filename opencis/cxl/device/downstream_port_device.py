@@ -6,7 +6,7 @@ See LICENSE for details.
 """
 
 from typing import Optional
-from asyncio import create_task, gather, Condition
+from threading import Event
 
 from opencis.cxl.component.cxl_io_callback_data import CxlIoCallbackData
 from opencis.util.logger import logger
@@ -50,31 +50,14 @@ from opencis.pci.component.config_space_manager import PCI_DEVICE_TYPE
 class SleepLoop(RunnableComponent):
     def __init__(self):
         super().__init__()
-        self._task = None
-        self._running = False
-        self._loopcond = Condition()
+        self._running_evt = Event()
 
-    async def _process(self):
-        await self._loopcond.acquire()
-        try:
-            await self._change_status_to_running()
-            if self._running:
-                await self._loopcond.wait()
-        finally:
-            self._loopcond.release()
+    def _run(self):
+        self._change_status_to_running()
+        self._running_evt.wait()
 
-    async def _run(self):
-        self._running = True
-        self._task = create_task(self._process())
-        await self.wait_for_ready()
-        await self._task
-
-    async def _stop(self):
-        self._running = False
-        await self._loopcond.acquire()
-        self._loopcond.notify()
-        self._loopcond.release()
-        await self._task
+    def _stop(self):
+        self._running_evt.set()
 
 
 class DownstreamPortDevice(CxlPortDevice):
@@ -170,7 +153,7 @@ class DownstreamPortDevice(CxlPortDevice):
     def get_secondary_bus_number(self, ld_id: int):
         return self._pci_registers[ld_id].pci.secondary_bus_number
 
-    async def bind_to_vppb(self, ld_id: int):
+    def bind_to_vppb(self, ld_id: int):
         # TODO: Check for invalid ld_id
         logger.info(self._create_message(f"Binding LD-ID {ld_id} to vPPB{self._vppb_index}"))
         self._vppb_upstream_connection[ld_id] = CxlConnection()
@@ -198,21 +181,14 @@ class DownstreamPortDevice(CxlPortDevice):
 
         self._pci_bridge_component[ld_id].set_port_number(self._vppb_index)
 
-        wait_tasks = []
-
-        self._tasks.add_task(self._cxl_io_manager[ld_id].run())
-        wait_tasks.append(self._cxl_io_manager[ld_id].wait_for_ready())
+        self._cxl_io_manager[ld_id].start_wait_ready()
         self._stop_tasks.append(self._cxl_io_manager[ld_id])
 
-        self._tasks.add_task(self._cxl_mem_manager[ld_id].run())
-        wait_tasks.append(self._cxl_mem_manager[ld_id].wait_for_ready())
+        self._cxl_mem_manager[ld_id].start_wait_ready()
         self._stop_tasks.append(self._cxl_mem_manager[ld_id])
 
-        self._tasks.add_task(self._cxl_cache_manager[ld_id].run())
-        wait_tasks.append(self._cxl_cache_manager[ld_id].wait_for_ready())
+        self._cxl_cache_manager[ld_id].start_wait_ready()
         self._stop_tasks.append(self._cxl_cache_manager[ld_id])
-
-        await gather(*wait_tasks)
 
         return (
             self._cxl_mem_manager[ld_id],
@@ -226,23 +202,21 @@ class DownstreamPortDevice(CxlPortDevice):
         )
 
     # Caller should always await this function
-    async def unbind_from_vppb(self, ld_id: int):
-        tasks = []
+    def unbind_from_vppb(self, ld_id: int):
         self._vppb_downstream_connection.pop(ld_id, None)
         self._vppb_upstream_connection.pop(ld_id, None)
         io_task = self._cxl_io_manager.pop(ld_id, None)
         mem_task = self._cxl_mem_manager.pop(ld_id, None)
         cache_task = self._cxl_cache_manager.pop(ld_id, None)
         if io_task:
-            tasks.append(create_task(io_task.stop()))
+            io_task.stop_sync()
             self._stop_tasks.remove(io_task)
         if mem_task:
-            tasks.append(create_task(mem_task.stop()))
+            mem_task.stop_sync()
             self._stop_tasks.remove(mem_task)
         if cache_task:
-            tasks.append(create_task(cache_task.stop()))
+            cache_task.stop_sync()
             self._stop_tasks.remove(cache_task)
-        await gather(*tasks)
 
         logger.info(
             self._create_message(f"Unbinding ld_id {ld_id} to vPPB{self._vppb_index} (noop)")
@@ -262,17 +236,23 @@ class DownstreamPortDevice(CxlPortDevice):
     def get_ppb_bind(self):
         return self._ppb_bind
 
-    async def _run(self):
+    def _run(self):
         logger.info(self._create_message("Starting"))
-        await self._change_status_to_running()
-        self._tasks.add_task(self._dummy_process.run())
+        self._change_status_to_running()
+        self._dummy_process.start_wait_ready()
         self._stop_tasks.append(self._dummy_process)
-        await self._dummy_process.wait_for_ready()
-        await self._tasks.wait_for_completion()
+        self._dummy_process.join()
         logger.info(self._create_message("Stopped"))
 
-    async def _stop(self):
+    def _stop(self):
         logger.info(self._create_message("Stopping"))
-        await self._dummy_process.wait_for_ready()
-        stop_tasks = [create_task(task.stop()) for task in self._stop_tasks]
-        await gather(*stop_tasks)
+        for task in self._stop_tasks:
+            try:
+                task.stop_sync()
+            except Exception:
+                pass
+        # Ensure dummy process is released
+        try:
+            self._dummy_process.stop_sync()
+        except Exception:
+            pass

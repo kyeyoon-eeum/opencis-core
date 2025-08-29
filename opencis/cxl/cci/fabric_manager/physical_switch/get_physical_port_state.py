@@ -230,7 +230,7 @@ class GetPhysicalPortStateCommand(CciForegroundCommand):
         self._switch_connection_manager = switch_connection_manager
         self._device_configs = device_configs
 
-    async def _execute(self, request: CciRequest) -> CciResponse:
+    def _execute(self, request: CciRequest) -> CciResponse:
         request_payload = self.parse_request_payload(request.payload)
         switch_ports = self._switch_connection_manager.get_switch_ports()
         port_info_list = []

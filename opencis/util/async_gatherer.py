@@ -5,26 +5,21 @@ This software is licensed under the terms of the Revised BSD License.
 See LICENSE for details.
 """
 
-import asyncio
+import threading
 
 
 class AsyncGatherer:
     def __init__(self):
-        self._tasks = set()
-        self._event = asyncio.Event()
+        # Synchronous thread-based gatherer only
+        self._threads: list[threading.Thread] = []
 
-    def add_task(self, coro):
-        task = asyncio.create_task(coro)
-        self._tasks.add(task)
-        task.add_done_callback(self._on_task_done)
-        return task
+    # --- Synchronous thread helpers ---
+    def clear(self) -> None:
+        self._threads = []
 
-    def _on_task_done(self, task):
-        self._tasks.remove(task)
-        if not self._tasks:
-            self._event.set()
+    def add_thread(self, thread: threading.Thread) -> None:
+        self._threads.append(thread)
 
-    async def wait_for_completion(self):
-        while self._tasks:
-            await self._event.wait()
-            self._event.clear()
+    def join_all(self) -> None:
+        for t in self._threads:
+            t.join()

@@ -5,7 +5,6 @@ This software is licensed under the terms of the Revised BSD License.
 See LICENSE for details.
 """
 
-import asyncio
 import threading
 from typing import cast, Tuple, Optional
 from enum import Enum, auto
@@ -63,13 +62,14 @@ class SwitchConnectionClient(RunnableComponent):
         self._injected_error = None
         self._retry = retry
         self._stop_signal = False
-        self._loop: asyncio.AbstractEventLoop | None = None
+        self._loop = None
         self._worker_thread: threading.Thread | None = None
         self._worker_stop = threading.Event()
 
-    async def _connect(self) -> Tuple[ShmStreamReader, StreamWriterLike]:
+    def _connect_sync(self) -> Tuple[ShmStreamReader, StreamWriterLike]:
         # Connect using selected transport with async retry for server readiness
-        retry_deadline = asyncio.get_running_loop().time() + 2.0
+        import time
+        retry_deadline = time.monotonic() + 2.0
         last_error = None
         transport = "shm"
         while True:
@@ -83,9 +83,9 @@ class SwitchConnectionClient(RunnableComponent):
                 return (reader, writer)
             except Exception as e:
                 last_error = e
-                if asyncio.get_running_loop().time() >= retry_deadline:
+                if time.monotonic() >= retry_deadline:
                     raise e
-                await asyncio.sleep(0.01)
+                time.sleep(0.01)
 
     def inject_error(self, injected_error: INJECTED_ERRORS):
         self._injected_error = injected_error
@@ -100,9 +100,7 @@ class SwitchConnectionClient(RunnableComponent):
         self._port = port
 
     def _client_worker(self) -> None:
-        assert self._loop is not None
-        # Run connect in the event loop to reuse its retry/sleep logic
-        reader, writer = asyncio.run_coroutine_threadsafe(self._connect(), self._loop).result()
+        reader, writer = self._connect_sync()
         logger.info(self._create_message("Client connected"))
         # Sideband handshake (blocking read/write in this thread)
         logger.info(self._create_message("Sending CONNECTION_REQUEST"))
@@ -134,18 +132,11 @@ class SwitchConnectionClient(RunnableComponent):
         logger.info(self._create_message("Starting client PacketProcessor"))
 
         # Start processor in loop and wait until ready
-        def _start_pp() -> None:
-            asyncio.create_task(self._packet_processor.run())
-
-        self._loop.call_soon_threadsafe(_start_pp)
-        asyncio.run_coroutine_threadsafe(
-            self._packet_processor.wait_for_ready(), self._loop
-        ).result()
+        self._packet_processor.start_wait_ready()
         logger.info(self._create_message("Client PacketProcessor RUNNING"))
         logger.info(self._create_message("SwitchConnectionClient READY"))
 
-    async def _run(self):
-        self._loop = asyncio.get_running_loop()
+    def _run(self):
         self._worker_stop.clear()
         self._worker_thread = threading.Thread(
             target=self._client_worker,
@@ -153,20 +144,16 @@ class SwitchConnectionClient(RunnableComponent):
             daemon=True,
         )
         self._worker_thread.start()
-        await self._change_status_to_running()
-        # Keep alive until stop
-        stopper = asyncio.Event()
-        try:
-            await stopper.wait()
-        except asyncio.CancelledError:
-            pass
+        self._change_status_to_running()
+        # Block until worker stops
+        self._worker_thread.join()
 
-    async def _stop(self):
+    def _stop(self):
         self._stop_signal = True
         self._worker_stop.set()
         try:
             if self._packet_processor is not None:
-                await self._packet_processor.stop()
+                self._packet_processor.stop_sync()
         except Exception:
             pass
         if self._worker_thread is not None:

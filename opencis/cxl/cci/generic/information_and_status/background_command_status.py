@@ -117,8 +117,8 @@ class BackgroundOperationStatusCommand(CciForegroundCommand):
         super().__init__(self.OPCODE, label=label)
         self._mctp_cci_executor = mctp_cci_executor
 
-    async def _execute(self, _: CciRequest) -> CciResponse:
-        status = await self._mctp_cci_executor.get_background_command_status()
+    def _execute(self, _: CciRequest) -> CciResponse:
+        status = self._mctp_cci_executor.get_background_command_status()
 
         payload = BackgroundOperationStatusResponsePayload(
             background_operation_status=BackgroundOperationStatusField(

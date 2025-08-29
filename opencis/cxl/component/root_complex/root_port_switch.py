@@ -6,7 +6,6 @@ See LICENSE for details.
 """
 
 from abc import ABC, abstractmethod
-import asyncio
 from dataclasses import dataclass, field
 from typing import List
 from enum import Enum, auto
@@ -62,34 +61,25 @@ class CxlRootPort(RunnableComponent):
             lambda _: f"{self.get_message_label()}:FifoRelay:CXL.cache",
         )
 
-    async def _run(self):
-        run_tasks = [
-            asyncio.create_task(self._cxl_io_cfg_processor.run()),
-            asyncio.create_task(self._cxl_io_mmio_processor.run()),
-            asyncio.create_task(self._cxl_mem_processor.run()),
-            asyncio.create_task(self._cxl_cache_processor.run()),
-        ]
-        wait_tasks = [
-            asyncio.create_task(self._cxl_io_cfg_processor.wait_for_ready()),
-            asyncio.create_task(self._cxl_io_mmio_processor.wait_for_ready()),
-            asyncio.create_task(self._cxl_mem_processor.wait_for_ready()),
-            asyncio.create_task(self._cxl_cache_processor.wait_for_ready()),
-        ]
-        await asyncio.gather(*wait_tasks)
-        await self._change_status_to_running()
+    def _run(self):
+        self._cxl_io_cfg_processor.start_wait_ready()
+        self._cxl_io_mmio_processor.start_wait_ready()
+        self._cxl_mem_processor.start_wait_ready()
+        self._cxl_cache_processor.start_wait_ready()
+        self._change_status_to_running()
         from opencis.util.logger import logger
 
         logger.info(self._create_message("RootPort FIFO relays RUNNING"))
-        await asyncio.gather(*run_tasks)
+        self._cxl_io_cfg_processor.join()
+        self._cxl_io_mmio_processor.join()
+        self._cxl_mem_processor.join()
+        self._cxl_cache_processor.join()
 
-    async def _stop(self):
-        tasks = [
-            asyncio.create_task(self._cxl_io_cfg_processor.stop()),
-            asyncio.create_task(self._cxl_io_mmio_processor.stop()),
-            asyncio.create_task(self._cxl_mem_processor.stop()),
-            asyncio.create_task(self._cxl_cache_processor.stop()),
-        ]
-        await asyncio.gather(*tasks)
+    def _stop(self):
+        self._cxl_io_cfg_processor.stop_sync()
+        self._cxl_io_mmio_processor.stop_sync()
+        self._cxl_mem_processor.stop_sync()
+        self._cxl_cache_processor.stop_sync()
 
 
 @dataclass
@@ -130,19 +120,10 @@ class SimpleRootPortSwitch(RootPortSwitchBase):
     def get_root_bus(self) -> int:
         return self._root_bus_num
 
-    async def _run(self):
-        start_tasks = [
-            asyncio.create_task(self._root_port_device_client.run()),
-        ]
-        wait_tasks = [
-            asyncio.create_task(self._root_port_device_client.wait_for_ready()),
-        ]
-        await asyncio.gather(*wait_tasks)
-        await self._change_status_to_running()
-        await asyncio.gather(*start_tasks)
+    def _run(self):
+        self._root_port_device_client.start_wait_ready()
+        self._change_status_to_running()
+        self._root_port_device_client.join()
 
-    async def _stop(self):
-        tasks = [
-            asyncio.create_task(self._root_port_device_client.stop()),
-        ]
-        await asyncio.gather(*tasks)
+    def _stop(self):
+        self._root_port_device_client.stop_sync()

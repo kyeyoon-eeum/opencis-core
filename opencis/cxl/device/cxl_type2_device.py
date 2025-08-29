@@ -6,7 +6,6 @@ See LICENSE for details.
 """
 
 # pylint: disable=duplicate-code
-from asyncio import create_task, gather
 from dataclasses import dataclass
 from typing import Optional
 from opencis.cxl.component.cxl_cache_dcoh import CxlCacheDcoh
@@ -131,11 +130,11 @@ class CxlType2Device(RunnableComponent):
         # )
         # self._device_simple_processor = DeviceLlcIoGen(device_processor_config)
 
-    async def read_mmio(self, addr: int, size: int, bar: int = 0):
-        return await self._mmio_manager.read_mmio(addr, size, bar)
+    def read_mmio(self, addr: int, size: int, bar: int = 0):
+        return self._mmio_manager.read_mmio(addr, size, bar)
 
-    async def write_mmio(self, addr: int, size: int, data: int, bar: int = 0):
-        await self._mmio_manager.write_mmio(addr, size, data, bar)
+    def write_mmio(self, addr: int, size: int, data: int, bar: int = 0):
+        self._mmio_manager.write_mmio(addr, size, data, bar)
 
     def _init_device(
         self,
@@ -221,43 +220,42 @@ class CxlType2Device(RunnableComponent):
         return self._cxl_io_manager.get_cfg_reg_vals()
 
     # TODO: change to match more efficient/accurate versions in cxl_type1_device.py
-    async def cxl_cache_readline(self, hpa: int) -> Optional[int]:
+    def cxl_cache_readline(self, hpa: int) -> Optional[int]:
         raise NotImplementedError()
 
-    async def cxl_cache_writeline(self, hpa: int, data: int):
+    def cxl_cache_writeline(self, hpa: int, data: int):
         raise NotImplementedError()
 
-    async def read_mem_dpa(self, dpa: int, size: int = 64) -> int:
+    def read_mem_dpa(self, dpa: int, size: int = 64) -> int:
         if not self._cxl_memory_device_component:
             raise RuntimeError(self._create_message("Memory device not yet initialized"))
-        return await self._cache_controller.cache_coherent_load(dpa, size)
+        return self._cache_controller.cache_coherent_load(dpa, size)
 
-    async def write_mem_dpa(self, dpa: int, data: int, size: int = 64):
+    def write_mem_dpa(self, dpa: int, data: int, size: int = 64):
         if not self._cxl_memory_device_component:
             raise RuntimeError(self._create_message("Memory device not yet initialized"))
-        await self._cache_controller.cache_coherent_store(dpa, size, data)
+        self._cache_controller.cache_coherent_store(dpa, size, data)
 
-    async def _run(self):
-        # pylint: disable=duplicate-code
-        run_tasks = [
-            create_task(self._cxl_io_manager.run()),
-            create_task(self._cxl_mem_dcoh.run()),
-            create_task(self._cache_controller.run()),
-        ]
-        wait_tasks = [
-            create_task(self._cxl_io_manager.wait_for_ready()),
-            create_task(self._cxl_mem_dcoh.wait_for_ready()),
-            create_task(self._cache_controller.wait_for_ready()),
-        ]
-        await gather(*wait_tasks)
-        await self._change_status_to_running()
-        await gather(*run_tasks)
+    def _run(self):
+        # Start components synchronously
+        self._cxl_io_manager.start_wait_ready()
+        self._cxl_mem_dcoh.start_wait_ready()
+        self._cache_controller.start_wait_ready()
+        self._change_status_to_running()
+        self._cxl_io_manager.join()
+        self._cxl_mem_dcoh.join()
+        self._cache_controller.join()
 
-    async def _stop(self):
-        # pylint: disable=duplicate-code
-        tasks = [
-            create_task(self._cxl_io_manager.stop()),
-            create_task(self._cxl_mem_dcoh.stop()),
-            create_task(self._cache_controller.stop()),
-        ]
-        await gather(*tasks)
+    def _stop(self):
+        try:
+            self._cxl_io_manager.stop_sync()
+        except Exception:
+            pass
+        try:
+            self._cxl_mem_dcoh.stop_sync()
+        except Exception:
+            pass
+        try:
+            self._cache_controller.stop_sync()
+        except Exception:
+            pass

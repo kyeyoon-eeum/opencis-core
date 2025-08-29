@@ -6,8 +6,8 @@ See LICENSE for details.
 """
 
 from abc import abstractmethod
-from asyncio import Condition, create_task
 from enum import Enum, auto
+import threading
 import traceback
 from typing import Optional, Union, Callable, TypeAlias
 
@@ -35,149 +35,78 @@ class LabeledComponent:
             return f"{class_name}:{self._label}"
         return class_name
 
-    def _create_message(self, message):
+    def _create_message(self, message: str) -> str:
         return f"[{self.get_message_label()}] {message}"
 
 
 class RunnableComponent(LabeledComponent):
     def __init__(self, label: Optional[Label] = None):
         super().__init__(label)
-        self._condition = Condition()
+        self._condition = threading.Condition()
         self._status = COMPONENT_STATUS.STOPPED
-        self._ready_waited = True  # Changed to False upon run()
+        self._thread: Optional[threading.Thread] = None
+        self._running_event = threading.Event()
 
-    async def run(self):
-        stop_when_exception_occurred = True
-        try:
-            await self._condition.acquire()
+    def start_wait_ready(self) -> None:
+        with self._condition:
             if self._status != COMPONENT_STATUS.STOPPED:
-                self._condition.release()
-                message = "Cannot run when it is not stopped"
-                logger.warning(self._create_message(message))
-                stop_when_exception_occurred = False
-                raise Exception(message)
-
+                logger.warning(self._create_message("Cannot start when not STOPPED"))
+                return
             self._status = COMPONENT_STATUS.STARTING
             logger.debug(self._create_message("Starting"))
             logger.info(self._create_message("Lifecycle: STARTING"))
-            self._condition.notify_all()
-            self._condition.release()
 
-            self._ready_waited = False
-            await self._run()
+        def _thread_target():
+            try:
+                self._run()
+            except Exception as e:  # pragma: no cover
+                logger.error(self._create_message(f"Unexpected Exception: {str(e)}"))
+                logger.error(traceback.format_exc())
+                with self._condition:
+                    self._status = COMPONENT_STATUS.STOPPED
+                    self._condition.notify_all()
 
-            logger.debug(self._create_message("Stopped"))
-            logger.info(self._create_message("Lifecycle: STOPPED"))
-            await self._condition.acquire()
-            self._status = COMPONENT_STATUS.STOPPED
-            self._condition.notify_all()
-            self._condition.release()
-        except Exception as e:
-            if stop_when_exception_occurred:
-                self._status = COMPONENT_STATUS.STOPPED
-            logger.error(self._create_message(f"Unexpected Exception: {str(e)}"))
-            logger.error(traceback.format_exc())
-            raise e
+        self._thread = threading.Thread(
+            target=_thread_target, name=self.get_message_label(), daemon=True
+        )
+        self._thread.start()
+        self.wait_for_ready()
 
-    async def run_wait_ready(self):
-        task = create_task(self.run())
-        await self.wait_for_ready()
-        return task
-
-    async def stop(self):
-        # During signal-based shutdown, components may be interrupted before wait_for_ready()
-        # is called. In this case, we should allow graceful shutdown without requiring
-        # wait_for_ready() to have been called first.
-        await self._condition.acquire()
-
-        # If component was never properly started (due to signal interruption),
-        # just return gracefully
-        if not self._ready_waited and self._status == COMPONENT_STATUS.STOPPED:
-            self._condition.release()
-            logger.debug(self._create_message("Component already stopped, skipping stop()"))
-            return
-
-        # If component is starting but was interrupted, allow stop without wait_for_ready()
-        if not self._ready_waited and self._status == COMPONENT_STATUS.STARTING:
-            logger.debug(
-                self._create_message("Stopping component that was interrupted during startup")
-            )
-            self._status = COMPONENT_STATUS.STOPPED
-            self._condition.notify_all()
-            self._condition.release()
-            return
-
-        # If component is stopping, allow graceful return without wait_for_ready()
-        if not self._ready_waited and self._status == COMPONENT_STATUS.STOPPING:
-            logger.debug(
-                self._create_message(
-                    "Component already stopping, allowing without wait_for_ready()"
-                )
-            )
-            self._condition.release()
-            return
-
-        # During signal interruption, components might reach RUNNING state before wait_for_ready()
-        # In this case, allow stop() but log it as a debug message
-        if not self._ready_waited and self._status == COMPONENT_STATUS.RUNNING:
-            logger.debug(
-                self._create_message(
-                    "Stopping RUNNING component without wait_for_ready() - signal interruption"
-                )
-            )
-            # Proceed with normal stop process
+    def stop_sync(self, timeout: float | None = None) -> None:
+        with self._condition:
+            if self._status not in (COMPONENT_STATUS.RUNNING, COMPONENT_STATUS.STARTING):
+                return
+            logger.debug(self._create_message("Stopping"))
             self._status = COMPONENT_STATUS.STOPPING
-            self._condition.release()
-            await self._stop()
-            await self._condition.acquire()
-            while self._status != COMPONENT_STATUS.STOPPED:
-                await self._condition.wait()
-            self._condition.release()
-            return
+        try:
+            self._stop()
+        finally:
+            with self._condition:
+                self._status = COMPONENT_STATUS.STOPPED
+                self._condition.notify_all()
+        self.join(timeout)
 
-        # For running components, require wait_for_ready() to have been called
-        if not self._ready_waited:
-            self._condition.release()
-            raise Exception("wait_for_ready() was not called after run()")
+    def join(self, timeout: float | None = None) -> None:
+        if self._thread is not None:
+            self._thread.join(timeout=timeout)
 
-        if self._status != COMPONENT_STATUS.RUNNING:
-            self._condition.release()
-            message = "Cannot stop when it is not running"
-            logger.warning(self._create_message(message))
-            return
-
-        logger.debug(self._create_message("Stopping"))
-        self._status = COMPONENT_STATUS.STOPPING
-        self._condition.release()
-
-        await self._stop()
-
-        await self._condition.acquire()
-        while self._status != COMPONENT_STATUS.STOPPED:
-            await self._condition.wait()
-        self._condition.release()
+    def wait_for_ready(self) -> None:
+        with self._condition:
+            logger.info(self._create_message("wait_for_ready(): waiting for RUNNING"))
+            while self._status != COMPONENT_STATUS.RUNNING:
+                self._condition.wait(timeout=0.1)
+            logger.info(self._create_message("wait_for_ready(): READY"))
 
     @abstractmethod
-    async def _run(self):
+    def _run(self) -> None:
         """must be implemented by a child class"""
 
-    async def _change_status_to_running(self):
-        await self._condition.acquire()
-        self._status = COMPONENT_STATUS.RUNNING
-        self._condition.notify_all()
-        self._condition.release()
+    def _change_status_to_running(self) -> None:
+        with self._condition:
+            self._status = COMPONENT_STATUS.RUNNING
+            self._condition.notify_all()
         logger.info(self._create_message("Lifecycle: RUNNING"))
 
     @abstractmethod
-    async def _stop(self):
+    def _stop(self) -> None:
         """must be implemented by a child class"""
-
-    async def wait_for_ready(self):
-        await self._condition.acquire()
-        logger.info(self._create_message("wait_for_ready(): waiting for RUNNING"))
-        while self._status != COMPONENT_STATUS.RUNNING:
-            logger.debug(self._create_message("Not running yet. Waiting"))
-            await self._condition.wait()
-        self._condition.release()
-        self._ready_waited = True
-        logger.info(self._create_message("wait_for_ready(): READY"))

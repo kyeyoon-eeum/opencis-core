@@ -7,10 +7,8 @@ See LICENSE for details.
 
 from dataclasses import dataclass
 from typing import cast
-import asyncio
 import threading
-from opencis.util.async_queue import AsyncQueue as Queue
-from asyncio import create_task, gather
+from queue import Queue
 
 from opencis.util.logger import logger
 from opencis.util.component import RunnableComponent
@@ -57,41 +55,38 @@ class PpbDownRouting(RunnableComponent):
         self,
         source: Queue,
         destination: Queue,
-        loop: asyncio.AbstractEventLoop,
         stop_evt: threading.Event,
     ):
         while not stop_evt.is_set():
-            packet = asyncio.run_coroutine_threadsafe(source.get(), loop).result()
+            packet = source.get()
             if packet is None:
                 break
             packet = cast(CxlIoBasePacket, packet)
             packet.tlp_prefix.ld_id = self._ld_id
-            asyncio.run_coroutine_threadsafe(destination.put(packet), loop).result()
+            destination.put(packet)
 
     def _mmio_worker(
         self,
         source: Queue,
         destination: Queue,
-        loop: asyncio.AbstractEventLoop,
         stop_evt: threading.Event,
     ):
         while not stop_evt.is_set():
-            packet = asyncio.run_coroutine_threadsafe(source.get(), loop).result()
+            packet = source.get()
             if packet is None:
                 break
             packet = cast(CxlIoBasePacket, packet)
             packet.tlp_prefix.ld_id = self._ld_id
-            asyncio.run_coroutine_threadsafe(destination.put(packet), loop).result()
+            destination.put(packet)
 
     def _mem_worker(
         self,
         source: Queue,
         destination: Queue,
-        loop: asyncio.AbstractEventLoop,
         stop_evt: threading.Event,
     ):
         while not stop_evt.is_set():
-            packet = asyncio.run_coroutine_threadsafe(source.get(), loop).result()
+            packet = source.get()
             if packet is None:
                 break
             packet = cast(CxlMemBasePacket, packet)
@@ -103,65 +98,61 @@ class PpbDownRouting(RunnableComponent):
                 pass
             else:
                 logger.warning(self._create_message("Unexpected CXL.mem packet"))
-            asyncio.run_coroutine_threadsafe(destination.put(packet), loop).result()
+            destination.put(packet)
 
     def _cache_worker(
         self,
         source: Queue,
         destination: Queue,
-        loop: asyncio.AbstractEventLoop,
         stop_evt: threading.Event,
     ):
         while not stop_evt.is_set():
-            packet = asyncio.run_coroutine_threadsafe(source.get(), loop).result()
+            packet = source.get()
             if packet is None:
                 break
-            asyncio.run_coroutine_threadsafe(destination.put(packet), loop).result()
+            destination.put(packet)
 
-    async def _run(self):
-        loop = asyncio.get_running_loop()
+    def _run(self):
         stop_evt = threading.Event()
         self._stop_evt = stop_evt
         self._threads = [
             threading.Thread(
                 target=self._cfg_worker,
-                args=(self._pairs[0].source, self._pairs[0].destination, loop, stop_evt),
+                args=(self._pairs[0].source, self._pairs[0].destination, stop_evt),
                 name=f"{self.__class__.__name__}-cfg",
                 daemon=True,
             ),
             threading.Thread(
                 target=self._mmio_worker,
-                args=(self._pairs[1].source, self._pairs[1].destination, loop, stop_evt),
+                args=(self._pairs[1].source, self._pairs[1].destination, stop_evt),
                 name=f"{self.__class__.__name__}-mmio",
                 daemon=True,
             ),
             threading.Thread(
                 target=self._mem_worker,
-                args=(self._pairs[2].source, self._pairs[2].destination, loop, stop_evt),
+                args=(self._pairs[2].source, self._pairs[2].destination, stop_evt),
                 name=f"{self.__class__.__name__}-mem",
                 daemon=True,
             ),
             threading.Thread(
                 target=self._cache_worker,
-                args=(self._pairs[3].source, self._pairs[3].destination, loop, stop_evt),
+                args=(self._pairs[3].source, self._pairs[3].destination, stop_evt),
                 name=f"{self.__class__.__name__}-cache",
                 daemon=True,
             ),
         ]
         for t in self._threads:
             t.start()
-        self._keepalive_evt = asyncio.Event()
-        await self._change_status_to_running()
-        await self._keepalive_evt.wait()
+        self._change_status_to_running()
+        # Block until stop
+        self._running_event.wait()
 
-    async def _stop(self):
+    def _stop(self):
         self._stop_evt.set()
         for pair in self._pairs:
-            await pair.source.put(None)
+            pair.source.put(None)
         for t in getattr(self, "_threads", []):
             t.join(timeout=2)
-        if hasattr(self, "_keepalive_evt"):
-            self._keepalive_evt.set()
 
 
 class PpbUpRouting(RunnableComponent):
@@ -181,34 +172,30 @@ class PpbUpRouting(RunnableComponent):
             self._dsc.cxl_cache_fifo.target_to_host,
         ]
 
-    def _cfg_worker(self, loop: asyncio.AbstractEventLoop, stop_evt: threading.Event):
+    def _cfg_worker(self, stop_evt: threading.Event):
         source = self._dsc.cfg_fifo.target_to_host
         while not stop_evt.is_set():
-            packet = asyncio.run_coroutine_threadsafe(source.get(), loop).result()
+            packet = source.get()
             if packet is None:
                 break
             cxl_io_packet = cast(CxlIoBasePacket, packet)
             ld_id = cxl_io_packet.tlp_prefix.ld_id
-            asyncio.run_coroutine_threadsafe(
-                self._usc[ld_id].cfg_fifo.target_to_host.put(packet), loop
-            ).result()
+            self._usc[ld_id].cfg_fifo.target_to_host.put(packet)
 
-    def _mmio_worker(self, loop: asyncio.AbstractEventLoop, stop_evt: threading.Event):
+    def _mmio_worker(self, stop_evt: threading.Event):
         source = self._dsc.mmio_fifo.target_to_host
         while not stop_evt.is_set():
-            packet = asyncio.run_coroutine_threadsafe(source.get(), loop).result()
+            packet = source.get()
             if packet is None:
                 break
             cxl_io_packet = cast(CxlIoBasePacket, packet)
             ld_id = cxl_io_packet.tlp_prefix.ld_id
-            asyncio.run_coroutine_threadsafe(
-                self._usc[ld_id].mmio_fifo.target_to_host.put(packet), loop
-            ).result()
+            self._usc[ld_id].mmio_fifo.target_to_host.put(packet)
 
-    def _mem_worker(self, loop: asyncio.AbstractEventLoop, stop_evt: threading.Event):
+    def _mem_worker(self, stop_evt: threading.Event):
         source = self._dsc.cxl_mem_fifo.target_to_host
         while not stop_evt.is_set():
-            packet = asyncio.run_coroutine_threadsafe(source.get(), loop).result()
+            packet = source.get()
             if packet is None:
                 break
             cxl_mem_base_packet = cast(CxlMemBasePacket, packet)
@@ -223,64 +210,57 @@ class PpbUpRouting(RunnableComponent):
                 ld_id = 0
             else:
                 raise Exception("No packet type!!!!")
-            asyncio.run_coroutine_threadsafe(
-                self._usc[ld_id].cxl_mem_fifo.target_to_host.put(packet), loop
-            ).result()
+            self._usc[ld_id].cxl_mem_fifo.target_to_host.put(packet)
 
-    def _cache_worker(self, loop: asyncio.AbstractEventLoop, stop_evt: threading.Event):
+    def _cache_worker(self, stop_evt: threading.Event):
         source = self._dsc.cxl_cache_fifo.target_to_host
         while not stop_evt.is_set():
-            packet = asyncio.run_coroutine_threadsafe(source.get(), loop).result()
+            packet = source.get()
             if packet is None:
                 break
-            asyncio.run_coroutine_threadsafe(
-                self._usc[0].cxl_cache_fifo.target_to_host.put(packet), loop
-            ).result()
+            self._usc[0].cxl_cache_fifo.target_to_host.put(packet)
 
-    async def _run(self):
-        loop = asyncio.get_running_loop()
+    def _run(self):
         stop_evt = threading.Event()
         self._stop_evt = stop_evt
         self._threads = [
             threading.Thread(
                 target=self._cfg_worker,
-                args=(loop, stop_evt),
+                args=(stop_evt,),
                 name=f"{self.__class__.__name__}-cfg",
                 daemon=True,
             ),
             threading.Thread(
                 target=self._mmio_worker,
-                args=(loop, stop_evt),
+                args=(stop_evt,),
                 name=f"{self.__class__.__name__}-mmio",
                 daemon=True,
             ),
             threading.Thread(
                 target=self._mem_worker,
-                args=(loop, stop_evt),
+                args=(stop_evt,),
                 name=f"{self.__class__.__name__}-mem",
                 daemon=True,
             ),
             threading.Thread(
                 target=self._cache_worker,
-                args=(loop, stop_evt),
+                args=(stop_evt,),
                 name=f"{self.__class__.__name__}-cache",
                 daemon=True,
             ),
         ]
         for t in self._threads:
             t.start()
-        self._keepalive_evt = asyncio.Event()
-        await self._change_status_to_running()
-        await self._keepalive_evt.wait()
+        self._change_status_to_running()
+        # Block until stop
+        self._running_event.wait()
 
-    async def _stop(self):
+    def _stop(self):
         self._stop_evt.set()
         for source in self._sources:
-            await source.put(None)
+            source.put(None)
         for t in getattr(self, "_threads", []):
             t.join(timeout=2)
-        if hasattr(self, "_keepalive_evt"):
-            self._keepalive_evt.set()
 
 
 @dataclass
@@ -319,41 +299,41 @@ class PpbDevice(RunnableComponent):
     def get_downstream_connection(self) -> CxlConnection:
         return self._downstream_connection
 
-    async def bind(self, ld_id: int):
+    def bind(self, ld_id: int):
         self._upstream_connections[ld_id] = CxlConnection()
         self._down_routings[ld_id] = PpbDownRouting(
             self._downstream_connection, self._upstream_connections[ld_id], ld_id
         )
-        self._routing_tasks.add_task(self._down_routings[ld_id].run())
-        await self._down_routings[ld_id].wait_for_ready()
+        self._down_routings[ld_id].start_wait_ready()
 
-    async def unbind(self, ld_id: int):
+    def unbind(self, ld_id: int):
         self._upstream_connections.pop(ld_id)
         task = self._down_routings.pop(ld_id)
-        await task.stop()
+        task.stop_sync()
 
-    async def freeze(self, ld_id: int):
+    def freeze(self, ld_id: int):
         task = self._down_routings[ld_id]
-        await task.stop()
+        task.stop_sync()
 
-    async def unfreeze(self, ld_id: int):
+    def unfreeze(self, ld_id: int):
         task = self._down_routings[ld_id]
-        await task.run_wait_ready()
+        task.start_wait_ready()
 
-    async def _run(self):
+    def _run(self):
         logger.info(self._create_message("Starting"))
-        self._routing_tasks.add_task(self._up_routing.run())
-        await self._up_routing.wait_for_ready()
-
-        await self._change_status_to_running()
-        await self._routing_tasks.wait_for_completion()
+        self._up_routing.start_wait_ready()
+        self._change_status_to_running()
+        self._up_routing.join()
         logger.info(self._create_message("Stopped"))
 
-    async def _stop(self):
+    def _stop(self):
         logger.info(self._create_message("Stopping"))
-        tasks = [
-            create_task(self._up_routing.stop()),
-        ]
+        try:
+            self._up_routing.stop_sync()
+        except Exception:
+            pass
         for task in self._down_routings.values():
-            tasks.append(create_task(task.stop()))
-        await gather(*tasks)
+            try:
+                task.stop_sync()
+            except Exception:
+                pass

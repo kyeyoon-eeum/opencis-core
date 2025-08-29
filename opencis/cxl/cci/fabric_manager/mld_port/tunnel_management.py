@@ -37,19 +37,19 @@ class TunnelManagementCommand(CciForegroundCommand):
         self._cxl_type3_devices = cxl_type3_devices
         self._cxl_connections = cxl_connections
 
-    async def _execute(self, request: CciRequest) -> CciResponse:
+    def _execute(self, request: CciRequest) -> CciResponse:
         request_payload = self.parse_request_payload(request.payload)
         port_or_ld_id = request_payload.port_or_ld_id
 
         real_payload = request_payload.command_payload
         connection = self._cxl_connections[port_or_ld_id]
 
-        await connection.cci_fifo.host_to_target.put(cast(CciMessagePacket, real_payload))
+        connection.cci_fifo.host_to_target.put(cast(CciMessagePacket, real_payload))
 
-        dev_response: CciMessagePacket = await connection.cci_fifo.target_to_host.get()
+        dev_response: CciMessagePacket = connection.cci_fifo.target_to_host.get()
 
         payload = TunnelManagementResponsePayload(
-            dev_response.get_size(), payload=bytes(CciMessagePacket)
+            dev_response.get_size(), payload=bytes(dev_response)
         )
 
         return CciResponse(payload=payload)

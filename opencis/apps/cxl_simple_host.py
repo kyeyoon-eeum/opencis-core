@@ -5,7 +5,7 @@ This software is licensed under the terms of the Revised BSD License.
 See LICENSE for details.
 """
 
-import asyncio
+import threading
 
 from opencis.cxl.transport.packet_constants import CXL_MEM_M2SBIRSP_OPCODE
 from opencis.util.logger import logger
@@ -59,7 +59,7 @@ class CxlSimpleHost(RunnableComponent):
     def _is_valid_addr(self, addr: int) -> bool:
         return 0 <= addr <= self._root_port_device.get_used_hpa_size() and (addr % 0x40 == 0)
 
-    async def _cxl_mem_read(self, addr: int) -> Result:
+    def _cxl_mem_read(self, addr: int) -> Result:
         logger.info(self._create_message(f"CXL.mem Read: addr=0x{addr:x}"))
         if self._is_valid_addr(addr) is False:
             logger.error(
@@ -67,10 +67,10 @@ class CxlSimpleHost(RunnableComponent):
             )
             return Result(f"Invalid Params: 0x{addr:x} is not a valid address")
         op_addr = addr + self._root_port_device.get_hpa_base()
-        res = await self._root_port_device.cxl_mem_read(op_addr)
+        res = self._root_port_device.cxl_mem_read(op_addr)
         return Result(res)
 
-    async def _cxl_mem_write(self, addr: int, data: int) -> Result:
+    def _cxl_mem_write(self, addr: int, data: int) -> Result:
         logger.info(self._create_message(f"CXL.mem Write: addr=0x{addr:x} data=0x{data:x}"))
         if self._is_valid_addr(addr) is False:
             logger.error(
@@ -78,34 +78,30 @@ class CxlSimpleHost(RunnableComponent):
             )
             return Result(f"Invalid Params: 0x{addr:x} is not a valid address")
         op_addr = addr + self._root_port_device.get_hpa_base()
-        res = await self._root_port_device.cxl_mem_write(op_addr, data)
+        res = self._root_port_device.cxl_mem_write(op_addr, data)
         return Result(res)
 
-    async def _cxl_mem_birsp(
+    def _cxl_mem_birsp(
         self, opcode: CXL_MEM_M2SBIRSP_OPCODE, bi_id: int = 0, bi_tag: int = 0
     ) -> Result:
         logger.info(self._create_message(f"CXL.mem BI-RSP: opcode=0x{opcode:x}"))
-        res = await self._root_port_device.cxl_mem_birsp(opcode, bi_id, bi_tag)
+        res = self._root_port_device.cxl_mem_birsp(opcode, bi_id, bi_tag)
         return Result(res)
 
-    async def _run(self):
-        tasks = [
-            asyncio.create_task(self._sw_conn_client.run()),
-            asyncio.create_task(self._root_port_device.run()),
-        ]
+    def _run(self):
+        self._sw_conn_client.start_wait_ready()
+        self._root_port_device.start_wait_ready()
         if self._hm_mode:
-            tasks.append(asyncio.create_task(self._host_mgr_conn_client.run()))
-            await self._host_mgr_conn_client.wait_for_ready()
-        await self._sw_conn_client.wait_for_ready()
-        await self._root_port_device.wait_for_ready()
-        await self._change_status_to_running()
-        await asyncio.gather(*tasks)
+            self._host_mgr_conn_client.start_wait_ready()
+        self._change_status_to_running()
+        # Block until children stop
+        self._sw_conn_client.join()
+        self._root_port_device.join()
+        if self._hm_mode:
+            self._host_mgr_conn_client.join()
 
-    async def _stop(self):
-        tasks = [
-            asyncio.create_task(self._sw_conn_client.stop()),
-            asyncio.create_task(self._root_port_device.stop()),
-        ]
+    def _stop(self):
+        self._sw_conn_client.stop_sync()
+        self._root_port_device.stop_sync()
         if self._hm_mode:
-            tasks.append(asyncio.create_task(self._host_mgr_conn_client.stop()))
-        await asyncio.gather(*tasks)
+            self._host_mgr_conn_client.stop_sync()

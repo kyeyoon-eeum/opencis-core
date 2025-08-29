@@ -6,11 +6,9 @@ See LICENSE for details.
 """
 
 from abc import abstractmethod
-from asyncio import gather, create_task
 from typing import List, Optional, cast
 
 from opencis.util.logger import logger
-import asyncio
 import threading
 from opencis.util.component import RunnableComponent
 from opencis.util.pci import bdf_to_string
@@ -66,31 +64,40 @@ class CxlRouter(RunnableComponent):
         return message
 
     @abstractmethod
-    async def _process_host_to_target_packets(self):
+    def _process_host_to_target_packets(self):
         pass
 
     @abstractmethod
-    async def _process_target_to_host_packets(self, downstream_connection_bind_slot: BindSlot):
+    def _process_target_to_host_packets(self, downstream_connection_bind_slot: BindSlot):
         pass
 
-    async def _run(self):
+    def _run(self):
         self._is_running = True
-        self._routing_tasks.add_task(self._process_host_to_target_packets())
+        # Start workers in threads
+        host_thread = threading.Thread(
+            target=self._process_host_to_target_packets, name=f"{self.get_message_label()}-h2t"
+        )
+        host_thread.start()
+        self._routing_tasks.add_thread(host_thread)
         for downstream_connection_bind_slot in self._downstream_connections:
-            self._routing_tasks.add_task(
-                self._process_target_to_host_packets(downstream_connection_bind_slot)
+            t = threading.Thread(
+                target=self._process_target_to_host_packets,
+                args=(downstream_connection_bind_slot,),
+                name=f"{self.get_message_label()}-t2h",
             )
-        await self._change_status_to_running()
-        await self._routing_tasks.wait_for_completion()
+            t.start()
+            self._routing_tasks.add_thread(t)
+        self._change_status_to_running()
+        self._routing_tasks.join_all()
 
-    async def _stop(self):
-        await self._upstream_connection_fifo.host_to_target.put(None)
+    def _stop(self):
+        self._upstream_connection_fifo.host_to_target.put(None)
         for downstream_connection_fifo in self._downstream_connection_fifos:
-            await downstream_connection_fifo.target_to_host.put(None)
+            downstream_connection_fifo.target_to_host.put(None)
 
-    async def stop_for_update(self, vppb_index: int):
+    def stop_for_update(self, vppb_index: int):
         if self._is_running:
-            await self._downstream_connection_fifos[vppb_index].target_to_host.put(None)
+            self._downstream_connection_fifos[vppb_index].target_to_host.put(None)
 
 
 class CxlIoRouter(RunnableComponent):
@@ -107,29 +114,20 @@ class CxlIoRouter(RunnableComponent):
         )
         self._mmio_router = MmioRouter(vcs_id, routing_table, upstream_vppb, port_binder)
 
-    async def update_router(self, vppb_index: int):
-        await self._config_space_router.update_router(vppb_index)
-        await self._mmio_router.update_router(vppb_index)
+    def update_router(self, vppb_index: int):
+        self._config_space_router.update_router(vppb_index)
+        self._mmio_router.update_router(vppb_index)
 
-    async def _run(self):
-        run_tasks = [
-            create_task(self._config_space_router.run()),
-            create_task(self._mmio_router.run()),
-        ]
-        wait_tasks = [
-            create_task(self._config_space_router.wait_for_ready()),
-            create_task(self._mmio_router.wait_for_ready()),
-        ]
-        await gather(*wait_tasks)
-        await self._change_status_to_running()
-        await gather(*run_tasks)
+    def _run(self):
+        self._config_space_router.start_wait_ready()
+        self._mmio_router.start_wait_ready()
+        self._change_status_to_running()
+        self._config_space_router.join()
+        self._mmio_router.join()
 
-    async def _stop(self):
-        stop_tasks = [
-            create_task(self._config_space_router.stop()),
-            create_task(self._mmio_router.stop()),
-        ]
-        await gather(*stop_tasks)
+    def _stop(self):
+        self._config_space_router.stop_sync()
+        self._mmio_router.stop_sync()
 
 
 class MmioRouter(CxlRouter):
@@ -152,9 +150,9 @@ class MmioRouter(CxlRouter):
                 bind_slot.vppb.get_upstream_connection().mmio_fifo
             )
 
-    async def _process_host_to_target_packets(self):
+    def _process_host_to_target_packets(self):
         while True:
-            packet = await self._upstream_connection_fifo.host_to_target.get()
+            packet = self._upstream_connection_fifo.host_to_target.get()
             if packet is None:
                 break
             logger.debug(self._create_message("Received an incoming request"))
@@ -172,7 +170,7 @@ class MmioRouter(CxlRouter):
             if target_port is None:
                 if mmio_packet.is_mem_read():
                     logger.debug(self._create_message(f"RD: 0x{address:x}[{size}] OOB"))
-                    await self._send_completion(req_id, tag, cpl_id=0, data=None)
+                    self._send_completion(req_id, tag, cpl_id=0, data=None)
                 elif mmio_packet.is_mem_write():
                     logger.debug(self._create_message(f"WR: 0x{address:x}[{size}] OOB"))
                 continue
@@ -191,32 +189,27 @@ class MmioRouter(CxlRouter):
                 )
                 continue
 
-            await vppb_downstream_connection.mmio_fifo.host_to_target.put(packet)
+            vppb_downstream_connection.mmio_fifo.host_to_target.put(packet)
 
-    async def _process_target_to_host_packets(self, downstream_connection_bind_slot: BindSlot):
+    def _process_target_to_host_packets(self, downstream_connection_bind_slot: BindSlot):
         # Unused in thread-based implementation
         raise NotImplementedError
 
     def _t2h_worker(
         self,
         downstream_connection_bind_slot: BindSlot,
-        loop: asyncio.AbstractEventLoop,
         stop_evt: threading.Event,
     ) -> None:
         downstream_connection_fifo = (
             downstream_connection_bind_slot.vppb.get_upstream_connection().mmio_fifo
         )
         while not stop_evt.is_set():
-            packet = asyncio.run_coroutine_threadsafe(
-                downstream_connection_fifo.target_to_host.get(), loop
-            ).result()
+            packet = downstream_connection_fifo.target_to_host.get()
             if packet is None:
                 break
-            asyncio.run_coroutine_threadsafe(
-                self._upstream_connection_fifo.target_to_host.put(packet), loop
-            ).result()
+            self._upstream_connection_fifo.target_to_host.put(packet)
 
-    async def _send_completion(
+    def _send_completion(
         self, req_id: int, tag: int, cpl_id: int, data: int = None, data_len: int = 0
     ):
         """
@@ -225,10 +218,10 @@ class MmioRouter(CxlRouter):
         packet = CxlIoCompletionPacket.create(
             req_id=req_id, tag=tag, cpl_id=cpl_id, data=data, length=data_len
         )
-        await self._upstream_connection_fifo.target_to_host.put(packet)
+        self._upstream_connection_fifo.target_to_host.put(packet)
 
-    async def update_router(self, vppb_index: int):
-        await self.stop_for_update(vppb_index)
+    def update_router(self, vppb_index: int):
+        self.stop_for_update(vppb_index)
         self._downstream_connections = self._port_binder.get_bind_slots()
         vppb_upstream_connection = self._downstream_connections[
             vppb_index
@@ -241,46 +234,46 @@ class MmioRouter(CxlRouter):
 
         if self._is_running:
             # Start a new worker thread for this port
-            loop = asyncio.get_running_loop()
             if not hasattr(self, "_t2h_stop"):
                 self._t2h_stop = threading.Event()
                 self._t2h_threads = []
             t = threading.Thread(
                 target=self._t2h_worker,
-                args=(self._downstream_connections[vppb_index], loop, self._t2h_stop),
+                args=(self._downstream_connections[vppb_index], self._t2h_stop),
                 name=f"MmioRouter-t2h-{vppb_index}",
                 daemon=True,
             )
             t.start()
             self._t2h_threads.append(t)
 
-    async def _run(self):
+    def _run(self):
         self._is_running = True
-        loop = asyncio.get_running_loop()
         self._t2h_stop = threading.Event()
         self._t2h_threads: list[threading.Thread] = []
-        # Start host->target coroutine
-        host_task = create_task(self._process_host_to_target_packets())
+        host_thread = threading.Thread(
+            target=self._process_host_to_target_packets, name="MmioRouter-h2t", daemon=True
+        )
+        host_thread.start()
         # Start T2H workers for each downstream
         for downstream_connection_bind_slot in self._downstream_connections:
             t = threading.Thread(
                 target=self._t2h_worker,
-                args=(downstream_connection_bind_slot, loop, self._t2h_stop),
+                args=(downstream_connection_bind_slot, self._t2h_stop),
                 name="MmioRouter-t2h",
                 daemon=True,
             )
             t.start()
             self._t2h_threads.append(t)
-        await self._change_status_to_running()
-        await host_task
+        self._change_status_to_running()
+        host_thread.join()
 
-    async def _stop(self):
+    def _stop(self):
         self._t2h_stop.set()
         for downstream_connection_fifo in self._downstream_connection_fifos:
-            await downstream_connection_fifo.target_to_host.put(None)
+            downstream_connection_fifo.target_to_host.put(None)
         for t in getattr(self, "_t2h_threads", []):
             t.join(timeout=1.0)
-        await self._upstream_connection_fifo.host_to_target.put(None)
+        self._upstream_connection_fifo.host_to_target.put(None)
 
 
 class ConfigSpaceRouter(CxlRouter):
@@ -302,9 +295,9 @@ class ConfigSpaceRouter(CxlRouter):
                 bind_slot.vppb.get_upstream_connection().cfg_fifo
             )
 
-    async def _process_host_to_target_packets(self):
+    def _process_host_to_target_packets(self):
         while True:
-            packet = await self._upstream_connection_fifo.host_to_target.get()
+            packet = self._upstream_connection_fifo.host_to_target.get()
             if packet is None:
                 break
             logger.debug(self._create_message("Received an incoming request"))
@@ -330,11 +323,11 @@ class ConfigSpaceRouter(CxlRouter):
                 logger.debug(
                     self._create_message(f"Request to {bdf_to_string(dest_id)} is not routable")
                 )
-                await self._send_unsupported_request(req_id, tag)
+                self._send_unsupported_request(req_id, tag)
                 continue
             if target_port >= len(self._downstream_connections):
                 logger.warning(self._create_message("target_port is out of bound"))
-                await self._send_unsupported_request(req_id, tag)
+                self._send_unsupported_request(req_id, tag)
                 continue
 
             logger.debug(self._create_message(f"Target port is {target_port}"))
@@ -344,43 +337,38 @@ class ConfigSpaceRouter(CxlRouter):
             ].vppb.get_upstream_connection()
             if vppb_upstream_connection is None:
                 logger.debug(self._create_message("vppb_upstream_connection is None"))
-                await self._send_unsupported_request(req_id, tag)
+                self._send_unsupported_request(req_id, tag)
                 continue
 
             downstream_connection_fifo = vppb_upstream_connection.cfg_fifo
-            await downstream_connection_fifo.host_to_target.put(packet)
+            downstream_connection_fifo.host_to_target.put(packet)
 
-    async def _process_target_to_host_packets(self, downstream_connection_bind_slot: BindSlot):
+    def _process_target_to_host_packets(self, downstream_connection_bind_slot: BindSlot):
         # Unused in thread-based implementation
         raise NotImplementedError
 
     def _t2h_worker(
         self,
         downstream_connection_bind_slot: BindSlot,
-        loop: asyncio.AbstractEventLoop,
         stop_evt: threading.Event,
     ) -> None:
         downstream_connection_fifo = (
             downstream_connection_bind_slot.vppb.get_upstream_connection().cfg_fifo
         )
         while not stop_evt.is_set():
-            packet = asyncio.run_coroutine_threadsafe(
-                downstream_connection_fifo.target_to_host.get(), loop
-            ).result()
+            packet = downstream_connection_fifo.target_to_host.get()
             if packet is None:
                 break
-            asyncio.run_coroutine_threadsafe(
-                self._upstream_connection_fifo.target_to_host.put(packet), loop
-            ).result()
+            self._upstream_connection_fifo.target_to_host.put(packet)
 
-    async def _send_unsupported_request(self, req_id, tag):
+    def _send_unsupported_request(self, req_id, tag):
         packet = CxlIoCompletionPacket.create(
             req_id=req_id, tag=tag, cpl_id=0, data=None, status=CXL_IO_CPL_STATUS.UR
         )
-        await self._upstream_connection_fifo.target_to_host.put(packet)
+        self._upstream_connection_fifo.target_to_host.put(packet)
 
-    async def update_router(self, vppb_index: int):
-        await self.stop_for_update(vppb_index)
+    def update_router(self, vppb_index: int):
+        self.stop_for_update(vppb_index)
         self._downstream_connections = self._port_binder.get_bind_slots()
         vppb_upstream_connection = self._downstream_connections[
             vppb_index
@@ -392,44 +380,45 @@ class ConfigSpaceRouter(CxlRouter):
         self._downstream_connection_fifos[vppb_index] = vppb_upstream_connection.cfg_fifo
 
         if self._is_running:
-            loop = asyncio.get_running_loop()
             if not hasattr(self, "_t2h_stop"):
                 self._t2h_stop = threading.Event()
                 self._t2h_threads = []
             t = threading.Thread(
                 target=self._t2h_worker,
-                args=(self._downstream_connections[vppb_index], loop, self._t2h_stop),
+                args=(self._downstream_connections[vppb_index], self._t2h_stop),
                 name=f"CfgRouter-t2h-{vppb_index}",
                 daemon=True,
             )
             t.start()
             self._t2h_threads.append(t)
 
-    async def _run(self):
+    def _run(self):
         self._is_running = True
-        loop = asyncio.get_running_loop()
         self._t2h_stop = threading.Event()
         self._t2h_threads: list[threading.Thread] = []
-        host_task = create_task(self._process_host_to_target_packets())
+        host_thread = threading.Thread(
+            target=self._process_host_to_target_packets, name="CfgRouter-h2t", daemon=True
+        )
+        host_thread.start()
         for downstream_connection_bind_slot in self._downstream_connections:
             t = threading.Thread(
                 target=self._t2h_worker,
-                args=(downstream_connection_bind_slot, loop, self._t2h_stop),
+                args=(downstream_connection_bind_slot, self._t2h_stop),
                 name="CfgRouter-t2h",
                 daemon=True,
             )
             t.start()
             self._t2h_threads.append(t)
-        await self._change_status_to_running()
-        await host_task
+        self._change_status_to_running()
+        host_thread.join()
 
-    async def _stop(self):
+    def _stop(self):
         self._t2h_stop.set()
         for downstream_connection_fifo in self._downstream_connection_fifos:
-            await downstream_connection_fifo.target_to_host.put(None)
+            downstream_connection_fifo.target_to_host.put(None)
         for t in getattr(self, "_t2h_threads", []):
             t.join(timeout=1.0)
-        await self._upstream_connection_fifo.host_to_target.put(None)
+        self._upstream_connection_fifo.host_to_target.put(None)
 
 
 class CxlMemRouter(CxlRouter):
@@ -461,9 +450,9 @@ class CxlMemRouter(CxlRouter):
                 bind_slot.vppb.get_upstream_connection().cxl_mem_fifo
             )
 
-    async def _process_host_to_target_packets(self):
+    def _process_host_to_target_packets(self):
         while True:
-            packet = await self._upstream_connection_fifo.host_to_target.get()
+            packet = self._upstream_connection_fifo.host_to_target.get()
             if packet is None:
                 break
 
@@ -502,16 +491,15 @@ class CxlMemRouter(CxlRouter):
                 .vppb.get_upstream_connection()
                 .cxl_mem_fifo
             )
-            await downstream_connection_fifo.host_to_target.put(packet)
+            downstream_connection_fifo.host_to_target.put(packet)
 
-    async def _process_target_to_host_packets(self, downstream_connection_bind_slot: BindSlot):
+    def _process_target_to_host_packets(self, downstream_connection_bind_slot: BindSlot):
         # Unused in thread-based implementation
         raise NotImplementedError
 
     def _t2h_worker(
         self,
         downstream_connection_bind_slot: BindSlot,
-        loop: asyncio.AbstractEventLoop,
         stop_evt: threading.Event,
     ) -> None:
         logger.debug(self._create_message("Starting CXL.mem T2H worker thread"))
@@ -526,9 +514,7 @@ class CxlMemRouter(CxlRouter):
         bi_forward = self._bi_forward_override_for_test
 
         while not stop_evt.is_set():
-            packet = asyncio.run_coroutine_threadsafe(
-                downstream_connection_fifo.target_to_host.get(), loop
-            ).result()
+            packet = downstream_connection_fifo.target_to_host.get()
             if packet is None:
                 break
 
@@ -551,9 +537,7 @@ class CxlMemRouter(CxlRouter):
 
                 if bi_enable == 0 and bi_forward == 1:
                     logger.debug(self._create_message("MEM T2H forwarding BI Snoop upstream"))
-                    asyncio.run_coroutine_threadsafe(
-                        self._upstream_connection_fifo.target_to_host.put(packet), loop
-                    ).result()
+                    self._upstream_connection_fifo.target_to_host.put(packet)
                 elif bi_enable == 1 and bi_forward == 0:
                     hdm_decoder_manager = upstream_vppb_component.get_hdm_decoder_manager()
                     if hdm_decoder_manager.is_bi_capable():
@@ -561,19 +545,15 @@ class CxlMemRouter(CxlRouter):
                         logger.debug(
                             self._create_message(f"MEM T2H rewriting BI bi_id={bi_id} upstream")
                         )
-                        asyncio.run_coroutine_threadsafe(
-                            self._upstream_connection_fifo.target_to_host.put(packet), loop
-                        ).result()
+                        self._upstream_connection_fifo.target_to_host.put(packet)
                     else:
                         continue
             else:
                 # quiet normal forwarding logs
-                asyncio.run_coroutine_threadsafe(
-                    self._upstream_connection_fifo.target_to_host.put(packet), loop
-                ).result()
+                self._upstream_connection_fifo.target_to_host.put(packet)
 
-    async def update_router(self, vppb_index: int):
-        await self.stop_for_update(vppb_index)
+    def update_router(self, vppb_index: int):
+        self.stop_for_update(vppb_index)
         self._downstream_connections = self._port_binder.get_bind_slots()
         vppb_upstream_connection = self._downstream_connections[
             vppb_index
@@ -585,46 +565,46 @@ class CxlMemRouter(CxlRouter):
         self._downstream_connection_fifos[vppb_index] = vppb_upstream_connection.cxl_mem_fifo
 
         if self._is_running:
-            loop = asyncio.get_running_loop()
             if not hasattr(self, "_t2h_stop"):
                 self._t2h_stop = threading.Event()
                 self._t2h_threads = []
             t = threading.Thread(
                 target=self._t2h_worker,
-                args=(self._downstream_connections[vppb_index], loop, self._t2h_stop),
+                args=(self._downstream_connections[vppb_index], self._t2h_stop),
                 name=f"MemRouter-t2h-{vppb_index}",
                 daemon=True,
             )
             t.start()
             self._t2h_threads.append(t)
 
-    async def _run(self):
+    def _run(self):
         self._is_running = True
-        loop = asyncio.get_running_loop()
         self._t2h_stop = threading.Event()
         self._t2h_threads: list[threading.Thread] = []
-        # Start host->target coroutine
-        host_task = create_task(self._process_host_to_target_packets())
+        host_thread = threading.Thread(
+            target=self._process_host_to_target_packets, name="MemRouter-h2t", daemon=True
+        )
+        host_thread.start()
         # Start T2H workers for each downstream
         for downstream_connection_bind_slot in self._downstream_connections:
             t = threading.Thread(
                 target=self._t2h_worker,
-                args=(downstream_connection_bind_slot, loop, self._t2h_stop),
+                args=(downstream_connection_bind_slot, self._t2h_stop),
                 name="MemRouter-t2h",
                 daemon=True,
             )
             t.start()
             self._t2h_threads.append(t)
-        await self._change_status_to_running()
-        await host_task
+        self._change_status_to_running()
+        host_thread.join()
 
-    async def _stop(self):
+    def _stop(self):
         self._t2h_stop.set()
         for downstream_connection_fifo in self._downstream_connection_fifos:
-            await downstream_connection_fifo.target_to_host.put(None)
+            downstream_connection_fifo.target_to_host.put(None)
         for t in getattr(self, "_t2h_threads", []):
             t.join(timeout=1.0)
-        await self._upstream_connection_fifo.host_to_target.put(None)
+        self._upstream_connection_fifo.host_to_target.put(None)
 
 
 class CxlCacheRouter(CxlRouter):
@@ -648,9 +628,9 @@ class CxlCacheRouter(CxlRouter):
                 bind_slot.vppb.get_upstream_connection().cxl_cache_fifo
             )
 
-    async def _process_host_to_target_packets(self):
+    def _process_host_to_target_packets(self):
         while True:
-            packet = await self._upstream_connection_fifo.host_to_target.get()
+            packet = self._upstream_connection_fifo.host_to_target.get()
             if packet is None:
                 break
 
@@ -668,11 +648,6 @@ class CxlCacheRouter(CxlRouter):
                 raise Exception("Received unexpected packet")
 
             upstream_vppb_component = self._upstream_vppb.get_cxl_component()
-
-            # HACK: this is a placeholder that only works with structures having a
-            # fixed number of targets. A MUCH better way of doing this is through an
-            # indexed memory read, but in the interest of time, and due to the
-            # unstability of UnalignedBitStructure, that solution is probably unwise.
 
             target_fld_name = f"target{cache_id}_options"
 
@@ -694,16 +669,15 @@ class CxlCacheRouter(CxlRouter):
                 .vppb.get_upstream_connection()
                 .cxl_cache_fifo
             )
-            await downstream_connection_fifo.host_to_target.put(packet)
+            downstream_connection_fifo.host_to_target.put(packet)
 
-    async def _process_target_to_host_packets(self, downstream_connection_bind_slot: BindSlot):
+    def _process_target_to_host_packets(self, downstream_connection_bind_slot: BindSlot):
         # Unused in thread-based implementation
         raise NotImplementedError
 
     def _t2h_worker(
         self,
         downstream_connection_bind_slot: BindSlot,
-        loop: asyncio.AbstractEventLoop,
         stop_evt: threading.Event,
     ) -> None:
         downstream_connection_fifo = (
@@ -712,9 +686,7 @@ class CxlCacheRouter(CxlRouter):
         downstream_vppb = downstream_connection_bind_slot.vppb
         downstream_vppb_component = downstream_vppb.get_cxl_component()
         while not stop_evt.is_set():
-            packet = asyncio.run_coroutine_threadsafe(
-                downstream_connection_fifo.target_to_host.get(), loop
-            ).result()
+            packet = downstream_connection_fifo.target_to_host.get()
             if packet is None:
                 break
             cxl_cache_base_packet = cast(CxlCacheBasePacket, packet)
@@ -736,12 +708,10 @@ class CxlCacheRouter(CxlRouter):
                     # get the local cache id
                     cache_id = cache_id_decoder_opt_ctl["local_cache_id"]
                     cxl_cache_packet.set_cache_id(cache_id)
-            asyncio.run_coroutine_threadsafe(
-                self._upstream_connection_fifo.target_to_host.put(packet), loop
-            ).result()
+            self._upstream_connection_fifo.target_to_host.put(packet)
 
-    async def update_router(self, vppb_index: int):
-        await self.stop_for_update(vppb_index)
+    def update_router(self, vppb_index: int):
+        self.stop_for_update(vppb_index)
         self._downstream_connections = self._port_binder.get_bind_slots()
         vppb_upstream_connection = self._downstream_connections[
             vppb_index
@@ -753,41 +723,42 @@ class CxlCacheRouter(CxlRouter):
         self._downstream_connection_fifos[vppb_index] = vppb_upstream_connection.cxl_cache_fifo
 
         if self._is_running:
-            loop = asyncio.get_running_loop()
             if not hasattr(self, "_t2h_stop"):
                 self._t2h_stop = threading.Event()
                 self._t2h_threads = []
             t = threading.Thread(
                 target=self._t2h_worker,
-                args=(self._downstream_connections[vppb_index], loop, self._t2h_stop),
+                args=(self._downstream_connections[vppb_index], self._t2h_stop),
                 name=f"CacheRouter-t2h-{vppb_index}",
                 daemon=True,
             )
             t.start()
             self._t2h_threads.append(t)
 
-    async def _run(self):
+    def _run(self):
         self._is_running = True
-        loop = asyncio.get_running_loop()
         self._t2h_stop = threading.Event()
         self._t2h_threads: list[threading.Thread] = []
-        host_task = create_task(self._process_host_to_target_packets())
+        host_thread = threading.Thread(
+            target=self._process_host_to_target_packets, name="CacheRouter-h2t", daemon=True
+        )
+        host_thread.start()
         for downstream_connection_bind_slot in self._downstream_connections:
             t = threading.Thread(
                 target=self._t2h_worker,
-                args=(downstream_connection_bind_slot, loop, self._t2h_stop),
+                args=(downstream_connection_bind_slot, self._t2h_stop),
                 name="CacheRouter-t2h",
                 daemon=True,
             )
             t.start()
             self._t2h_threads.append(t)
-        await self._change_status_to_running()
-        await host_task
+        self._change_status_to_running()
+        host_thread.join()
 
-    async def _stop(self):
+    def _stop(self):
         self._t2h_stop.set()
         for downstream_connection_fifo in self._downstream_connection_fifos:
-            await downstream_connection_fifo.target_to_host.put(None)
+            downstream_connection_fifo.target_to_host.put(None)
         for t in getattr(self, "_t2h_threads", []):
             t.join(timeout=1.0)
-        await self._upstream_connection_fifo.host_to_target.put(None)
+        self._upstream_connection_fifo.host_to_target.put(None)

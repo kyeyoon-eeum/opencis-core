@@ -5,7 +5,7 @@ This software is licensed under the terms of the Revised BSD License.
 See LICENSE for details.
 """
 
-from asyncio import create_task, gather
+import threading
 from typing import Optional
 
 from opencis.pci.component.pci import (
@@ -67,22 +67,13 @@ class PciDevice(RunnableComponent):
         pci_register = PciExpressConfigSpace(options=pci_register_options)
         self._config_space_manager.set_register(pci_register)
 
-    async def _run(self):
-        tasks = [
-            create_task(self._mmio_manager.run()),
-            create_task(self._config_space_manager.run()),
-        ]
-        wait_tasks = [
-            create_task(self._mmio_manager.wait_for_ready()),
-            create_task(self._config_space_manager.wait_for_ready()),
-        ]
-        await gather(*wait_tasks)
-        await self._change_status_to_running()
-        await gather(*tasks)
+    def _run(self):
+        self._mmio_manager.start_wait_ready()
+        self._config_space_manager.start_wait_ready()
+        self._change_status_to_running()
+        self._mmio_manager.join()
+        self._config_space_manager.join()
 
-    async def _stop(self):
-        tasks = [
-            create_task(self._mmio_manager.stop()),
-            create_task(self._config_space_manager.stop()),
-        ]
-        await gather(*tasks)
+    def _stop(self):
+        self._mmio_manager.stop_sync()
+        self._config_space_manager.stop_sync()

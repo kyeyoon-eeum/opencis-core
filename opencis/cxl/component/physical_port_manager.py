@@ -5,7 +5,7 @@ This software is licensed under the terms of the Revised BSD License.
 See LICENSE for details.
 """
 
-from asyncio import create_task, gather
+import threading
 from dataclasses import dataclass
 from typing import List, Dict, Optional, cast
 
@@ -148,35 +148,41 @@ class PhysicalPortManager(RunnableComponent):
                 connected_devices.append(device_info)
         return connected_devices
 
-    async def _run(self):
-        run_tasks = []
-        wait_tasks = []
-        for port_device in self._port_devices:
-            run_tasks.append(create_task(port_device.run()))
-            wait_tasks.append(create_task(port_device.wait_for_ready()))
-        for ppb_device in self._ppb_devices:
-            run_tasks.append(create_task(ppb_device.run()))
-            wait_tasks.append(create_task(ppb_device.wait_for_ready()))
-
-        for ppb_bind in self._ppb_binds:
-            if ppb_bind is not None:
-                run_tasks.append(create_task(ppb_bind.run()))
-                wait_tasks.append(create_task(ppb_bind.wait_for_ready()))
-
-        await gather(*wait_tasks)
-        await self._change_status_to_running()
+    def _run(self):
+        threads: list[threading.Thread] = []
+        # Start and wait for readiness
+        for comp in [
+            *self._port_devices,
+            *self._ppb_devices,
+            *[b for b in self._ppb_binds if b is not None],
+        ]:
+            comp.start_wait_ready()
+            threads.append(comp._thread)  # using internal thread to join later
+        self._change_status_to_running()
         from opencis.util.logger import logger
 
         logger.info(self._create_message("PhysicalPortManager RUNNING"))
-        await gather(*run_tasks)
+        for comp in [
+            *self._port_devices,
+            *self._ppb_devices,
+            *[b for b in self._ppb_binds if b is not None],
+        ]:
+            comp.join()
 
-    async def _stop(self):
-        tasks = []
+    def _stop(self):
         for port_device in self._port_devices:
-            tasks.append(create_task(port_device.stop()))
+            try:
+                port_device.stop_sync()
+            except Exception:
+                pass
         for ppb_device in self._ppb_devices:
-            tasks.append(create_task(ppb_device.stop()))
+            try:
+                ppb_device.stop_sync()
+            except Exception:
+                pass
         for ppb_bind in self._ppb_binds:
             if ppb_bind is not None:
-                tasks.append(create_task(ppb_bind.stop()))
-        await gather(*tasks)
+                try:
+                    ppb_bind.stop_sync()
+                except Exception:
+                    pass

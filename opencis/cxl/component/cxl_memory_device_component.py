@@ -90,15 +90,11 @@ class CharDriverAccessor:
             os.close(fd)
         return int.from_bytes(data, "little")
 
-    async def write(self, offset: int, data: int, size: int):
-        import asyncio
+    def write(self, offset: int, data: int, size: int):
+        self._write_blocking(offset, data, size)
 
-        await asyncio.to_thread(self._write_blocking, offset, data, size)
-
-    async def read(self, offset: int, size: int) -> int:
-        import asyncio
-
-        return await asyncio.to_thread(self._read_blocking, offset, size)
+    def read(self, offset: int, size: int) -> int:
+        return self._read_blocking(offset, size)
 
 
 class MemoryDeviceIdentity(UnalignedBitStructure):
@@ -353,29 +349,35 @@ class CxlMemoryDeviceComponent(CxlDeviceComponent):
             return None
         return hpa
 
-    async def write_mem(self, hpa: int, data: int, size: int = 64):
+    def write_mem_sync(self, hpa: int, data: int, size: int = 64):
         dpa = self._hdm_decoder_manager.get_dpa(hpa)
         if dpa is None:
             logger.warning(self._create_message(f"[write_mem] HPA {hex(hpa)} is not decodable"))
             return
-        await self._memory_accessor.write(dpa, data, size)
+        if self._memory_accessor is not None:
+            self._memory_accessor.write(dpa, data, size)
 
-    async def read_mem(self, hpa: int, size: int = 64) -> int:
+    def read_mem_sync(self, hpa: int, size: int = 64) -> int:
         dpa = self._hdm_decoder_manager.get_dpa(hpa)
         if dpa is None:
             logger.warning(self._create_message(f"[read_mem] HPA {hex(hpa)} is not decodable"))
             return 0
-        return await self._memory_accessor.read(dpa, size)
+        if self._memory_accessor is None:
+            return 0
+        return self._memory_accessor.read(dpa, size)
 
-    async def read_mem_dpa(self, dpa: int, size: int = 64) -> int:
-        return await self._memory_accessor.read(dpa, size)
+    def read_mem_dpa_sync(self, dpa: int, size: int = 64) -> int:
+        if self._memory_accessor is None:
+            return 0
+        return self._memory_accessor.read(dpa, size)
 
-    async def write_mem_dpa(self, dpa: int, data: int, size: int = 64):
-        await self._memory_accessor.write(dpa, data, size)
+    def write_mem_dpa_sync(self, dpa: int, data: int, size: int = 64):
+        if self._memory_accessor is not None:
+            self._memory_accessor.write(dpa, data, size)
 
     # TODO: check OOB write for cache (should <= self._cache_line_size)
-    async def write_cache(self, cache_id: int, data: int):
+    def write_cache_sync(self, cache_id: int, data: int):
         self._cache_info[cache_id].write(data)
 
-    async def read_cache(self, cache_id: int) -> int:
+    def read_cache_sync(self, cache_id: int) -> int:
         return self._cache_info[cache_id].read()

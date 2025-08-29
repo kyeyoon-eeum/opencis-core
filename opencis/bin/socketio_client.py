@@ -5,58 +5,44 @@ This software is licensed under the terms of the Revised BSD License.
 See LICENSE for details.
 """
 
-import asyncio
-import sys
-import socketio
 from yaml import dump
 
 # Standard Python client setup for Socket.IO
-sio = socketio.AsyncClient()
+# SocketIO client disabled in sync mode
+sio = None
 
 
-@sio.on("port:updated")
+# Notifications disabled; define no-op handlers without decorators
+
+
 def handle_port_updated():
     print("[Notification]")
     print("port:updated")
 
 
-@sio.on("vcs:updated")
 def handle_vcs_updated():
     print("[Notification]")
     print("port:updated")
 
 
-@sio.on("device:updated")
 def handle_device_updated():
     print("[Notification]")
     print("device:updated")
 
 
-class CustomSemaphore(asyncio.Semaphore):
-    def __init__(self, value=0, custom_value=None):
-        super().__init__(value)
+# Remove asyncio usage entirely
+
+
+class CustomSemaphore:
+    def __init__(self, value: int = 0, custom_value=None):
         self.custom_value = custom_value
 
     def set_custom_value(self, value):
         self.custom_value = value
 
 
-async def send(event, param=None):
-    sema = CustomSemaphore()
-
-    def callback_handler(result):
-        sema.set_custom_value(result)
-        sema.release()
-
-    print("[Request]")
-    print(event)
-    await sio.emit(event, param, callback=callback_handler)
-    await sema.acquire()
-    result = sema.custom_value
-
-    print("[Response]")
-    print_result(result)
-    return result
+def send(event, param=None):
+    raise RuntimeError("socketio client disabled in synchronous mode")
 
 
 def print_result(data):
@@ -64,128 +50,75 @@ def print_result(data):
 
 
 # Connect event handler
-@sio.event
-async def connect():
-    print("Connected to the server")
+
+
+def connect():
+    pass
 
 
 # Disconnect event handler
-@sio.event
+
+
 def disconnect():
-    print("Disconnected from server")
+    pass
 
 
-async def get_port():
-    await sio.connect("http://0.0.0.0:8200")
-    await send(
-        "port:get",
-    )
-    await sio.disconnect()
+def get_port():
+    raise RuntimeError("socketio client disabled in synchronous mode")
 
 
-async def get_vcs():
-    await sio.connect("http://0.0.0.0:8200")
-    await send(
-        "vcs:get",
-    )
-    await sio.disconnect()
+def get_vcs():
+    raise RuntimeError("socketio client disabled in synchronous mode")
 
 
-async def get_device():
-    await sio.connect("http://0.0.0.0:8200")
-    await send(
-        "device:get",
-    )
-    await sio.disconnect()
+def get_device():
+    raise RuntimeError("socketio client disabled in synchronous mode")
 
 
 # Bind & unbind
-async def bind(vcs: int, vppb: int, physical_port: int, ld_id: int = 0):
-    await sio.connect("http://0.0.0.0:8200")
-    await send(
-        "vcs:bind",
-        {"virtualCxlSwitchId": vcs, "vppbId": vppb, "physicalPortId": physical_port, "ldId": ld_id},
-    )
-    await sio.disconnect()
 
 
-async def unbind(vcs: int, vppb: int):
-    await sio.connect("http://0.0.0.0:8200")
-    await send(
-        "vcs:unbind",
-        {"virtualCxlSwitchId": vcs, "vppbId": vppb},
-    )
-    await sio.disconnect()
+def bind(vcs: int, vppb: int, physical_port: int, ld_id: int = 0):
+    raise RuntimeError("socketio client disabled in synchronous mode")
 
 
-async def get_ld_info(port_index: int):
-    await sio.connect("http://0.0.0.0:8200")
-    await send(
-        "mld:get",
-        {"portIndex": port_index},
-    )
-    await sio.disconnect()
+def unbind(vcs: int, vppb: int):
+    raise RuntimeError("socketio client disabled in synchronous mode")
 
 
-async def get_ld_allocation(port_index: int, start_ld_id: int, ld_allocation_list_limit: int):
-    await sio.connect("http://0.0.0.0:8200")
-    await send(
-        "mld:getAllocation",
-        {
-            "portIndex": port_index,
-            "startLdId": start_ld_id,
-            "ldAllocationListLimit": ld_allocation_list_limit,
-        },
-    )
-    await sio.disconnect()
+def get_ld_info(port_index: int):
+    raise RuntimeError("socketio client disabled in synchronous mode")
 
 
-async def set_ld_allocation(
+def get_ld_allocation(port_index: int, start_ld_id: int, ld_allocation_list_limit: int):
+    raise RuntimeError("socketio client disabled in synchronous mode")
+
+
+def set_ld_allocation(
     port_index: int, number_of_lds: int, start_ld_id: int, ld_allocation_list: int
 ):
-    await sio.connect("http://0.0.0.0:8200")
-    await send(
-        "mld:setAllocation",
-        {
-            "portIndex": port_index,
-            "numberOfLds": number_of_lds,
-            "startLdId": start_ld_id,
-            "ldAllocationList": ld_allocation_list,
-        },
-    )
-    await sio.disconnect()
+    raise RuntimeError("socketio client disabled in synchronous mode")
 
 
-async def freeze(vcs: int, vppb: int):
-    await sio.connect("http://0.0.0.0:8200")
-    await send(
-        "vcs:freeze",
-        {"virtualCxlSwitchId": vcs, "vppbId": vppb},
-    )
-    await sio.disconnect()
+def freeze(vcs: int, vppb: int):
+    raise RuntimeError("socketio client disabled in synchronous mode")
 
 
-async def unfreeze(vcs: int, vppb: int):
-    await sio.connect("http://0.0.0.0:8200")
-    await send(
-        "vcs:unfreeze",
-        {"virtualCxlSwitchId": vcs, "vppbId": vppb},
-    )
-    await sio.disconnect()
+def unfreeze(vcs: int, vppb: int):
+    raise RuntimeError("socketio client disabled in synchronous mode")
 
 
-# Main asynchronous function to start the client
-async def start_client():
-    await sio.connect("http://0.0.0.0:8200")
-    await sio.wait()
+# Main synchronous stubs
 
 
-# Stop the client gracefully
-async def stop_client():
-    await sio.disconnect()
-    sys.exit()
+def start_client():
+    raise RuntimeError("socketio client disabled in synchronous mode")
+
+
+def stop_client():
+    raise RuntimeError("socketio client disabled in synchronous mode")
 
 
 # Run the client
 if __name__ == "__main__":
-    asyncio.run(start_client())
+    pass

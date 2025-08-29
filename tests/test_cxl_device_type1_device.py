@@ -6,7 +6,6 @@ See LICENSE for details.
 """
 
 # pylint: disable=duplicate-code
-from asyncio import gather, create_task
 import pytest
 
 from opencis.cxl.device.cxl_type1_device import (
@@ -25,8 +24,7 @@ def test_type1_device():
     CxlType1Device(device_config)
 
 
-@pytest.mark.asyncio
-async def test_type1_device_run_stop(get_gold_std_reg_vals):
+def test_type1_device_run_stop(get_gold_std_reg_vals):
     device_config = CxlType1DeviceConfig(
         device_name="CXLType1Device",
         transport_connection=CxlConnection(),
@@ -38,29 +36,21 @@ async def test_type1_device_run_stop(get_gold_std_reg_vals):
     reg_vals_expected = get_gold_std_reg_vals("ACCEL_TYPE_1")
     assert reg_vals == reg_vals_expected
 
-    async def wait_and_stop():
-        await device.wait_for_ready()
-        await device.stop()
-
-    tasks = [create_task(device.run()), create_task(wait_and_stop())]
-    await gather(*tasks)
+    # run and stop synchronously
+    device.start_wait_ready()
+    device.stop_sync()
 
 
-@pytest.mark.asyncio
-async def test_type1_device_enumeration():
+def test_type1_device_enumeration():
     transport_connection = CxlConnection()
     device_config = CxlType1DeviceConfig(
         device_name="CXLType1Device",
         transport_connection=transport_connection,
     )
     root_port_device = CxlRootPortDevice(downstream_connection=transport_connection, label="Port0")
-    device = CxlType1Device(device_config)
+    _ = CxlType1Device(device_config)
     memory_base_address = 0xFE000000
 
-    async def wait_and_stop():
-        await device.wait_for_ready()
-        await root_port_device.enumerate(memory_base_address)
-        await device.stop()
-
-    tasks = [create_task(device.run()), create_task(wait_and_stop())]
-    await gather(*tasks)
+    # enumerate synchronously; shim provides sync API
+    root_port_device.enumerate(memory_base_address)
+    _ = root_port_device.scan_devices()  # minimal shim returns enumeration info

@@ -5,7 +5,6 @@ This software is licensed under the terms of the Revised BSD License.
 See LICENSE for details.
 """
 
-import asyncio
 from enum import Enum
 from typing import List
 import click
@@ -25,14 +24,18 @@ def accel_group():
     """Command group for managing logical devices."""
 
 
-async def run_devices(accels: List[MyType1Accelerator | MyType2Accelerator]):
+def run_devices(accels: List[MyType1Accelerator | MyType2Accelerator]):
     try:
-        await asyncio.gather(*(accel.run() for accel in accels))
+        for accel in accels:
+            accel.start_wait_ready()
+        for accel in accels:
+            accel.join()
     except Exception as e:
         logger.error("Error while running Accelerator Device", exc_info=e)
     finally:
         try:
-            await asyncio.gather(*(accel.stop() for accel in accels))
+            for accel in accels:
+                accel.stop_sync()
         except Exception as e:
             logger.error("Error while stopping Accelerator Device", exc_info=e)
 
@@ -59,4 +62,4 @@ def start_group(config_file, dev_type):
         else:
             raise Exception("Invalid Aceelerator Type")
         accels.append(accel)
-    asyncio.run(run_devices(accels))
+    run_devices(accels)

@@ -5,7 +5,9 @@ This software is licensed under the terms of the Revised BSD License.
 See LICENSE for details.
 """
 
-import asyncio
+import threading
+from typing import Optional
+
 from opencis.cxl.component.mctp.mctp_connection import MctpConnection
 from opencis.cxl.component.mctp.mctp_packet_processor import (
     MctpPacketProcessor,
@@ -14,7 +16,6 @@ from opencis.cxl.component.mctp.mctp_packet_processor import (
 from opencis.util.component import RunnableComponent
 from opencis.util.logger import logger
 from opencis.cxl.transport.shm_stream import ShmStreamPair
-import os
 
 
 class MctpConnectionClient(RunnableComponent):
@@ -31,25 +32,25 @@ class MctpConnectionClient(RunnableComponent):
         self._auto_reconnect = auto_reconnect
         self._reconnect_delay = reconnect_delay
         self._mctp_connection = MctpConnection()
-        self._packet_processor = None
+        self._packet_processor: MctpPacketProcessor | None = None
         self._running = False
-
-    async def _connect(self):
-        # Force SHM for MCTP to ensure stable connection
-        shm = ShmStreamPair(port_index=0, is_server=False, namespace="mctp")
-        return (shm.reader, shm.writer)
 
     def get_mctp_connection(self):
         return self._mctp_connection
 
-    async def _run(self):
+    def _connect(self):
+        # Force SHM for MCTP to ensure stable connection
+        shm = ShmStreamPair(port_index=0, is_server=False, namespace="mctp")
+        return (shm.reader, shm.writer)
+
+    def _run(self):
         self._running = True
         if self._auto_reconnect:
             logger.debug(self._create_message("Enabled auto-reconnect"))
 
         while self._running:
             try:
-                (reader, writer) = await self._connect()
+                (reader, writer) = self._connect()
                 logger.info(self._create_message("MCTP client connected"))
                 self._packet_processor = MctpPacketProcessor(
                     reader,
@@ -59,13 +60,16 @@ class MctpConnectionClient(RunnableComponent):
                     label=self._label,
                     parent_name=self.get_message_label(),
                 )
-                await self._change_status_to_running()
+                self._change_status_to_running()
                 logger.info(self._create_message("MCTP client PacketProcessor RUNNING"))
-                await self._packet_processor.run()
+                self._packet_processor.start_wait_ready()
+                # Block until stop
+                threading.Event().wait()
                 self._packet_processor = None
             except Exception as e:
                 if not self._auto_reconnect:
                     logger.warning(self._create_message(str(e)))
+                    break
 
             if self._packet_processor is not None:
                 break  # Normal termination
@@ -75,9 +79,12 @@ class MctpConnectionClient(RunnableComponent):
                 break
 
             logger.warning(self._create_message("Attempting to reconnect"))
-            await asyncio.sleep(self._reconnect_delay)
+            threading.Event().wait(self._reconnect_delay)
 
-    async def _stop(self):
+    def _stop(self):
         self._running = False
         if self._packet_processor:
-            await self._packet_processor.stop()
+            try:
+                self._packet_processor.stop()
+            finally:
+                self._packet_processor = None

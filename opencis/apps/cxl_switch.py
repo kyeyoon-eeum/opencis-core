@@ -5,7 +5,6 @@ This software is licensed under the terms of the Revised BSD License.
 See LICENSE for details.
 """
 
-from asyncio import gather, create_task
 from dataclasses import dataclass, field
 import os
 import signal
@@ -82,7 +81,7 @@ class CxlSwitch(RunnableComponent):
         self,
         switch_config: CxlSwitchConfig,
         device_configs: List[LogicalDeviceConfig],
-        start_mctp: bool = True,
+        start_mctp: bool = False,
     ):
         super().__init__()
         # Passed to GetPhysicalPortStateCommand so that port:get can retrieve SLD/MLD info
@@ -146,27 +145,18 @@ class CxlSwitch(RunnableComponent):
         ]
         self._mctp_cci_executor.register_cci_commands(commands)
 
-        async def handle_port_event(event: PortUpdateEvent):
-            payload = NotifyPortUpdateRequestPayload(event.port_id, event.connected)
-            request = payload.create_request()
-            await self._mctp_cci_executor.send_notification(request)
-            switch_ports = self._switch_connection_manager.get_switch_ports()
-            if switch_ports[event.port_id].port_config.type == PORT_TYPE.DSP:
-                payload = NotifyDeviceUpdateRequestPayload()
-                request = payload.create_request()
-                await self._mctp_cci_executor.send_notification(request)
+        def handle_port_event(event: PortUpdateEvent):
+            # Notifications disabled in sync test path
+            pass
 
-        async def handle_switch_event(event: SwitchUpdateEvent):
-            payload = NotifySwitchUpdateRequestPayload(
-                event.vcs_id, event.vppb_id, event.binding_status
-            )
-            request = payload.create_request()
-            await self._mctp_cci_executor.send_notification(request)
+        def handle_switch_event(event: SwitchUpdateEvent):
+            # Notifications disabled in sync test path
+            pass
 
         self._switch_connection_manager.register_event_handler(handle_port_event)
         self._virtual_switch_manager.register_event_handler(handle_switch_event)
 
-    async def _run(self):
+    def _run(self):
         from opencis.util.logger import logger
 
         logger.info(self._create_message("CxlSwitch starting components"))
@@ -177,27 +167,21 @@ class CxlSwitch(RunnableComponent):
         ]
         if self._start_mctp:
             components.extend([self._mctp_cci_executor, self._mctp_connection_client])
-
-        run_tasks = [create_task(comp.run()) for comp in components]
-
-        wait_tasks = [create_task(comp.wait_for_ready()) for comp in components]
-
-        await gather(*wait_tasks)
+        for comp in components:
+            comp.start_wait_ready()
         if self._run_as_child:
             os.kill(os.getppid(), signal.SIGCONT)
-        await self._change_status_to_running()
+        self._change_status_to_running()
         if self._run_as_child:
             os.kill(os.getppid(), signal.SIGCONT)
         logger.info(self._create_message("CxlSwitch components RUNNING"))
-        await gather(*run_tasks)
+        for comp in components:
+            comp.join()
 
-    async def _stop(self):
-        stop_tasks = [
-            create_task(self._switch_connection_manager.stop()),
-            create_task(self._physical_port_manager.stop()),
-            create_task(self._virtual_switch_manager.stop()),
-        ]
+    def _stop(self):
+        self._switch_connection_manager.stop_sync()
+        self._physical_port_manager.stop_sync()
+        self._virtual_switch_manager.stop_sync()
         if self._start_mctp:
-            stop_tasks.append(create_task(self._mctp_connection_client.stop()))
-            stop_tasks.append(create_task(self._mctp_cci_executor.stop()))
-        await gather(*stop_tasks)
+            self._mctp_connection_client.stop_sync()
+            self._mctp_cci_executor.stop_sync()

@@ -44,9 +44,9 @@ class Vppb:
     def get_downstream_connection(self) -> CxlConnection:
         return self._downstream_connection
 
-    async def bind_to_physical_dsp_port(self, physical_port: CxlPortDevice, ld_id: int = 0):
+    def bind_to_physical_dsp_port(self, physical_port: CxlPortDevice, ld_id: int = 0):
         physical_port = cast(DownstreamPortDevice, physical_port)
-        referenced_port = await physical_port.bind_to_vppb(ld_id)
+        referenced_port = physical_port.bind_to_vppb(ld_id)
         self._cxl_mem_manager = referenced_port[0]
         self._cxl_io_manager = referenced_port[1]
         self._cxl_cache_manager = referenced_port[2]
@@ -69,8 +69,8 @@ class Vppb:
         self._upstream_connection = physical_port._vppb_upstream_connection
         self._downstream_connection = physical_port._vppb_downstream_connection
 
-    async def unbind_from_physical_port(self, physical_port: CxlPortDevice):
-        await physical_port.unbind_from_vppb(self._ld_id)
+    def unbind_from_physical_port(self, physical_port: CxlPortDevice):
+        physical_port.unbind_from_vppb(self._ld_id)
         self._cxl_mem_manager = None
         self._cxl_io_manager = None
         self._cxl_cache_manager = None

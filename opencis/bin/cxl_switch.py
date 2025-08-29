@@ -5,7 +5,6 @@ This software is licensed under the terms of the Revised BSD License.
 See LICENSE for details.
 """
 
-import asyncio
 import click
 from opencis.util.logger import logger
 from opencis.apps.cxl_switch import CxlSwitch
@@ -31,11 +30,13 @@ def start(config_file):
 
     switch = CxlSwitch(environment.switch_config, environment.logical_device_configs)
     try:
-        asyncio.run(switch.run())
+        switch.start_wait_ready()
+        logger.info("CXL Switch is RUNNING (threaded)")
+        switch.join()
     except Exception as e:
         logger.error("Error while running CXL Switch", exc_info=e)
     finally:
         try:
-            asyncio.run(switch.stop())
+            switch.stop_sync(timeout=2.0)
         except Exception as e:
             logger.error("Error while stopping CXL Switch", exc_info=e)

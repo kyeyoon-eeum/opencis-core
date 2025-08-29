@@ -226,7 +226,7 @@ class GetVirtualCxlSwitchInfoCommand(CciForegroundCommand):
         self._virtual_switch_manager = virtual_switch_manager
         super().__init__(self.OPCODE)
 
-    async def _execute(self, request: CciRequest) -> CciResponse:
+    def _execute(self, request: CciRequest) -> CciResponse:
         request_payload = self.parse_request_payload(request.payload)
 
         if request_payload.vppb_list_limit < 1:

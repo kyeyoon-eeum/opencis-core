@@ -5,7 +5,7 @@ This software is licensed under the terms of the Revised BSD License.
 See LICENSE for details.
 """
 
-from asyncio import create_task, gather
+ 
 from enum import Enum, auto
 from typing import Optional
 
@@ -170,30 +170,20 @@ class CxlType3Device(RunnableComponent):
     def get_reg_vals(self):
         return self._cxl_io_manager.get_cfg_reg_vals()
 
-    async def init_bi_snp(self):
+    def init_bi_snp(self):
         # TODO: implement real BISnp logic
         # This is only a placeholder for tests
         packet = CxlMemBISnpPacket.create(0x00, CXL_MEM_S2MBISNP_OPCODE.BISNP_DATA)
-        await self._cxl_mem_manager.process_cxl_mem_bisnp_packet(packet)
+        self._cxl_mem_manager.process_cxl_mem_bisnp_packet(packet)
 
-    async def _run(self):
-        # pylint: disable=duplicate-code
-        run_tasks = [
-            create_task(self._cxl_io_manager.run()),
-            create_task(self._cxl_mem_manager.run()),
-        ]
-        wait_tasks = [
-            create_task(self._cxl_io_manager.wait_for_ready()),
-            create_task(self._cxl_mem_manager.wait_for_ready()),
-        ]
-        await gather(*wait_tasks)
-        await self._change_status_to_running()
-        await gather(*run_tasks)
+    def _run(self):
+        # Start managers synchronously with threads
+        self._cxl_io_manager.start_wait_ready()
+        self._cxl_mem_manager.start_wait_ready()
+        self._change_status_to_running()
+        self._cxl_io_manager.join()
+        self._cxl_mem_manager.join()
 
-    async def _stop(self):
-        # pylint: disable=duplicate-code
-        tasks = [
-            create_task(self._cxl_io_manager.stop()),
-            create_task(self._cxl_mem_manager.stop()),
-        ]
-        await gather(*tasks)
+    def _stop(self):
+        self._cxl_io_manager.stop_sync()
+        self._cxl_mem_manager.stop_sync()

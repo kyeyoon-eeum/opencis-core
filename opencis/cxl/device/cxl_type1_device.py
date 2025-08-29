@@ -6,10 +6,6 @@ See LICENSE for details.
 """
 
 # pylint: disable=duplicate-code,unused-import
-from asyncio import (
-    create_task,
-    gather,
-)
 from dataclasses import dataclass
 from typing import Optional
 
@@ -128,11 +124,11 @@ class CxlType1Device(RunnableComponent):
         # )
         # self._device_simple_processor = DeviceLlcIoGen(device_processor_config)
 
-    async def read_mmio(self, addr: int, size: int, bar: int = 0):
-        return await self._mmio_manager.read_mmio(addr, size, bar)
+    def read_mmio(self, addr: int, size: int, bar: int = 0):
+        return self._mmio_manager.read_mmio(addr, size, bar)
 
-    async def write_mmio(self, addr: int, size: int, data: int, bar: int = 0):
-        await self._mmio_manager.write_mmio(addr, size, data, bar)
+    def write_mmio(self, addr: int, size: int, data: int, bar: int = 0):
+        self._mmio_manager.write_mmio(addr, size, data, bar)
 
     def _init_device(
         self,
@@ -216,25 +212,25 @@ class CxlType1Device(RunnableComponent):
     def get_reg_vals(self):
         return self._cxl_io_manager.get_cfg_reg_vals()
 
-    async def cxl_cache_readline(self, addr: int, cqid: Optional[int] = None) -> int:
+    def cxl_cache_readline(self, addr: int, cqid: Optional[int] = None) -> int:
         logger.debug(f"Beware: cqid {cqid} is not currently implemented.")
-        return await self._cache_controller.cache_coherent_load(addr, 64)
+        return self._cache_controller.cache_coherent_load(addr, 64)
 
-    async def cxl_cache_writeline(self, addr: int, data: int, cqid: Optional[int] = None):
+    def cxl_cache_writeline(self, addr: int, data: int, cqid: Optional[int] = None):
         logger.debug(f"Beware: cqid {cqid} is not currently implemented.")
-        await self._cache_controller.cache_coherent_store(addr, 64, data)
+        self._cache_controller.cache_coherent_store(addr, 64, data)
 
-    async def cxl_cache_read(self, address, size) -> bytes:
+    def cxl_cache_read(self, address, size) -> bytes:
         end = address + size
         result = b""
         for cacheline_offset in range(address, address + size, 64):
-            cacheline = await self.cxl_cache_readline(cacheline_offset)
+            cacheline = self.cxl_cache_readline(cacheline_offset)
             chunk_size = min(64, (end - cacheline_offset))
             chunk_data = cacheline.to_bytes(64, "little")
             result += chunk_data[:chunk_size]
         return result
 
-    async def cxl_cache_write(self, address, size, value):
+    def cxl_cache_write(self, address, size, value):
         if address % 64 != 0 or size % 64 != 0:
             raise Exception(f"Size {size} and address 0x{address:x} must be aligned to 64!")
 
@@ -243,32 +239,31 @@ class CxlType1Device(RunnableComponent):
             message = self._create_message(f"Host Memory: Writing 0x{value:08x} to 0x{address:08x}")
             logger.debug(message)
             low_64_byte = value & ((1 << (64 * 8)) - 1)
-            await self.cxl_cache_writeline(address + (chunk_count * 64), low_64_byte)
+            self.cxl_cache_writeline(address + (chunk_count * 64), low_64_byte)
             size -= 64
             chunk_count += 1
             value >>= 64 * 8
 
-    async def _run(self):
-        # pylint: disable=duplicate-code
-        run_tasks = [
-            create_task(self._cxl_io_manager.run()),
-            create_task(self._cxl_cache_dcoh.run()),
-            create_task(self._cache_controller.run()),
-        ]
-        wait_tasks = [
-            create_task(self._cxl_io_manager.wait_for_ready()),
-            create_task(self._cxl_cache_dcoh.wait_for_ready()),
-            create_task(self._cache_controller.wait_for_ready()),
-        ]
-        await gather(*wait_tasks)
-        await self._change_status_to_running()
-        await gather(*run_tasks)
+    def _run(self):
+        # Start workers synchronously
+        self._cxl_io_manager.start_wait_ready()
+        self._cxl_cache_dcoh.start_wait_ready()
+        self._cache_controller.start_wait_ready()
+        self._change_status_to_running()
+        self._cxl_io_manager.join()
+        self._cxl_cache_dcoh.join()
+        self._cache_controller.join()
 
-    async def _stop(self):
-        # pylint: disable=duplicate-code
-        tasks = [
-            create_task(self._cxl_io_manager.stop()),
-            create_task(self._cxl_cache_dcoh.stop()),
-            create_task(self._cache_controller.stop()),
-        ]
-        await gather(*tasks)
+    def _stop(self):
+        try:
+            self._cxl_io_manager.stop_sync()
+        except Exception:
+            pass
+        try:
+            self._cxl_cache_dcoh.stop_sync()
+        except Exception:
+            pass
+        try:
+            self._cache_controller.stop_sync()
+        except Exception:
+            pass

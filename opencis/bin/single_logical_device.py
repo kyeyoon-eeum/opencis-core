@@ -5,7 +5,6 @@ This software is licensed under the terms of the Revised BSD License.
 See LICENSE for details.
 """
 
-import asyncio
 from typing import List
 import humanfriendly
 import click
@@ -20,14 +19,18 @@ def sld_group():
     """Command group for managing single logical devices."""
 
 
-async def run_devices(slds: List[SingleLogicalDevice]):
+def run_devices(slds: List[SingleLogicalDevice]):
     try:
-        await asyncio.gather(*(sld.run() for sld in slds))
+        for sld in slds:
+            sld.start_wait_ready()
+        for sld in slds:
+            sld.join()
     except Exception as e:
         logger.error("Error while running Single Logical Device", exc_info=e)
     finally:
         try:
-            await asyncio.gather(*(sld.stop() for sld in slds))
+            for sld in slds:
+                sld.stop_sync(timeout=2.0)
         except Exception as e:
             logger.error("Error while stopping Single Logical Device", exc_info=e)
 
@@ -46,7 +49,7 @@ def start_group(config_file):
             port=cxl_env.switch_config.port,
         )
         slds.append(sld)
-    asyncio.run(run_devices(slds))
+    run_devices(slds)
 
 
 @sld_group.command(name="start")
@@ -59,4 +62,5 @@ def start(port, memfile, memsize):
         memfile = f"mem{port}.bin"
     memsize = humanfriendly.parse_size(memsize, binary=True)
     sld = SingleLogicalDevice(port, memsize, memfile)
-    asyncio.run(sld.run())
+    sld.start_wait_ready()
+    sld.join()
