@@ -43,7 +43,7 @@ cdef class ShmStreamReader:
         # Pull frames until filled (fallback to bytes payload for correctness)
         cdef Py_ssize_t got
         while off < n:
-            got = self._in_ring.pop_frame_wait_into(self._tmp_buf, 256, 100)
+            got = self._in_ring.pop_frame_wait_into(self._tmp_buf, 256, 100000)
             if got <= 0:
                 continue
             plen = got
