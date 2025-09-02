@@ -5,10 +5,10 @@ This software is licensed under the terms of the Revised BSD License.
 See LICENSE for details.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import threading
-from queue import Queue
 from typing import cast
+import time
 
 from opencis.util.logger import logger
 from opencis.util.component import RunnableComponent
@@ -54,11 +54,7 @@ from opencis.cxl.component.cache_controller import (
 )
 
 
-@dataclass
-class HomeAgentCxlChannel:
-    s2m_ndr: Queue = field(default_factory=Queue)
-    s2m_drs: Queue = field(default_factory=Queue)
-    s2m_bisnp: Queue = field(default_factory=Queue)
+
 
 
 @dataclass
@@ -89,15 +85,18 @@ class HomeAgent(RunnableComponent):
             cache_rsp=CXL_MEM_M2SBIRSP_OPCODE.BIRSP_I,
             cache_list=[],
             birsp_sched=False,
+            pending_ndr_status=None,
+            waiting_for_drs=False,
         )
 
-        # emulated .mem s2m channels
-        self._cxl_channel = HomeAgentCxlChannel()
         self._loop = None
-        self._demux_thread: threading.Thread | None = None
-        self._demux_stop = threading.Event()
-        self._main_thread: threading.Thread | None = None
-        self._main_stop = threading.Event()
+        self._state_lock = threading.Lock()
+        self._flow_control_cv = threading.Condition(self._state_lock)
+        self._fc_host_run = False
+        self._downstream_worker_thread: threading.Thread | None = None
+        self._downstream_stop = threading.Event()
+        self._upstream_worker_thread: threading.Thread | None = None
+        self._upstream_stop = threading.Event()
 
     def _create_m2s_req_packet(
         self,
@@ -228,25 +227,39 @@ class HomeAgent(RunnableComponent):
             return
 
         if s2mndr_packet.s2mndr_header.meta_value == CXL_MEM_META_VALUE.ANY:
-            # HDM-DB: DRS immediately following NDR as part of one response
-            while self._cxl_channel.s2m_drs.empty():
-                pass
-            cxl_packet = self._cxl_channel.s2m_drs.get()
-            assert cast(CxlMemBasePacket, cxl_packet).is_s2mdrs()
-            cache_packet = CacheResponse(status, cxl_packet.get_data_as_int())
+            # HDM-DB: DRS should follow NDR as part of one response
+            # Store the NDR status and set flag to wait for DRS
+            self._cur_state.pending_ndr_status = status
+            self._cur_state.waiting_for_drs = True
+            logger.debug(self._create_message("NDR processed, waiting for DRS packet"))
+            # Don't send CacheResponse yet - wait for DRS
+            return
         else:
             cache_packet = CacheResponse(status)
-        logger.debug(self._create_message("HA posting CacheResponse for UNCACHED_READ"))
-        self._upstream_cache_to_home_agent_fifos.response.put(cache_packet)
-        self._cur_state.state = COH_STATE_MACHINE.COH_STATE_INIT
+            logger.debug(self._create_message("HA posting CacheResponse for UNCACHED_READ"))
+            self._upstream_cache_to_home_agent_fifos.response.put(cache_packet)
+            self._cur_state.state = COH_STATE_MACHINE.COH_STATE_INIT
 
     # .mem s2m drs handler
     # method is only used for non cacheable devices like memory expander
     def _process_cxl_s2m_drs_packet(self, s2mdrs_packet: CxlMemS2MDRSPacket):
         assert s2mdrs_packet.s2mdrs_header.opcode == CXL_MEM_S2MDRS_OPCODE.MEM_DATA
         logger.info(self._create_message("Processing S2M DRS in HA"))
-        cache_packet = CacheResponse(CACHE_RESPONSE_STATUS.OK, s2mdrs_packet.get_data_as_int())
-        self._upstream_cache_to_home_agent_fifos.response.put(cache_packet)
+
+        # Check if this DRS corresponds to a pending NDR
+        if self._cur_state.waiting_for_drs and self._cur_state.pending_ndr_status is not None:
+            # This DRS completes a pending NDR response
+            cache_packet = CacheResponse(self._cur_state.pending_ndr_status, s2mdrs_packet.get_data_as_int())
+            logger.debug(self._create_message("HA posting CacheResponse for NDR+DRS sequence"))
+            self._upstream_cache_to_home_agent_fifos.response.put(cache_packet)
+            # Reset the pending state
+            self._cur_state.pending_ndr_status = None
+            self._cur_state.waiting_for_drs = False
+        else:
+            # Standalone DRS packet (for non-cacheable devices)
+            cache_packet = CacheResponse(CACHE_RESPONSE_STATUS.OK, s2mdrs_packet.get_data_as_int())
+            self._upstream_cache_to_home_agent_fifos.response.put(cache_packet)
+
         self._cur_state.state = COH_STATE_MACHINE.COH_STATE_INIT
 
     # .mem s2m bisnp handler
@@ -378,103 +391,99 @@ class HomeAgent(RunnableComponent):
                 self._cur_state.state = COH_STATE_MACHINE.COH_STATE_WAIT
             self._downstream_cxl_mem_fifos.host_to_target.put(cxl_packet)
 
-    # .mem s2m packet process
-    def _process_downstream_target_to_host_worker(self) -> None:
-        while not self._demux_stop.is_set():
+    # Downstream worker handling CXL.mem packets from device
+    def _process_downstream_packets_worker(self) -> None:
+        while not self._downstream_stop.is_set():
             packet = self._downstream_cxl_mem_fifos.target_to_host.get()
             if packet is None:
                 break
+
             base_packet = cast(BasePacket, packet)
             if not base_packet.is_cxl_mem():
                 raise Exception(f"Received unexpected packet: {base_packet.get_type()}")
             cxl_packet = cast(CxlMemBasePacket, packet)
-            if cxl_packet.is_s2mndr():
-                logger.debug(self._create_message("HomeAgent demux: received S2M NDR"))
-                self._cxl_channel.s2m_ndr.put(cast(CxlMemS2MNDRPacket, packet))
-            elif cxl_packet.is_s2mdrs():
-                logger.debug(self._create_message("HomeAgent demux: received S2M DRS"))
-                self._cxl_channel.s2m_drs.put(cast(CxlMemS2MDRSPacket, packet))
-            elif cxl_packet.is_s2mbisnp():
-                self._cxl_channel.s2m_bisnp.put(cast(CxlMemS2MBISnpPacket, packet))
-            else:
-                raise Exception(f"Received unexpected packet: {cxl_packet.get_type()}")
 
-    # process from host/device channels one by one in state machine
-    def _home_agent_coherency_main_worker(self) -> None:
-        _stop_process = False
-        _fc_run = False
-        _fc_host_run = False
-
-        while not _stop_process and not self._main_stop.is_set():
-            # Response draining policy:
-            # - While waiting (one outstanding request), handle exactly one NDR per loop.
-            #   The NDR handler will consume its paired DRS when meta=ANY.
-            # - When idle (INIT), allow at most one stray DRS to be handled to avoid leftovers.
-            if self._cur_state.state == COH_STATE_MACHINE.COH_STATE_WAIT:
-                if not self._cxl_channel.s2m_ndr.empty():
-                    packet = self._cxl_channel.s2m_ndr.get()
-                    self._process_cxl_s2m_rsp_packet(packet)
-            elif self._cur_state.state == COH_STATE_MACHINE.COH_STATE_INIT:
-                if not self._cxl_channel.s2m_drs.empty():
-                    packet = self._cxl_channel.s2m_drs.get()
-                    self._process_cxl_s2m_drs_packet(packet)
-            # flow control for host/device packets
-            if self._cur_state.state == COH_STATE_MACHINE.COH_STATE_INIT:
-                _fc_run = False
-                if _fc_host_run is False:
-                    if not self._upstream_cache_to_home_agent_fifos.request.empty():
-                        _fc_run = True
-                        _fc_host_run = True
-                    elif not self._cxl_channel.s2m_bisnp.empty():
-                        _fc_run = True
-                        _fc_host_run = False
-                else:
-                    if not self._cxl_channel.s2m_bisnp.empty():
-                        _fc_run = True
-                        _fc_host_run = False
-                    elif not self._upstream_cache_to_home_agent_fifos.request.empty():
-                        _fc_run = True
-                        _fc_host_run = True
-
-                if _fc_run:
-                    if _fc_host_run:
-                        self._cur_state.packet = (
-                            self._upstream_cache_to_home_agent_fifos.request.get()
-                        )
-                        if self._cur_state.packet is None:
-                            logger.debug(
-                                self._create_message(
-                                    "Stop processing home agent coherency main loop"
-                                )
-                            )
-                            _stop_process = True
-                        fn = self._process_upstream_host_to_target_packets
+            with self._state_lock:
+                # Process packets based on current state
+                if self._cur_state.state == COH_STATE_MACHINE.COH_STATE_WAIT and cxl_packet.is_s2mndr():
+                    logger.debug(self._create_message("HomeAgent: received S2M NDR"))
+                    self._process_cxl_s2m_rsp_packet(cast(CxlMemS2MNDRPacket, packet))
+                elif self._cur_state.state == COH_STATE_MACHINE.COH_STATE_INIT and cxl_packet.is_s2mdrs():
+                    logger.debug(self._create_message("HomeAgent: received S2M DRS"))
+                    self._process_cxl_s2m_drs_packet(cast(CxlMemS2MDRSPacket, packet))
+                elif self._cur_state.state == COH_STATE_MACHINE.COH_STATE_INIT and cxl_packet.is_s2mbisnp():
+                    # Handle BISNP packets with flow control coordination
+                    if self._fc_host_run is True:
+                        # It's our turn to process BISNP packets (upstream has priority)
+                        self._cur_state.packet = cast(CxlMemS2MBISnpPacket, packet)
+                        self._cur_state.state = COH_STATE_MACHINE.COH_STATE_START
+                        self._process_cxl_s2m_bisnp_packet(cast(CxlMemS2MBISnpPacket, packet))
+                        self._fc_host_run = False
+                        # Signal upstream worker that it can now check for work
+                        self._flow_control_cv.notify_all()
                     else:
-                        self._cur_state.packet = self._cxl_channel.s2m_bisnp.get()
-                        fn = self._process_cxl_s2m_bisnp_packet
+                        # Upstream worker has priority, put packet back and wait
+                        self._downstream_cxl_mem_fifos.target_to_host.put(packet)
+                        # Wait for upstream worker to finish its turn
+                        self._flow_control_cv.wait(timeout=0.001)
+                else:
+                    # Packet type doesn't match current state - put it back for later processing
+                    logger.debug(self._create_message(f"Packet {cxl_packet.get_type()} not ready for processing in state {self._cur_state.state}"))
+                    self._downstream_cxl_mem_fifos.target_to_host.put(packet)
+                    # Brief pause to avoid busy waiting
+                    time.sleep(0.001)
 
-                    self._cur_state.state = COH_STATE_MACHINE.COH_STATE_START
+    # Upstream worker handling cache requests from host
+    def _process_upstream_packets_worker(self) -> None:
+        _stop_process = False
 
-            # run request processing and response checking code continuously until state changed
-            else:
-                fn(self._cur_state.packet)
+        while not _stop_process and not self._upstream_stop.is_set():
+            cache_packet = self._upstream_cache_to_home_agent_fifos.request.get()
+            if cache_packet is None:
+                logger.debug(self._create_message("Stop processing upstream cache requests"))
+                _stop_process = True
+                break
+
+            with self._state_lock:
+                # Process upstream packets with flow control coordination
+                if self._cur_state.state == COH_STATE_MACHINE.COH_STATE_INIT:
+                    if self._fc_host_run is False:
+                        # We have priority, set flag and process
+                        self._fc_host_run = True
+                        self._cur_state.state = COH_STATE_MACHINE.COH_STATE_START
+                        self._process_upstream_host_to_target_packets(cache_packet)
+                        self._fc_host_run = False
+                        # Signal downstream worker that it can now check for work
+                        self._flow_control_cv.notify_all()
+                    else:
+                        # Downstream worker has priority, put packet back and wait
+                        self._upstream_cache_to_home_agent_fifos.request.put(cache_packet)
+                        # Wait for downstream worker to finish its turn
+                        self._flow_control_cv.wait(timeout=0.001)
+                else:
+                    # State is not INIT, put packet back for later processing
+                    logger.debug(self._create_message(f"Upstream packet not ready for processing in state {self._cur_state.state}"))
+                    self._upstream_cache_to_home_agent_fifos.request.put(cache_packet)
+                    # Brief pause to avoid busy waiting
+                    time.sleep(0.001)
 
     def _run(self):
-        self._demux_stop.clear()
-        self._demux_thread = threading.Thread(
-            target=self._process_downstream_target_to_host_worker,
-            name=f"{self.get_message_label()}-mem-demux",
+        self._downstream_stop.clear()
+        self._downstream_worker_thread = threading.Thread(
+            target=self._process_downstream_packets_worker,
+            name=f"{self.get_message_label()}-downstream-worker",
             daemon=True,
         )
-        self._demux_thread.start()
-        # start main coherency worker thread
-        self._main_stop.clear()
-        self._main_thread = threading.Thread(
-            target=self._home_agent_coherency_main_worker,
-            name=f"{self.get_message_label()}-mem-main",
+        self._downstream_worker_thread.start()
+
+        self._upstream_stop.clear()
+        self._upstream_worker_thread = threading.Thread(
+            target=self._process_upstream_packets_worker,
+            name=f"{self.get_message_label()}-upstream-worker",
             daemon=True,
         )
-        self._main_thread.start()
+        self._upstream_worker_thread.start()
+
         # start memory request workers
         self._io_thread = threading.Thread(
             target=self._process_memory_io_bridge_requests,
@@ -492,8 +501,8 @@ class HomeAgent(RunnableComponent):
         # Block until workers finish
         self._io_thread.join()
         self._coh_thread.join()
-        self._main_thread.join()
-        self._demux_thread.join()
+        self._downstream_worker_thread.join()
+        self._upstream_worker_thread.join()
 
     def _stop(self):
         try:
@@ -502,14 +511,17 @@ class HomeAgent(RunnableComponent):
             self._upstream_cache_to_home_agent_fifos.request.put(None)
         except Exception:
             pass
-        self._demux_stop.set()
+
+        # Stop downstream worker
+        self._downstream_stop.set()
         try:
             self._downstream_cxl_mem_fifos.target_to_host.put(None)
         except Exception:
             pass
-        if self._demux_thread is not None:
-            self._demux_thread.join(timeout=1.0)
-        # stop main coherency worker
-        self._main_stop.set()
-        if self._main_thread is not None:
-            self._main_thread.join(timeout=1.0)
+        if self._downstream_worker_thread is not None:
+            self._downstream_worker_thread.join(timeout=1.0)
+
+        # Stop upstream worker
+        self._upstream_stop.set()
+        if self._upstream_worker_thread is not None:
+            self._upstream_worker_thread.join(timeout=1.0)

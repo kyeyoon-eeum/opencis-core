@@ -62,6 +62,8 @@ class CohStateMachine:
     cache_rsp: CACHE_RESPONSE_STATUS
     cache_list: list
     birsp_sched: bool
+    pending_ndr_status: CACHE_RESPONSE_STATUS | None = None
+    waiting_for_drs: bool = False
 
 
 class CacheCheck(Enum):
