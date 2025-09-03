@@ -59,7 +59,7 @@ class CxlMemManager(PacketProcessor):
             raise Exception("CxlMemoryDeviceComponent isn't set yet")
 
         addr = mem_rd_packet.get_address()
-        logger.info(self._create_message(f"DEVICE MEM_RD addr=0x{addr:x}"))
+        logger.debug(self._create_message(f"DEVICE MEM_RD addr=0x{addr:x}"))
         data = self._memory_device_component.read_mem_sync(addr)
         ld_id = mem_rd_packet.m2sreq_header.ld_id
         logger.debug(self._create_message(f"CXL.mem Read: HPA addr:0x{addr:08x} LD-ID:{ld_id}"))

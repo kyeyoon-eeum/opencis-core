@@ -428,21 +428,21 @@ class CacheController(RunnableComponent):
     def _uncached_load(self, addr: int, size: int) -> int:
         from opencis.util.logger import logger  # local import to avoid cycle at module load
 
-        logger.info(self._create_message(f"UNCACHED_READ req addr=0x{addr:x} size={size}"))
+        logger.debug(self._create_message(f"UNCACHED_READ req addr=0x{addr:x} size={size}"))
         packet = CacheRequest(CACHE_REQUEST_TYPE.UNCACHED_READ, addr, size)
         self._cache_to_coh_agent_fifo.request.put(packet)
         resp = self._cache_to_coh_agent_fifo.response.get()
-        logger.info(self._create_message("UNCACHED_READ rsp OK"))
+        logger.debug(self._create_message("UNCACHED_READ rsp OK"))
         return resp.data
 
     def _uncached_store(self, addr: int, size: int, data: int) -> int:
         from opencis.util.logger import logger  # local import to avoid cycle at module load
 
-        logger.info(self._create_message(f"UNCACHED_WRITE req addr=0x{addr:x} size={size}"))
+        logger.debug(self._create_message(f"UNCACHED_WRITE req addr=0x{addr:x} size={size}"))
         packet = CacheRequest(CACHE_REQUEST_TYPE.UNCACHED_WRITE, addr, size, data)
         self._cache_to_coh_agent_fifo.request.put(packet)
         resp = self._cache_to_coh_agent_fifo.response.get()
-        logger.info(self._create_message("UNCACHED_WRITE rsp OK"))
+        logger.debug(self._create_message("UNCACHED_WRITE rsp OK"))
 
     # registered event loop for processor's cache load/store operations (thread worker)
     def _processor_request_worker(self) -> None:

@@ -227,8 +227,6 @@ class CacheCoherencyBridge(RunnableComponent):
                 self._cur_state.state = COH_STATE_MACHINE.COH_STATE_DONE
 
             elif self._cur_state.state == COH_STATE_MACHINE.COH_STATE_DONE:
-                if self._cxl_channel.d2h_data.empty():
-                    return
                 packet = self._cxl_channel.d2h_data.get()
                 addr = self._cur_state.packet.get_address()
                 mem_packet = MemoryRequest(

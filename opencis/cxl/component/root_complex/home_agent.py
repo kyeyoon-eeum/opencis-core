@@ -93,10 +93,8 @@ class HomeAgent(RunnableComponent):
         self._state_lock = threading.Lock()
         self._flow_control_cv = threading.Condition(self._state_lock)
         self._fc_host_run = False
-        self._downstream_worker_thread: threading.Thread | None = None
-        self._downstream_stop = threading.Event()
-        self._upstream_worker_thread: threading.Thread | None = None
-        self._upstream_stop = threading.Event()
+        self._downstream_worker_thread: threading.Thread = None
+        self._upstream_worker_thread: threading.Thread = None
 
     def _create_m2s_req_packet(
         self,
@@ -209,7 +207,7 @@ class HomeAgent(RunnableComponent):
 
     # .mem s2m rsp handler
     def _process_cxl_s2m_rsp_packet(self, s2mndr_packet: CxlMemS2MNDRPacket):
-        logger.info(self._create_message("Processing S2M NDR in HA"))
+        logger.debug(self._create_message("Processing S2M NDR in HA"))
         if s2mndr_packet.s2mndr_header.opcode == CXL_MEM_S2MNDR_OPCODE.CMP_S:
             status = CACHE_RESPONSE_STATUS.RSP_S
         elif s2mndr_packet.s2mndr_header.opcode == CXL_MEM_S2MNDR_OPCODE.CMP_E:
@@ -244,7 +242,7 @@ class HomeAgent(RunnableComponent):
     # method is only used for non cacheable devices like memory expander
     def _process_cxl_s2m_drs_packet(self, s2mdrs_packet: CxlMemS2MDRSPacket):
         assert s2mdrs_packet.s2mdrs_header.opcode == CXL_MEM_S2MDRS_OPCODE.MEM_DATA
-        logger.info(self._create_message("Processing S2M DRS in HA"))
+        logger.debug(self._create_message("Processing S2M DRS in HA"))
 
         # Check if this DRS corresponds to a pending NDR
         if self._cur_state.waiting_for_drs and self._cur_state.pending_ndr_status is not None:
@@ -339,13 +337,13 @@ class HomeAgent(RunnableComponent):
                 elif cache_packet.type == CACHE_REQUEST_TYPE.UNCACHED_WRITE:
                     meta_value = CXL_MEM_META_VALUE.ANY
 
-                logger.info(self._create_message(f"CXL.mem H2T WR req addr=0x{addr:x}"))
+                logger.debug(self._create_message(f"CXL.mem H2T WR req addr=0x{addr:x}"))
                 cxl_packet = self._create_m2s_rwd_packet(
                     opcode, meta_field, meta_value, snp_type, addr, data
                 )
                 packet = CacheResponse(CACHE_RESPONSE_STATUS.OK)
                 self._upstream_cache_to_home_agent_fifos.response.put(packet)
-                logger.info(self._create_message("CXL.mem H2T WR ack to cache OK"))
+                logger.debug(self._create_message("CXL.mem H2T WR ack to cache OK"))
             else:
                 # HDM-H Normal Read
                 if cache_packet.type == CACHE_REQUEST_TYPE.READ:
@@ -374,7 +372,7 @@ class HomeAgent(RunnableComponent):
                 else:
                     raise Exception(f"Invalid M2S Opcode Type: {cache_packet.type}")
 
-                logger.info(self._create_message(f"CXL.mem H2T RD req addr=0x{addr:x}"))
+                logger.debug(self._create_message(f"CXL.mem H2T RD req addr=0x{addr:x}"))
                 cxl_packet = self._create_m2s_req_packet(
                     opcode, meta_field, meta_value, snp_type, addr
                 )
@@ -393,7 +391,7 @@ class HomeAgent(RunnableComponent):
 
     # Downstream worker handling CXL.mem packets from device
     def _process_downstream_packets_worker(self) -> None:
-        while not self._downstream_stop.is_set():
+        while True:
             packet = self._downstream_cxl_mem_fifos.target_to_host.get()
             if packet is None:
                 break
@@ -435,13 +433,10 @@ class HomeAgent(RunnableComponent):
 
     # Upstream worker handling cache requests from host
     def _process_upstream_packets_worker(self) -> None:
-        _stop_process = False
-
-        while not _stop_process and not self._upstream_stop.is_set():
+        while True:
             cache_packet = self._upstream_cache_to_home_agent_fifos.request.get()
             if cache_packet is None:
                 logger.debug(self._create_message("Stop processing upstream cache requests"))
-                _stop_process = True
                 break
 
             with self._state_lock:
@@ -468,7 +463,6 @@ class HomeAgent(RunnableComponent):
                     time.sleep(0.001)
 
     def _run(self):
-        self._downstream_stop.clear()
         self._downstream_worker_thread = threading.Thread(
             target=self._process_downstream_packets_worker,
             name=f"{self.get_message_label()}-downstream-worker",
@@ -476,7 +470,6 @@ class HomeAgent(RunnableComponent):
         )
         self._downstream_worker_thread.start()
 
-        self._upstream_stop.clear()
         self._upstream_worker_thread = threading.Thread(
             target=self._process_upstream_packets_worker,
             name=f"{self.get_message_label()}-upstream-worker",
@@ -491,13 +484,16 @@ class HomeAgent(RunnableComponent):
             daemon=True,
         )
         self._io_thread.start()
+
         self._coh_thread = threading.Thread(
             target=self._process_memory_coh_bridge_requests,
             name=f"{self.get_message_label()}-coh-req",
             daemon=True,
         )
         self._coh_thread.start()
+
         self._change_status_to_running()
+
         # Block until workers finish
         self._io_thread.join()
         self._coh_thread.join()
@@ -513,7 +509,6 @@ class HomeAgent(RunnableComponent):
             pass
 
         # Stop downstream worker
-        self._downstream_stop.set()
         try:
             self._downstream_cxl_mem_fifos.target_to_host.put(None)
         except Exception:
@@ -522,6 +517,5 @@ class HomeAgent(RunnableComponent):
             self._downstream_worker_thread.join(timeout=1.0)
 
         # Stop upstream worker
-        self._upstream_stop.set()
         if self._upstream_worker_thread is not None:
             self._upstream_worker_thread.join(timeout=1.0)
