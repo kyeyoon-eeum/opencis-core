@@ -5,9 +5,8 @@ This software is licensed under the terms of the Revised BSD License.
 See LICENSE for details.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import threading
-from queue import Queue
 from itertools import cycle
 from typing import cast
 from enum import Enum, auto
@@ -57,11 +56,7 @@ class SF_UPDATE_TYPE(Enum):
     SF_DEVICE_OUT = auto()
 
 
-@dataclass
-class CacheCoherencyBridgeCxlChannel:
-    d2h_req: Queue = field(default_factory=Queue)
-    d2h_rsp: Queue = field(default_factory=Queue)
-    d2h_data: Queue = field(default_factory=Queue)
+
 
 
 @dataclass
@@ -94,13 +89,16 @@ class CacheCoherencyBridge(RunnableComponent):
         )
         self._sf_device = [set() for _ in range(self._num_cache_devices)]
 
-        # emulated .cache d2h channels
-        self._cxl_channel = CacheCoherencyBridgeCxlChannel()
+        # Store pending packets for consumption by request processing
+        self._pending_d2h_data: CxlCacheD2HDataPacket | None = None
+        self._pending_memory_response = None
+
         self._loop = None
-        self._demux_thread: threading.Thread | None = None
-        self._demux_stop = threading.Event()
-        self._main_thread: threading.Thread | None = None
-        self._main_stop = threading.Event()
+        self._state_lock = threading.Lock()
+        self._downstream_worker_thread: threading.Thread | None = None
+        self._upstream_req_worker_thread: threading.Thread | None = None
+        self._upstream_rsp_worker_thread: threading.Thread | None = None
+        self._memory_worker_thread: threading.Thread | None = None
 
         self._uqid_gen = cycle(range(0, 4096))
 
@@ -151,365 +149,389 @@ class CacheCoherencyBridge(RunnableComponent):
 
     # .cache d2h req handler
     def _process_cxl_d2h_req_packet(self, d2hreq_packet: CxlCacheD2HReqPacket):
-        if self._cur_state.state == COH_STATE_MACHINE.COH_STATE_WAIT:
-            return
+        with self._state_lock:
+            if self._cur_state.state == COH_STATE_MACHINE.COH_STATE_WAIT:
+                return
 
-        addr = d2hreq_packet.get_address()
-        cache_id = d2hreq_packet.d2hreq_header.cache_id
-        cqid = d2hreq_packet.d2hreq_header.cqid
-        sf_update_list = []
+            addr = d2hreq_packet.get_address()
+            cache_id = d2hreq_packet.d2hreq_header.cache_id
+            cqid = d2hreq_packet.d2hreq_header.cqid
+            sf_update_list = []
 
-        if d2hreq_packet.d2hreq_header.cache_opcode == CXL_CACHE_D2HREQ_OPCODE.CACHE_RD_OWN_NO_DATA:
-            if self._cur_state.state == COH_STATE_MACHINE.COH_STATE_START:
-                self._cur_state.cache_list = self._snoop_filter_find_cache_list(addr, cache_id)
-                # device cache snoop filter miss
-                if not self._cur_state.cache_list:
-                    self._cur_state.state = COH_STATE_MACHINE.COH_STATE_DONE
-                # snoop needs to wait until all invalid requests are finished
-                else:
-                    self._snoop_invalidate_caches(addr, self._cur_state.cache_list)
-                    self._cur_state.state = COH_STATE_MACHINE.COH_STATE_WAIT
+            if d2hreq_packet.d2hreq_header.cache_opcode == CXL_CACHE_D2HREQ_OPCODE.CACHE_RD_OWN_NO_DATA:
+                if self._cur_state.state == COH_STATE_MACHINE.COH_STATE_START:
+                    self._cur_state.cache_list = self._snoop_filter_find_cache_list(addr, cache_id)
+                    # device cache snoop filter miss
+                    if not self._cur_state.cache_list:
+                        self._cur_state.state = COH_STATE_MACHINE.COH_STATE_DONE
+                    # snoop needs to wait until all invalid requests are finished
+                    else:
+                        self._snoop_invalidate_caches(addr, self._cur_state.cache_list)
+                        self._cur_state.state = COH_STATE_MACHINE.COH_STATE_WAIT
 
-            # invalidate host cache and return to the target device
-            if self._cur_state.state == COH_STATE_MACHINE.COH_STATE_DONE:
-                cache_packet = CacheRequest(CACHE_REQUEST_TYPE.SNP_INV, addr)
-                self._upstream_coh_bridge_to_cache_fifo.request.put(cache_packet)
-                packet = self._upstream_coh_bridge_to_cache_fifo.response.get()
-
-                cxl_packet = CxlCacheCacheH2DRspPacket.create(
-                    cache_id, CXL_CACHE_H2DRSP_OPCODE.GO, CXL_CACHE_H2DRSP_CACHE_STATE.EXCLUSIVE
-                )
-                sf_update_list.append(SF_UPDATE_TYPE.SF_DEVICE_IN)
-                self._downstream_cxl_cache_fifos.host_to_target.put(cxl_packet)
-                self._cur_state.state = COH_STATE_MACHINE.COH_STATE_INIT
-        elif d2hreq_packet.d2hreq_header.cache_opcode == CXL_CACHE_D2HREQ_OPCODE.CACHE_CLEAN_EVICT:
-            if self._cur_state.state == COH_STATE_MACHINE.COH_STATE_START:
-                cxl_packet = CxlCacheCacheH2DRspPacket.create(
-                    cache_id,
-                    CXL_CACHE_H2DRSP_OPCODE.GO_WRITE_PULL_DROP,
-                    self.get_next_uqid(),  # fake UQID allocation
-                    cqid=cqid,
-                )
-                self._downstream_cxl_cache_fifos.host_to_target.put(cxl_packet)
-                self._cur_state.state = COH_STATE_MACHINE.COH_STATE_DONE
-
-            elif self._cur_state.state == COH_STATE_MACHINE.COH_STATE_DONE:
-                sf_update_list.append(SF_UPDATE_TYPE.SF_DEVICE_OUT)
-                self._cur_state.state = COH_STATE_MACHINE.COH_STATE_INIT
-
-        elif (
-            d2hreq_packet.d2hreq_header.cache_opcode
-            == CXL_CACHE_D2HREQ_OPCODE.CACHE_CLEAN_EVICT_NO_DATA
-        ):
-            if self._cur_state.state == COH_STATE_MACHINE.COH_STATE_START:
-                cxl_packet = CxlCacheCacheH2DRspPacket.create(
-                    cache_id,
-                    CXL_CACHE_H2DRSP_OPCODE.GO,
-                    CXL_CACHE_H2DRSP_CACHE_STATE.INVALID,  # MESI for GO mesgs
-                    cqid=cqid,
-                )
-                self._downstream_cxl_cache_fifos.host_to_target.put(cxl_packet)
-                self._cur_state.state = COH_STATE_MACHINE.COH_STATE_DONE
-
-            elif self._cur_state.state == COH_STATE_MACHINE.COH_STATE_DONE:
-                sf_update_list.append(SF_UPDATE_TYPE.SF_DEVICE_OUT)
-                self._cur_state.state = COH_STATE_MACHINE.COH_STATE_INIT
-
-        elif d2hreq_packet.d2hreq_header.cache_opcode == CXL_CACHE_D2HREQ_OPCODE.CACHE_DIRTY_EVICT:
-            if self._cur_state.state == COH_STATE_MACHINE.COH_STATE_START:
-                cxl_packet = CxlCacheCacheH2DRspPacket.create(
-                    cache_id,
-                    CXL_CACHE_H2DRSP_OPCODE.GO_WRITE_PULL,
-                    self.get_next_uqid(),  # fake UQID allocation
-                    cqid=cqid,
-                )
-                self._downstream_cxl_cache_fifos.host_to_target.put(cxl_packet)
-                self._cur_state.state = COH_STATE_MACHINE.COH_STATE_DONE
-
-            elif self._cur_state.state == COH_STATE_MACHINE.COH_STATE_DONE:
-                packet = self._cxl_channel.d2h_data.get()
-                addr = self._cur_state.packet.get_address()
-                mem_packet = MemoryRequest(
-                    MEMORY_REQUEST_TYPE.WRITE, addr, 64, packet.get_data_as_int()
-                )
-                self._memory_producer_fifos.request.put(mem_packet)
-                sf_update_list.append(SF_UPDATE_TYPE.SF_DEVICE_OUT)
-                self._cur_state.state = COH_STATE_MACHINE.COH_STATE_INIT
-
-        elif d2hreq_packet.d2hreq_header.cache_opcode == CXL_CACHE_D2HREQ_OPCODE.CACHE_RD_SHARED:
-            if self._cur_state.state == COH_STATE_MACHINE.COH_STATE_START:
-                self._cur_state.cache_list = self._snoop_filter_find_cache_list(addr, cache_id)
-                # device cache snoop filter miss
-                if not self._cur_state.cache_list or len(self._cur_state.cache_list) > 1:
-                    self._cur_state.cache_rsp = CACHE_RESPONSE_STATUS.OK
-                    self._cur_state.state = COH_STATE_MACHINE.COH_STATE_DONE
-                # snoop needs to wait until exclusive read request is finished
-                else:
-                    self._snoop_read_latest_data(
-                        addr, self._cur_state.cache_list, CXL_CACHE_H2DREQ_OPCODE.SNP_DATA
-                    )
-                    self._cur_state.state = COH_STATE_MACHINE.COH_STATE_WAIT
-
-            # share host cache and return to the target device
-            if self._cur_state.state == COH_STATE_MACHINE.COH_STATE_DONE:
-                if self._cur_state.cache_rsp == CACHE_RESPONSE_STATUS.RSP_M:
-                    if self._cxl_channel.d2h_data.empty():
-                        return
-                    packet = self._cxl_channel.d2h_data.get()
-                    data = packet.data
-                else:
-                    cache_packet = CacheRequest(CACHE_REQUEST_TYPE.SNP_DATA, addr)
+                # invalidate host cache and return to the target device
+                if self._cur_state.state == COH_STATE_MACHINE.COH_STATE_DONE:
+                    cache_packet = CacheRequest(CACHE_REQUEST_TYPE.SNP_INV, addr)
                     self._upstream_coh_bridge_to_cache_fifo.request.put(cache_packet)
                     packet = self._upstream_coh_bridge_to_cache_fifo.response.get()
 
-                    if packet.status == CACHE_RESPONSE_STATUS.RSP_MISS:
-                        data = self._sync_memory_read(addr)
+                    cxl_packet = CxlCacheCacheH2DRspPacket.create(
+                        cache_id, CXL_CACHE_H2DRSP_OPCODE.GO, CXL_CACHE_H2DRSP_CACHE_STATE.EXCLUSIVE
+                    )
+                    sf_update_list.append(SF_UPDATE_TYPE.SF_DEVICE_IN)
+                    self._downstream_cxl_cache_fifos.host_to_target.put(cxl_packet)
+                    self._cur_state.state = COH_STATE_MACHINE.COH_STATE_INIT
+            elif d2hreq_packet.d2hreq_header.cache_opcode == CXL_CACHE_D2HREQ_OPCODE.CACHE_CLEAN_EVICT:
+                if self._cur_state.state == COH_STATE_MACHINE.COH_STATE_START:
+                    cxl_packet = CxlCacheCacheH2DRspPacket.create(
+                        cache_id,
+                        CXL_CACHE_H2DRSP_OPCODE.GO_WRITE_PULL_DROP,
+                        self.get_next_uqid(),  # fake UQID allocation
+                        cqid=cqid,
+                    )
+                    self._downstream_cxl_cache_fifos.host_to_target.put(cxl_packet)
+                    self._cur_state.state = COH_STATE_MACHINE.COH_STATE_DONE
+
+                elif self._cur_state.state == COH_STATE_MACHINE.COH_STATE_DONE:
+                    sf_update_list.append(SF_UPDATE_TYPE.SF_DEVICE_OUT)
+                    self._cur_state.state = COH_STATE_MACHINE.COH_STATE_INIT
+
+            elif (
+                d2hreq_packet.d2hreq_header.cache_opcode
+                == CXL_CACHE_D2HREQ_OPCODE.CACHE_CLEAN_EVICT_NO_DATA
+            ):
+                if self._cur_state.state == COH_STATE_MACHINE.COH_STATE_START:
+                    cxl_packet = CxlCacheCacheH2DRspPacket.create(
+                        cache_id,
+                        CXL_CACHE_H2DRSP_OPCODE.GO,
+                        CXL_CACHE_H2DRSP_CACHE_STATE.INVALID,  # MESI for GO mesgs
+                        cqid=cqid,
+                    )
+                    self._downstream_cxl_cache_fifos.host_to_target.put(cxl_packet)
+                    self._cur_state.state = COH_STATE_MACHINE.COH_STATE_DONE
+
+                elif self._cur_state.state == COH_STATE_MACHINE.COH_STATE_DONE:
+                    sf_update_list.append(SF_UPDATE_TYPE.SF_DEVICE_OUT)
+                    self._cur_state.state = COH_STATE_MACHINE.COH_STATE_INIT
+
+            elif d2hreq_packet.d2hreq_header.cache_opcode == CXL_CACHE_D2HREQ_OPCODE.CACHE_DIRTY_EVICT:
+                if self._cur_state.state == COH_STATE_MACHINE.COH_STATE_START:
+                    cxl_packet = CxlCacheCacheH2DRspPacket.create(
+                        cache_id,
+                        CXL_CACHE_H2DRSP_OPCODE.GO_WRITE_PULL,
+                        self.get_next_uqid(),  # fake UQID allocation
+                        cqid=cqid,
+                    )
+                    self._downstream_cxl_cache_fifos.host_to_target.put(cxl_packet)
+                    self._cur_state.state = COH_STATE_MACHINE.COH_STATE_DONE
+
+                elif self._cur_state.state == COH_STATE_MACHINE.COH_STATE_DONE:
+                    if self._pending_d2h_data is None:
+                        return
+                    packet = self._pending_d2h_data
+                    addr = self._cur_state.packet.get_address()
+                    mem_packet = MemoryRequest(
+                        MEMORY_REQUEST_TYPE.WRITE, addr, 64, packet.get_data_as_int()
+                    )
+                    self._memory_producer_fifos.request.put(mem_packet)
+                    sf_update_list.append(SF_UPDATE_TYPE.SF_DEVICE_OUT)
+                    self._pending_d2h_data = None
+                    self._cur_state.state = COH_STATE_MACHINE.COH_STATE_INIT
+
+            elif d2hreq_packet.d2hreq_header.cache_opcode == CXL_CACHE_D2HREQ_OPCODE.CACHE_RD_SHARED:
+                if self._cur_state.state == COH_STATE_MACHINE.COH_STATE_START:
+                    self._cur_state.cache_list = self._snoop_filter_find_cache_list(addr, cache_id)
+                    # device cache snoop filter miss
+                    if not self._cur_state.cache_list or len(self._cur_state.cache_list) > 1:
+                        self._cur_state.cache_rsp = CACHE_RESPONSE_STATUS.OK
+                        self._cur_state.state = COH_STATE_MACHINE.COH_STATE_DONE
+                    # snoop needs to wait until exclusive read request is finished
                     else:
+                        self._snoop_read_latest_data(
+                            addr, self._cur_state.cache_list, CXL_CACHE_H2DREQ_OPCODE.SNP_DATA
+                        )
+                        self._cur_state.state = COH_STATE_MACHINE.COH_STATE_WAIT
+
+                # share host cache and return to the target device
+                if self._cur_state.state == COH_STATE_MACHINE.COH_STATE_DONE:
+                    if self._cur_state.cache_rsp == CACHE_RESPONSE_STATUS.RSP_M:
+                        if self._pending_d2h_data is None:
+                            return
+                        packet = self._pending_d2h_data
                         data = packet.data
+                        self._pending_d2h_data = None
+                    else:
+                        cache_packet = CacheRequest(CACHE_REQUEST_TYPE.SNP_DATA, addr)
+                        self._upstream_coh_bridge_to_cache_fifo.request.put(cache_packet)
+                        packet = self._upstream_coh_bridge_to_cache_fifo.response.get()
 
-                cxl_packet = CxlCacheCacheH2DRspPacket.create(
-                    cache_id, CXL_CACHE_H2DRSP_OPCODE.GO, CXL_CACHE_H2DRSP_CACHE_STATE.SHARED
-                )
-                sf_update_list.append(SF_UPDATE_TYPE.SF_DEVICE_IN)
-                self._downstream_cxl_cache_fifos.host_to_target.put(cxl_packet)
+                        if packet.status == CACHE_RESPONSE_STATUS.RSP_MISS:
+                            data = self._sync_memory_read(addr)
+                        else:
+                            data = packet.data
 
-                cxl_packet = CxlCacheCacheH2DDataPacket.create(cache_id, data, cqid)
-                self._downstream_cxl_cache_fifos.host_to_target.put(cxl_packet)
-                self._cur_state.state = COH_STATE_MACHINE.COH_STATE_INIT
+                    cxl_packet = CxlCacheCacheH2DRspPacket.create(
+                        cache_id, CXL_CACHE_H2DRSP_OPCODE.GO, CXL_CACHE_H2DRSP_CACHE_STATE.SHARED
+                    )
+                    sf_update_list.append(SF_UPDATE_TYPE.SF_DEVICE_IN)
+                    self._downstream_cxl_cache_fifos.host_to_target.put(cxl_packet)
 
-        if sf_update_list:
-            self._snoop_filter_update(addr, cache_id, sf_update_list)
+                    cxl_packet = CxlCacheCacheH2DDataPacket.create(cache_id, data, cqid)
+                    self._downstream_cxl_cache_fifos.host_to_target.put(cxl_packet)
+                    self._cur_state.state = COH_STATE_MACHINE.COH_STATE_INIT
+
+            if sf_update_list:
+                self._snoop_filter_update(addr, cache_id, sf_update_list)
 
     # .cache d2h rsp handler
     def _process_cxl_d2h_rsp_packet(self, d2hrsp_packet: CxlCacheD2HRspPacket):
-        sf_update_list = []
+        with self._state_lock:
+            sf_update_list = []
 
-        if d2hrsp_packet.d2hrsp_header.cache_opcode < CXL_CACHE_D2HRSP_OPCODE.RSP_S_FWD_M:
-            if d2hrsp_packet.d2hrsp_header.cache_opcode in (
-                CXL_CACHE_D2HRSP_OPCODE.RSP_I_HIT_I,
-                CXL_CACHE_D2HRSP_OPCODE.RSP_I_HIT_SE,
-            ):
-                self._cur_state.cache_rsp = CACHE_RESPONSE_STATUS.RSP_I
-                sf_update_list.append(SF_UPDATE_TYPE.SF_DEVICE_OUT)
-            elif d2hrsp_packet.d2hrsp_header.cache_opcode == CXL_CACHE_D2HRSP_OPCODE.RSP_S_HIT_SE:
-                self._cur_state.cache_rsp = CACHE_RESPONSE_STATUS.RSP_S
+            if d2hrsp_packet.d2hrsp_header.cache_opcode < CXL_CACHE_D2HRSP_OPCODE.RSP_S_FWD_M:
+                if d2hrsp_packet.d2hrsp_header.cache_opcode in (
+                    CXL_CACHE_D2HRSP_OPCODE.RSP_I_HIT_I,
+                    CXL_CACHE_D2HRSP_OPCODE.RSP_I_HIT_SE,
+                ):
+                    self._cur_state.cache_rsp = CACHE_RESPONSE_STATUS.RSP_I
+                    sf_update_list.append(SF_UPDATE_TYPE.SF_DEVICE_OUT)
+                elif d2hrsp_packet.d2hrsp_header.cache_opcode == CXL_CACHE_D2HRSP_OPCODE.RSP_S_HIT_SE:
+                    self._cur_state.cache_rsp = CACHE_RESPONSE_STATUS.RSP_S
 
-            assert len(self._cur_state.cache_list) != 0
-            cache_id = self._cur_state.cache_list.pop()
+                assert len(self._cur_state.cache_list) != 0
+                cache_id = self._cur_state.cache_list.pop()
 
-            if len(self._cur_state.cache_list) == 0:
+                if len(self._cur_state.cache_list) == 0:
+                    self._cur_state.state = COH_STATE_MACHINE.COH_STATE_DONE
+
+            else:
+                if d2hrsp_packet.d2hrsp_header.cache_opcode in (
+                    CXL_CACHE_D2HRSP_OPCODE.RSP_S_FWD_M,
+                    CXL_CACHE_D2HRSP_OPCODE.RSP_V_FWD_V,
+                ):
+                    self._cur_state.cache_rsp = CACHE_RESPONSE_STATUS.RSP_M
+                elif d2hrsp_packet.d2hrsp_header.cache_opcode == CXL_CACHE_D2HRSP_OPCODE.RSP_I_FWD_M:
+                    self._cur_state.cache_rsp = CACHE_RESPONSE_STATUS.RSP_I
+                    sf_update_list.append(SF_UPDATE_TYPE.SF_DEVICE_OUT)
+                cache_id = self._cur_state.cache_list.pop()
                 self._cur_state.state = COH_STATE_MACHINE.COH_STATE_DONE
 
-        else:
-            if d2hrsp_packet.d2hrsp_header.cache_opcode in (
-                CXL_CACHE_D2HRSP_OPCODE.RSP_S_FWD_M,
-                CXL_CACHE_D2HRSP_OPCODE.RSP_V_FWD_V,
-            ):
-                self._cur_state.cache_rsp = CACHE_RESPONSE_STATUS.RSP_M
-            elif d2hrsp_packet.d2hrsp_header.cache_opcode == CXL_CACHE_D2HRSP_OPCODE.RSP_I_FWD_M:
-                self._cur_state.cache_rsp = CACHE_RESPONSE_STATUS.RSP_I
-                sf_update_list.append(SF_UPDATE_TYPE.SF_DEVICE_OUT)
-            cache_id = self._cur_state.cache_list.pop()
-            self._cur_state.state = COH_STATE_MACHINE.COH_STATE_DONE
-
-        if sf_update_list:
-            addr = self._cur_state.packet.get_address()
-            self._snoop_filter_update(addr, cache_id, sf_update_list)
+            if sf_update_list:
+                addr = self._cur_state.packet.get_address()
+                self._snoop_filter_update(addr, cache_id, sf_update_list)
 
     # .cache h2d packet process
     # pylint: disable=duplicate-code
     def _process_upstream_host_to_target_packets(self, cache_packet: CacheRequest):
-        if self._cur_state.state == COH_STATE_MACHINE.COH_STATE_WAIT:
-            return
+        with self._state_lock:
+            if self._cur_state.state == COH_STATE_MACHINE.COH_STATE_WAIT:
+                return
 
-        if self._cur_state.state == COH_STATE_MACHINE.COH_STATE_START:
-            addr = cache_packet.addr
+            if self._cur_state.state == COH_STATE_MACHINE.COH_STATE_START:
+                addr = cache_packet.addr
 
-            if cache_packet.type in (
-                CACHE_REQUEST_TYPE.WRITE_BACK,
-                CACHE_REQUEST_TYPE.WRITE_BACK_CLEAN,
-            ):
-                if cache_packet.type == CACHE_REQUEST_TYPE.WRITE_BACK:
-                    mem_packet = MemoryRequest(
-                        MEMORY_REQUEST_TYPE.WRITE, addr, cache_packet.size, cache_packet.data
-                    )
-                    self._memory_producer_fifos.request.put(mem_packet)
-                cache_packet = CacheResponse(CACHE_RESPONSE_STATUS.OK)
-                self._upstream_cache_to_coh_bridge_fifo.response.put(cache_packet)
-                self._cur_state.state = COH_STATE_MACHINE.COH_STATE_INIT
-            else:
-                # device cache snoop filter miss
-                # host can access without sending any transaction to the devices whatsoever
-                self._cur_state.cache_list = self._snoop_filter_find_cache_list(addr)
-                if not self._cur_state.cache_list:
-                    if cache_packet.type == CACHE_REQUEST_TYPE.SNP_INV:
-                        status = CACHE_RESPONSE_STATUS.RSP_I
-                        cache_packet = CacheResponse(status)
-                    else:
-                        if cache_packet.type == CACHE_REQUEST_TYPE.SNP_DATA:
-                            status = CACHE_RESPONSE_STATUS.RSP_S
-                        elif cache_packet.type == CACHE_REQUEST_TYPE.SNP_CUR:
-                            status = CACHE_RESPONSE_STATUS.RSP_V
-                        data = self._sync_memory_read(addr)
-                        cache_packet = CacheResponse(status, data)
+                if cache_packet.type in (
+                    CACHE_REQUEST_TYPE.WRITE_BACK,
+                    CACHE_REQUEST_TYPE.WRITE_BACK_CLEAN,
+                ):
+                    if cache_packet.type == CACHE_REQUEST_TYPE.WRITE_BACK:
+                        mem_packet = MemoryRequest(
+                            MEMORY_REQUEST_TYPE.WRITE, addr, cache_packet.size, cache_packet.data
+                        )
+                        self._memory_producer_fifos.request.put(mem_packet)
+                    cache_packet = CacheResponse(CACHE_RESPONSE_STATUS.OK)
                     self._upstream_cache_to_coh_bridge_fifo.response.put(cache_packet)
                     self._cur_state.state = COH_STATE_MACHINE.COH_STATE_INIT
-                # device cache snoop filter hit
-                # host needs to resolve coherency for the requested line
-                elif cache_packet.type == CACHE_REQUEST_TYPE.SNP_INV:
-                    self._snoop_invalidate_caches(addr, self._cur_state.cache_list)
-                    self._cur_state.state = COH_STATE_MACHINE.COH_STATE_WAIT
                 else:
-                    # cacheline is in shared status
-                    if len(self._cur_state.cache_list) > 1:
-                        data = self._sync_memory_read(addr)
-                        if cache_packet.type == CACHE_REQUEST_TYPE.SNP_DATA:
-                            status = CACHE_RESPONSE_STATUS.RSP_S
-                        elif cache_packet.type == CACHE_REQUEST_TYPE.SNP_CUR:
-                            status = CACHE_RESPONSE_STATUS.RSP_V
-                        cache_packet = CacheResponse(status, data)
+                    # device cache snoop filter miss
+                    # host can access without sending any transaction to the devices whatsoever
+                    self._cur_state.cache_list = self._snoop_filter_find_cache_list(addr)
+                    if not self._cur_state.cache_list:
+                        if cache_packet.type == CACHE_REQUEST_TYPE.SNP_INV:
+                            status = CACHE_RESPONSE_STATUS.RSP_I
+                            cache_packet = CacheResponse(status)
+                        else:
+                            if cache_packet.type == CACHE_REQUEST_TYPE.SNP_DATA:
+                                status = CACHE_RESPONSE_STATUS.RSP_S
+                            elif cache_packet.type == CACHE_REQUEST_TYPE.SNP_CUR:
+                                status = CACHE_RESPONSE_STATUS.RSP_V
+                            data = self._sync_memory_read(addr)
+                            cache_packet = CacheResponse(status, data)
                         self._upstream_cache_to_coh_bridge_fifo.response.put(cache_packet)
                         self._cur_state.state = COH_STATE_MACHINE.COH_STATE_INIT
-                    # cacheline is in modified or exclusive status
-                    else:
-                        if cache_packet.type == CACHE_REQUEST_TYPE.SNP_DATA:
-                            opcode = CXL_CACHE_H2DREQ_OPCODE.SNP_DATA
-                        elif cache_packet.type == CACHE_REQUEST_TYPE.SNP_CUR:
-                            opcode = CXL_CACHE_H2DREQ_OPCODE.SNP_CUR
-                        self._snoop_read_latest_data(addr, self._cur_state.cache_list, opcode)
+                    # device cache snoop filter hit
+                    # host needs to resolve coherency for the requested line
+                    elif cache_packet.type == CACHE_REQUEST_TYPE.SNP_INV:
+                        self._snoop_invalidate_caches(addr, self._cur_state.cache_list)
                         self._cur_state.state = COH_STATE_MACHINE.COH_STATE_WAIT
+                    else:
+                        # cacheline is in shared status
+                        if len(self._cur_state.cache_list) > 1:
+                            data = self._sync_memory_read(addr)
+                            if cache_packet.type == CACHE_REQUEST_TYPE.SNP_DATA:
+                                status = CACHE_RESPONSE_STATUS.RSP_S
+                            elif cache_packet.type == CACHE_REQUEST_TYPE.SNP_CUR:
+                                status = CACHE_RESPONSE_STATUS.RSP_V
+                            cache_packet = CacheResponse(status, data)
+                            self._upstream_cache_to_coh_bridge_fifo.response.put(cache_packet)
+                            self._cur_state.state = COH_STATE_MACHINE.COH_STATE_INIT
+                        # cacheline is in modified or exclusive status
+                        else:
+                            if cache_packet.type == CACHE_REQUEST_TYPE.SNP_DATA:
+                                opcode = CXL_CACHE_H2DREQ_OPCODE.SNP_DATA
+                            elif cache_packet.type == CACHE_REQUEST_TYPE.SNP_CUR:
+                                opcode = CXL_CACHE_H2DREQ_OPCODE.SNP_CUR
+                            self._snoop_read_latest_data(addr, self._cur_state.cache_list, opcode)
+                            self._cur_state.state = COH_STATE_MACHINE.COH_STATE_WAIT
 
-        if self._cur_state.state == COH_STATE_MACHINE.COH_STATE_DONE:
-            if self._cur_state.cache_rsp in (
-                CACHE_RESPONSE_STATUS.RSP_I,
-                CACHE_RESPONSE_STATUS.RSP_S,
-            ):
-                addr = self._cur_state.packet.addr
-                data = self._sync_memory_read(addr)
-            elif self._cur_state.cache_rsp == CACHE_RESPONSE_STATUS.RSP_M:
-                if self._cxl_channel.d2h_data.empty():
-                    return
-                packet = self._cxl_channel.d2h_data.get()
-                data = packet.get_data_as_int()
-            else:  # Unsupported for now
-                assert 0
-            cache_packet = CacheResponse(self._cur_state.cache_rsp, data)
-            self._upstream_cache_to_coh_bridge_fifo.response.put(cache_packet)
-            self._cur_state.state = COH_STATE_MACHINE.COH_STATE_INIT
+            if self._cur_state.state == COH_STATE_MACHINE.COH_STATE_DONE:
+                if self._cur_state.cache_rsp in (
+                    CACHE_RESPONSE_STATUS.RSP_I,
+                    CACHE_RESPONSE_STATUS.RSP_S,
+                ):
+                    addr = self._cur_state.packet.addr
+                    data = self._sync_memory_read(addr)
+                elif self._cur_state.cache_rsp == CACHE_RESPONSE_STATUS.RSP_M:
+                    if self._pending_d2h_data is None:
+                        return
+                    packet = self._pending_d2h_data
+                    data = packet.get_data_as_int()
+                    self._pending_d2h_data = None
+                else:  # Unsupported for now
+                    assert 0
+                cache_packet = CacheResponse(self._cur_state.cache_rsp, data)
+                self._upstream_cache_to_coh_bridge_fifo.response.put(cache_packet)
+                self._cur_state.state = COH_STATE_MACHINE.COH_STATE_INIT
 
-    # .cache d2h packet process
-    def _process_downstream_target_to_host_worker(self) -> None:
-        while not self._demux_stop.is_set():
+    # Downstream worker: handles D2H packets from device
+    def _process_downstream_packets_worker(self) -> None:
+        while True:
             packet = self._downstream_cxl_cache_fifos.target_to_host.get()
             if packet is None:
                 break
+
             base_packet = cast(BasePacket, packet)
             if not base_packet.is_cxl_cache():
                 raise Exception(f"Received unexpected packet: {base_packet.get_type()}")
             cxl_packet = cast(CxlCacheBasePacket, packet)
+
+            # Process packets directly based on type
             if cxl_packet.is_d2hreq():
-                self._cxl_channel.d2h_req.put(cast(CxlCacheD2HReqPacket, packet))
+                self._process_cxl_d2h_req_packet(cast(CxlCacheD2HReqPacket, packet))
             elif cxl_packet.is_d2hrsp():
-                self._cxl_channel.d2h_rsp.put(cast(CxlCacheD2HRspPacket, packet))
+                self._process_cxl_d2h_rsp_packet(cast(CxlCacheD2HRspPacket, packet))
             elif cxl_packet.is_d2hdata():
-                self._cxl_channel.d2h_data.put(cast(CxlCacheD2HDataPacket, packet))
+                # Handle D2H data packets - these need special handling as they're consumed
+                # by the request processing logic when needed
+                # For now, we'll store it for later consumption
+                self._pending_d2h_data = cast(CxlCacheD2HDataPacket, packet)
             else:
                 raise Exception(f"Received unexpected packet: {cxl_packet.get_type()}")
 
-    # process from host/device channels one by one in state machine
-    def _cache_coherency_bridge_main_worker(self) -> None:
-        _stop_process = False
-        _fc_run = False
-        _fc_host_run = False
+    # Upstream request worker: handles cache requests from upstream
+    def _process_upstream_requests_worker(self) -> None:
+        while True:
+            cache_packet = self._upstream_cache_to_coh_bridge_fifo.request.get()
+            if cache_packet is None:
+                logger.debug(self._create_message("Stop processing upstream cache requests"))
+                break
 
-        while not _stop_process and not self._main_stop.is_set():
-            # Drain at most one pending D2H RSP per iteration to avoid starvation (transport-only)
-            if not self._cxl_channel.d2h_rsp.empty():
-                packet = self._cxl_channel.d2h_rsp.get()
-                self._process_cxl_d2h_rsp_packet(packet)
-            # flow control for host/device packets
-            # link state machine and function to the current request
-            if self._cur_state.state == COH_STATE_MACHINE.COH_STATE_INIT:
-                _fc_run = False
-                if _fc_host_run is False:
-                    if not self._upstream_cache_to_coh_bridge_fifo.request.empty():
-                        _fc_run = True
-                        _fc_host_run = True
-                    elif not self._cxl_channel.d2h_req.empty():
-                        _fc_run = True
-                        _fc_host_run = False
-                else:
-                    if not self._cxl_channel.d2h_req.empty():
-                        _fc_run = True
-                        _fc_host_run = False
-                    elif not self._upstream_cache_to_coh_bridge_fifo.request.empty():
-                        _fc_run = True
-                        _fc_host_run = True
+            # Process upstream cache request directly
+            self._process_upstream_host_to_target_packets(cache_packet)
 
-                if _fc_run:
-                    if _fc_host_run:
-                        self._cur_state.packet = (
-                            self._upstream_cache_to_coh_bridge_fifo.request.get()
-                        )
-                        if self._cur_state.packet is None:
-                            logger.debug(
-                                self._create_message(
-                                    "Stop processing cache coherency bridge main loop"
-                                )
-                            )
-                            _stop_process = True
-                        fn = self._process_upstream_host_to_target_packets
-                    else:
-                        self._cur_state.packet = self._cxl_channel.d2h_req.get()
-                        fn = self._process_cxl_d2h_req_packet
+    # Upstream response worker: handles responses from cache operations
+    def _process_upstream_responses_worker(self) -> None:
+        while True:
+            cache_packet = self._upstream_coh_bridge_to_cache_fifo.response.get()
+            if cache_packet is None:
+                logger.debug(self._create_message("Stop processing upstream cache responses"))
+                break
 
-                    self._cur_state.state = COH_STATE_MACHINE.COH_STATE_START
+            # Process cache response - this would typically be handled by the request processing logic
+            # For now, we'll just log it as the response handling is integrated into the request processing
+            logger.debug(self._create_message(f"Received cache response: {cache_packet.status}"))
 
-            # run request processing and response checking code continuously until state changed
-            # data packets are extracted and consumed in request processing code
-            else:
-                fn(self._cur_state.packet)
+    # Memory response worker: handles responses from memory operations
+    def _process_memory_responses_worker(self) -> None:
+        while True:
+            memory_packet = self._memory_producer_fifos.response.get()
+            if memory_packet is None:
+                logger.debug(self._create_message("Stop processing memory responses"))
+                break
 
-                if not self._cxl_channel.d2h_rsp.empty():
-                    packet = self._cxl_channel.d2h_rsp.get()
-                    self._process_cxl_d2h_rsp_packet(packet)
+            # Memory responses are typically consumed synchronously in the request processing
+            # For now, we'll store it for later consumption if needed
+            self._pending_memory_response = memory_packet
 
     def _run(self):
-        self._demux_stop.clear()
-        self._demux_thread = threading.Thread(
-            target=self._process_downstream_target_to_host_worker,
-            name=f"{self.get_message_label()}-cache-demux",
+        # Start downstream worker for D2H packets
+        self._downstream_worker_thread = threading.Thread(
+            target=self._process_downstream_packets_worker,
+            name=f"{self.get_message_label()}-downstream",
             daemon=True,
         )
-        self._demux_thread.start()
-        self._main_stop.clear()
-        self._main_thread = threading.Thread(
-            target=self._cache_coherency_bridge_main_worker,
-            name=f"{self.get_message_label()}-cache-main",
+        self._downstream_worker_thread.start()
+
+        # Start upstream request worker for cache requests
+        self._upstream_req_worker_thread = threading.Thread(
+            target=self._process_upstream_requests_worker,
+            name=f"{self.get_message_label()}-upstream-req",
             daemon=True,
         )
-        self._main_thread.start()
+        self._upstream_req_worker_thread.start()
+
+        # Start upstream response worker for cache responses
+        self._upstream_rsp_worker_thread = threading.Thread(
+            target=self._process_upstream_responses_worker,
+            name=f"{self.get_message_label()}-upstream-rsp",
+            daemon=True,
+        )
+        self._upstream_rsp_worker_thread.start()
+
+        # Start memory response worker
+        self._memory_worker_thread = threading.Thread(
+            target=self._process_memory_responses_worker,
+            name=f"{self.get_message_label()}-memory",
+            daemon=True,
+        )
+        self._memory_worker_thread.start()
+
         self._change_status_to_running()
         # Block until threads finish
-        self._main_thread.join()
-        self._demux_thread.join()
+        self._downstream_worker_thread.join()
+        self._upstream_req_worker_thread.join()
+        self._upstream_rsp_worker_thread.join()
+        self._memory_worker_thread.join()
 
     def _stop(self):
-        self._demux_stop.set()
+        # Stop downstream worker
         try:
             self._downstream_cxl_cache_fifos.target_to_host.put(None)
         except Exception:
             pass
-        if self._demux_thread is not None:
-            self._demux_thread.join(timeout=1.0)
-        self._main_stop.set()
+        if self._downstream_worker_thread is not None:
+            self._downstream_worker_thread.join(timeout=1.0)
+
+        # Stop upstream request worker
         try:
             self._upstream_cache_to_coh_bridge_fifo.request.put(None)
         except Exception:
             pass
-        if self._main_thread is not None:
-            self._main_thread.join(timeout=1.0)
+        if self._upstream_req_worker_thread is not None:
+            self._upstream_req_worker_thread.join(timeout=1.0)
+
+        # Stop upstream response worker
         try:
-            self._upstream_cache_to_coh_bridge_fifo.request.put(None)
+            self._upstream_coh_bridge_to_cache_fifo.response.put(None)
         except Exception:
             pass
+        if self._upstream_rsp_worker_thread is not None:
+            self._upstream_rsp_worker_thread.join(timeout=1.0)
+
+        # Stop memory worker
+        try:
+            self._memory_producer_fifos.response.put(None)
+        except Exception:
+            pass
+        if self._memory_worker_thread is not None:
+            self._memory_worker_thread.join(timeout=1.0)
