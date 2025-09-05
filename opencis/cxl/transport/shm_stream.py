@@ -70,8 +70,8 @@ class ShmEndpoint:
 class ShmStreamPair:
     def __init__(self, port_index: int, is_server: bool, namespace: str = "switch"):
         self._endpoint = ShmEndpoint(port_index, is_server, namespace)
-        self.reader = ShmStreamReader(self._endpoint)
-        self.writer = ShmStreamWriter(self._endpoint)
+        self.reader = ShmStreamReader(self._endpoint._in_ring)
+        self.writer = ShmStreamWriter(self._endpoint._out_ring)
         logger.debug(
             f"[ShmStreamPair] created for port={port_index} server={is_server} ns={namespace}"
         )

@@ -19,9 +19,8 @@ MAX_PAYLOAD = DEFAULT_ELEM_SIZE - HEADER_SIZE
 
 
 cdef class ShmStreamReader:
-    def __cinit__(self, object endpoint):
-        self._ep = endpoint
-        self._in_ring = <_shm_c.ShmRing> getattr(endpoint, "_in_ring")
+    def __cinit__(self, object in_ring):
+        self._in_ring = in_ring
         self._left_off = 0
         self._left_len = 0
 
@@ -71,9 +70,8 @@ cdef class ShmStreamReader:
 
 
 cdef class ShmStreamWriter:
-    def __cinit__(self, object endpoint):
-        self._ep = endpoint
-        self._out_ring = <_shm_c.ShmRing> getattr(endpoint, "_out_ring")
+    def __cinit__(self, object out_ring):
+        self._out_ring = out_ring
         self._pending = deque()
 
     def write(self, data):
@@ -97,46 +95,3 @@ cdef class ShmStreamWriter:
                 # keep reference without slicing
                 self._pending.append((data, offset, take))
             offset += take
-
-    async def drain(self):
-        cdef object item
-        cdef object data
-        cdef Py_ssize_t offset
-        cdef Py_ssize_t length
-        cdef const unsigned char* ptr
-        while self._pending:
-            item = self._pending[0]
-            data, offset, length = item
-            if isinstance(data, bytes):
-                ptr = <const unsigned char*> PyBytes_AsString(data)
-            else:
-                ptr = <const unsigned char*> PyByteArray_AS_STRING(data)
-            if self._out_ring.try_push_frame_from(ptr + offset, <size_t>length):
-                self._pending.popleft()
-            else:
-                await asyncio.sleep(0)
-                return
-        return None
-
-    def close(self):
-        self._ep.close()
-
-    def drain_blocking(self):
-        """Blocking drain of pending frames using ring's wait-for-space helper."""
-        cdef object item
-        cdef object data
-        cdef Py_ssize_t offset
-        cdef Py_ssize_t length
-        cdef const unsigned char* ptr
-        while self._pending:
-            item = self._pending[0]
-            data, offset, length = item
-            if isinstance(data, bytes):
-                ptr = <const unsigned char*> PyBytes_AsString(data)
-            else:
-                ptr = <const unsigned char*> PyByteArray_AS_STRING(data)
-            if self._out_ring.push_frame_wait_from(ptr + offset, <size_t>length, 1000000):
-                self._pending.popleft()
-            else:
-                # Timed out; give up for now
-                break
