@@ -3,17 +3,13 @@
 
 import os
 from libc.stddef cimport size_t
-from libc.stdint cimport uint8_t
-from cpython.bytes cimport PyBytes_FromStringAndSize, PyBytes_AsString
 from libc.string cimport memcpy
-from libc.stdlib cimport malloc, free
-from libc.stdint cimport uint64_t
 
 cdef extern from "sys/socket.h":
     cdef int AF_UNIX
     cdef int SOCK_DGRAM
-    int socket(int domain, int type, int protocol)
-    int bind(int sockfd, const void* addr, unsigned int addrlen)
+    int socket(int domain, int type, int protocol) nogil
+    int bind(int sockfd, const void* addr, unsigned int addrlen) nogil
     ssize_t sendto(int sockfd, const void* buf, size_t len, int flags, const void* dest_addr, unsigned int addrlen) nogil
     ssize_t recv(int sockfd, void* buf, size_t len, int flags) nogil
 
@@ -22,9 +18,6 @@ cdef extern from "sys/un.h":
     cdef struct sockaddr_un:
         sa_family_t sun_family
         char sun_path[108]
-
-cdef extern from "unistd.h":
-    int close(int fd)
 
 cdef extern from "errno.h":
     int errno
@@ -43,7 +36,6 @@ cdef extern from "sys/mman.h":
     int PROT_WRITE
     int MAP_SHARED
 
-
 cdef class ShmRing:
     def __cinit__(self):
         self.base = NULL
@@ -58,7 +50,7 @@ cdef class ShmRing:
         for i in range(108):
             self.notify_path[i] = '\x00'
 
-    def create(self, str path, size_t capacity, size_t elem_size):
+    cpdef bint create(self, str path, size_t capacity, size_t elem_size):
         """Create or truncate a shared ring buffer file and map it."""
         self.path = path
         self.capacity = capacity
@@ -82,14 +74,15 @@ cdef class ShmRing:
             pass
         if self.base == <unsigned char*> -1 or self.base == NULL:
             self.base = NULL
-            raise OSError("mmap failed")
+            return False
         # Initialize header: [cap(8)][elem(8)][head(8)][tail(8)]
         self._write_u64(0, capacity)
         self._write_u64(8, elem_size)
         self._write_u64(16, 0)
         self._write_u64(24, 0)
+        return True
 
-    def open(self, str path):
+    cpdef bint open(self, str path):
         """Open an existing shared ring buffer file and map it."""
         self.path = path
         cdef size_t sz = <size_t> os.path.getsize(path)
@@ -100,18 +93,19 @@ cdef class ShmRing:
             os.close(fd)
         if self.base == <unsigned char*> -1 or self.base == NULL:
             self.base = NULL
-            raise OSError("mmap failed")
+            return False
         self.capacity = <size_t> self._read_u64(0)
         self.elem_size = <size_t> self._read_u64(8)
         self.region_size = sz
+        return True
 
-    cpdef void setup_unix_notify(self, bint is_server):
+    cpdef bint setup_unix_notify(self, bint is_server):
         """
         Configure a UNIX DGRAM socket used only to wake a peer when an empty ring becomes non-empty.
         Server binds to path ":.notify"; client sends datagrams to that path.
         """
         if not self.path:
-            return
+            return False
         self.notify_is_server = is_server
         cdef str npath = self.path + ".notify"
         cdef int fd = socket(AF_UNIX, SOCK_DGRAM, 0)
@@ -119,7 +113,7 @@ cdef class ShmRing:
         cdef bytes pb
         cdef Py_ssize_t l
         if fd < 0:
-            return
+            return False
         # Cache notify path into C buffer for nogil use
         pb = npath.encode("utf-8")
         l = pb.__len__()
@@ -141,12 +135,13 @@ cdef class ShmRing:
                 addr.sun_path[i] = '\x00'
             for i in range(self.notify_path_len):
                 addr.sun_path[i] = self.notify_path[i]
-            if bind(fd, <const void*>&addr, <unsigned int>(sizeof(sockaddr_un)) ) != 0:
-                close(fd)
-                return
+            if bind(fd, <const void*>&addr, <unsigned int>(sizeof(sockaddr_un))) != 0:
+                os.close(fd)
+                return False
             self.notify_fd_rx = fd
         else:
             self.notify_fd_tx = fd
+        return True
 
     cdef inline unsigned long long _read_u64(self, size_t off) noexcept nogil:
         return (<unsigned long long*> (self.base + off))[0]
@@ -238,17 +233,17 @@ cdef class ShmRing:
             if step < 1000000:
                 step <<= 1
 
-    def empty(self):
+    cdef bint empty(self) noexcept nogil:
         cdef unsigned long long head = self._read_u64(16)
         cdef unsigned long long tail = self._read_u64(24)
         return tail >= head
 
-    def is_full(self):
+    cdef bint is_full(self) noexcept nogil:
         cdef unsigned long long head = self._read_u64(16)
         cdef unsigned long long tail = self._read_u64(24)
         return head - tail >= self.capacity
 
-    def qsize(self):
+    cdef unsigned long long qsize(self) noexcept nogil:
         cdef unsigned long long head = self._read_u64(16)
         cdef unsigned long long tail = self._read_u64(24)
         return head - tail
@@ -274,19 +269,18 @@ cdef class ShmRing:
             if step < 1000000:
                 step <<= 1
 
-    cpdef bint push_frame_wait_from(self, const unsigned char* src, size_t payload_len, unsigned int max_sleep_ns=1000000):
+    cdef bint push_frame_wait_from(self, const unsigned char* src, size_t payload_len, unsigned int max_sleep_ns=1000000) noexcept nogil:
         """Push a frame (header + payload) waiting for space if needed.
-        Returns True on success, False if timed out before space became available.
+        Returns True on success, False if timed out before space became available or frame too large.
         """
         if payload_len > self.elem_size - 4:
-            raise ValueError("Frame too large for element")
-        with nogil:
-            while not self.try_push_frame_from(src, payload_len):
-                if not self.wait_for_space(max_sleep_ns):
-                    return False
+            return False
+        while not self.try_push_frame_from(src, payload_len):
+            if not self.wait_for_space(max_sleep_ns):
+                return False
         return True
 
-    def close(self):
+    cpdef void close(self):
         if self.base != NULL:
             try:
                 pass
@@ -297,7 +291,7 @@ cdef class ShmRing:
     cpdef void teardown_unix_notify(self):
         if self.notify_fd_rx >= 0:
             try:
-                close(self.notify_fd_rx)
+                os.close(self.notify_fd_rx)
             except Exception:
                 pass
             self.notify_fd_rx = -1
@@ -308,7 +302,7 @@ cdef class ShmRing:
                     pass
         if self.notify_fd_tx >= 0:
             try:
-                close(self.notify_fd_tx)
+                os.close(self.notify_fd_tx)
             except Exception:
                 pass
             self.notify_fd_tx = -1

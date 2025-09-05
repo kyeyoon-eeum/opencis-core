@@ -17,11 +17,17 @@ cdef class ShmRing:
     cdef unsigned int _read_u32(self, size_t off) noexcept nogil
     cdef void _write_u32(self, size_t off, unsigned int val) noexcept nogil
 
-    cpdef void setup_unix_notify(self, bint is_server)
+    cpdef bint create(self, str path, size_t capacity, size_t elem_size)
+    cpdef bint open(self, str path)
+    cpdef bint setup_unix_notify(self, bint is_server)
     cdef bint try_push_frame_from(self, const unsigned char* src, size_t payload_len) noexcept nogil
     cdef Py_ssize_t pop_frame_wait_into(self, unsigned char* dst, size_t dst_capacity, unsigned int max_sleep_ns=*) noexcept nogil
-    cpdef bint push_frame_wait_from(self, const unsigned char* src, size_t payload_len, unsigned int max_sleep_ns=*)
-    cpdef void teardown_unix_notify(self)
+    cdef bint push_frame_wait_from(self, const unsigned char* src, size_t payload_len, unsigned int max_sleep_ns=*) noexcept nogil
+    cdef bint empty(self) noexcept nogil
+    cdef bint is_full(self) noexcept nogil
+    cdef unsigned long long qsize(self) noexcept nogil
     cdef bint wait_for_space(self, unsigned int max_sleep_ns=*) noexcept nogil
+    cpdef void close(self)
+    cpdef void teardown_unix_notify(self)
 
 
