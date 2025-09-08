@@ -52,7 +52,7 @@ class MctpPacketReader(LabeledComponent):
         self._aborted = True
 
     def _get_payload_blocking(self):
-        self._readinto_exactly_blocking(self._hdr_buf, SystemHeader.get_size())
+        self.read_into_buf(self._hdr_buf, SystemHeader.get_size())
         base_packet = BasePacket(self._hdr_buf)
         remaining_length = base_packet.system_header.payload_length - len(base_packet)
         if remaining_length < 0:
@@ -63,10 +63,10 @@ class MctpPacketReader(LabeledComponent):
         payload = self._payload_buf[:total_len]
         payload[: len(self._hdr_buf)] = self._hdr_buf
         if remaining_length:
-            self._readinto_exactly_blocking(payload[len(self._hdr_buf) :], remaining_length)
+            self.read_into_buf(payload[len(self._hdr_buf) :], remaining_length)
         return base_packet, payload
 
-    def _readinto_exactly_blocking(self, buf: bytearray, n: int) -> None:
+    def read_into_buf(self, buf: bytearray, n: int) -> None:
         reader = self._reader
         if hasattr(reader, "readexactly_blocking"):
             data = reader.readexactly_blocking(n)

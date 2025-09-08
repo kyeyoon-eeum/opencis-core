@@ -7,7 +7,7 @@ cdef class ShmStreamReader:
     cdef Py_ssize_t _left_off
     cdef Py_ssize_t _left_len
     cdef unsigned char _tmp_buf[256]
-    cdef void _readinto_exactly_blocking(self, unsigned char* dst, Py_ssize_t n)
+    cdef void read_into_buf(self, unsigned char* dst, Py_ssize_t n)
 
 cdef class ShmStreamWriter:
     cdef object _ep

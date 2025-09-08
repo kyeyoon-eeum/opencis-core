@@ -23,7 +23,7 @@ cdef class ShmPacketReader:
             raise RuntimeError("PacketReader is aborted")
         if n <= 0:
             return
-        self._reader._readinto_exactly_blocking(dst, n)
+        self._reader.read_into_buf(dst, n)
 
     cdef Py_ssize_t _read_one_packet_bytes(self):
         # SystemHeader: payload_type (4 bits) + payload_length (12 bits)

@@ -24,7 +24,7 @@ cdef class ShmStreamReader:
         self._left_off = 0
         self._left_len = 0
 
-    cdef void _readinto_exactly_blocking(self, unsigned char* dst, Py_ssize_t n):
+    cdef void read_into_buf(self, unsigned char* dst, Py_ssize_t n):
         if n <= 0:
             return
         cdef Py_ssize_t off = 0
@@ -65,7 +65,7 @@ cdef class ShmStreamReader:
             return b""
         out_bytes = PyBytes_FromStringAndSize(NULL, n)
         dst = <unsigned char*> PyBytes_AsString(out_bytes)
-        self._readinto_exactly_blocking(dst, n)
+        self.read_into_buf(dst, n)
         return out_bytes
 
 
