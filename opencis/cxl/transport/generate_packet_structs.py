@@ -305,7 +305,8 @@ def emit_composite(packet_name, descriptor, field_sizes):
     lines.append("        n = len(data)")
     lines.append(f"        if {total_header_bytes} + n > MAX_PACKET_SIZE:")
     lines.append('            raise ValueError("packet too large")')
-    lines.append("        memcpy(dst, src, n)")
+    lines.append("        if n != 0:")
+    lines.append("            memcpy(dst, src, n)")
     lines.append("        self._data_length = n\n")
 
     # get_data()
@@ -331,10 +332,27 @@ def emit_composite(packet_name, descriptor, field_sizes):
     lines.append("        return <int>(other_ptr - base_ptr)\n")
 
     lines.append("    cpdef void set_bytes(self, int offset, object data):")
+    lines.append("        cdef unsigned char* dst")
+    lines.append("        cdef const unsigned char* src")
+    lines.append("        cdef Py_ssize_t n\n")
+
+    lines.append("        if PyByteArray_Check(data):")
+    lines.append("            src = <const unsigned char*> PyByteArray_AS_STRING(<bytearray>data)")
+    lines.append("            n = PyByteArray_GET_SIZE(<bytearray>data)")
+    lines.append("            if offset < 0 or offset + n > MAX_PACKET_SIZE:")
+    lines.append("                raise ValueError(\"packet too large\")")
+    lines.append("            dst = &self._buf[0] + offset")
+    lines.append("            if n != 0:")
+    lines.append("                memcpy(dst, src, n)")
+    lines.append("            return\n")
+
     lines.append("        cdef const unsigned char[::1] view = data")
-    lines.append("        cdef int i")
-    lines.append("        for i in range(view.shape[0]):")
-    lines.append("            self._buf[offset + i] = view[i]\n")
+    lines.append("        n = view.shape[0]")
+    lines.append("        if offset < 0 or offset + n > MAX_PACKET_SIZE:")
+    lines.append("            raise ValueError(\"packet too large\")")
+    lines.append("        dst = &self._buf[0] + offset")
+    lines.append("        if n != 0:")
+    lines.append("            memcpy(dst, &view[0], n)\n")
 
     lines.append(
         "    cpdef void write_bits(self, int start_bit, int width, unsigned long long value):"
@@ -382,6 +400,7 @@ from libc.string  cimport memcpy, memset
 from cpython.bytes cimport PyBytes_FromStringAndSize
 from cpython.ref cimport Py_INCREF, Py_DECREF
 from cpython.object cimport PyObject
+from cpython.bytearray cimport PyByteArray_Check, PyByteArray_AS_STRING, PyByteArray_GET_SIZE
 
 
 cdef unsigned long long _read_bits(unsigned char* p, int start_bit, int width) nogil:
