@@ -4,6 +4,7 @@
 import os
 from libc.stddef cimport size_t
 from libc.string cimport memcpy
+from libc.stdint cimport uint64_t
 
 cdef extern from "sys/socket.h":
     cdef int AF_UNIX
@@ -47,6 +48,8 @@ cdef class ShmRing:
         self.notify_fd_tx = -1
         self.notify_is_server = False
         self.notify_path_len = 0
+        self.capacity_is_pow2 = False
+        self.capacity_mask = 0
         for i in range(108):
             self.notify_path[i] = '\x00'
 
@@ -80,6 +83,13 @@ cdef class ShmRing:
         self._write_u64(8, elem_size)
         self._write_u64(16, 0)
         self._write_u64(24, 0)
+        # Precompute power-of-two mask for fast index
+        if capacity != 0 and (capacity & (capacity - 1)) == 0:
+            self.capacity_is_pow2 = True
+            self.capacity_mask = capacity - 1
+        else:
+            self.capacity_is_pow2 = False
+            self.capacity_mask = 0
         return True
 
     cpdef bint open(self, str path):
@@ -97,6 +107,12 @@ cdef class ShmRing:
         self.capacity = <size_t> self._read_u64(0)
         self.elem_size = <size_t> self._read_u64(8)
         self.region_size = sz
+        if self.capacity != 0 and (self.capacity & (self.capacity - 1)) == 0:
+            self.capacity_is_pow2 = True
+            self.capacity_mask = self.capacity - 1
+        else:
+            self.capacity_is_pow2 = False
+            self.capacity_mask = 0
         return True
 
     cpdef bint setup_unix_notify(self, bint is_server):
@@ -169,13 +185,20 @@ cdef class ShmRing:
         cdef char one
         if head - tail >= self.capacity:
             return False
-        cdef unsigned long long idx = head % self.capacity
+        cdef unsigned long long idx
+        if self.capacity_is_pow2:
+            idx = head & self.capacity_mask
+        else:
+            idx = head % self.capacity
         cdef size_t off = 32 + idx * <size_t> self.elem_size
         # header
         self._write_u32(off, <unsigned int> payload_len)
         off += 4
-        # payload (raw-pointer memcpy)
+
+        # payload
         memcpy(<void*>(self.base + off), <const void*>src, <size_t>payload_len)
+
+        # Publish new head last to ensure header/payload visible before head update
         self._write_u64(16, head + 1)
         if was_empty and self.notify_fd_tx >= 0 and self.notify_path_len > 0:
             addr2.sun_family = <sa_family_t>AF_UNIX
@@ -207,7 +230,10 @@ cdef class ShmRing:
             head = self._read_u64(16)
             tail = self._read_u64(24)
             if tail < head:
-                idx = tail % self.capacity
+                if self.capacity_is_pow2:
+                    idx = tail & self.capacity_mask
+                else:
+                    idx = tail % self.capacity
                 off = 32 + idx * self.elem_size
                 payload_len = self._read_u32(off)
                 if payload_len > self.elem_size - 4 or payload_len > dst_capacity:
@@ -249,16 +275,18 @@ cdef class ShmRing:
         return head - tail
 
     cdef bint wait_for_space(self, unsigned int max_sleep_ns=1000000) noexcept nogil:
-        """Busy-wait with exponential backoff (nanosleep) until ring is not full.
+        """Busy-wait with short spin then nanosleep backoff until ring has space.
         Returns True if space became available before timeout, False otherwise.
         """
         cdef unsigned int slept_ns = 0
         cdef unsigned int step = 100
         cdef timespec ts
+        cdef int spins
         while True:
-            # Inline is_full() for speed
-            if (self._read_u64(16) - self._read_u64(24)) < self.capacity:
-                return True
+            # Short spin to reduce sleep overhead for quick consumer progress
+            for spins in range(256):
+                if (self._read_u64(16) - self._read_u64(24)) < self.capacity:
+                    return True
             if slept_ns >= max_sleep_ns:
                 return False
             ts.tv_sec = 0

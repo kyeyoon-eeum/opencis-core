@@ -2,20 +2,22 @@ from libc.stdint cimport uint64_t
 
 cdef class ShmRing:
     cdef unsigned char* base
-    cdef uint64_t capacity
-    cdef uint64_t elem_size
-    cdef uint64_t region_size
+    cdef size_t capacity
+    cdef size_t elem_size
+    cdef size_t region_size
     cdef str path
     cdef int notify_fd_rx
     cdef int notify_fd_tx
     cdef bint notify_is_server
-    cdef char notify_path[108]
     cdef unsigned int notify_path_len
+    cdef char notify_path[108]
+    cdef bint capacity_is_pow2
+    cdef size_t capacity_mask
 
-    cdef unsigned long long _read_u64(self, size_t off) noexcept nogil
-    cdef void _write_u64(self, size_t off, unsigned long long v) noexcept nogil
-    cdef unsigned int _read_u32(self, size_t off) noexcept nogil
-    cdef void _write_u32(self, size_t off, unsigned int val) noexcept nogil
+    cdef inline unsigned long long _read_u64(self, size_t off) noexcept nogil
+    cdef inline void _write_u64(self, size_t off, unsigned long long v) noexcept nogil
+    cdef inline unsigned int _read_u32(self, size_t off) noexcept nogil
+    cdef inline void _write_u32(self, size_t off, unsigned int v) noexcept nogil
 
     cpdef bint create(self, str path, size_t capacity, size_t elem_size)
     cpdef bint open(self, str path)

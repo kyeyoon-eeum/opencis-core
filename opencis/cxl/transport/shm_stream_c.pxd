@@ -1,7 +1,6 @@
 cimport shm_ring
 
 cdef class ShmStreamReader:
-    cdef object _ep
     cdef shm_ring.ShmRing _in_ring
     cdef unsigned char _left_buf[256]
     cdef Py_ssize_t _left_off
@@ -10,6 +9,7 @@ cdef class ShmStreamReader:
     cdef void read_into_buf(self, unsigned char* dst, Py_ssize_t n)
 
 cdef class ShmStreamWriter:
-    cdef object _ep
     cdef shm_ring.ShmRing _out_ring
-    cdef object _pending
+    cdef object _last_obj
+    cdef const unsigned char* _last_ptr
+    cdef Py_ssize_t _last_len

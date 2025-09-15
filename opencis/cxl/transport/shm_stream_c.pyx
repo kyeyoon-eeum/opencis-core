@@ -1,12 +1,10 @@
 # cython: language_level=3
 # cython: boundscheck=False, wraparound=False, nonecheck=False, initializedcheck=False
 
-import asyncio
-from collections import deque
 from libc.stddef cimport size_t
 from libc.string cimport memcpy
-from cpython.bytes cimport PyBytes_FromStringAndSize, PyBytes_AsString
-from cpython.bytearray cimport PyByteArray_AS_STRING
+from cpython.bytes cimport PyBytes_FromStringAndSize, PyBytes_AsString, PyBytes_Check
+from cpython.bytearray cimport PyByteArray_AS_STRING, PyByteArray_Check
 
 from opencis.cxl.transport import shm_ring as _shm
 cimport opencis.cxl.transport.shm_ring as _shm_c
@@ -72,26 +70,62 @@ cdef class ShmStreamReader:
 cdef class ShmStreamWriter:
     def __cinit__(self, object out_ring):
         self._out_ring = out_ring
-        self._pending = deque()
+        self._last_obj = None
+        self._last_ptr = <const unsigned char*> 0
+        self._last_len = 0
 
     def write(self, data):
-        if not isinstance(data, (bytes, bytearray)):
-            data = bytes(data)
+        """Write bytes-like data to the stream without batching.
+        Uses a single frame when possible, otherwise splits respecting MAX_PAYLOAD.
+        """
         cdef const unsigned char* data_ptr
         cdef Py_ssize_t total
-        cdef Py_ssize_t offset = 0
+        cdef Py_ssize_t offset
         cdef Py_ssize_t take
-        # get pointer
-        if isinstance(data, bytes):
-            data_ptr = <const unsigned char*> PyBytes_AsString(data)
-            total = (<object>data).__len__()
+
+        # Reuse cached pointer for identical object to avoid repeated pointer lookups
+        if data is self._last_obj:
+            data_ptr = self._last_ptr
+            total = self._last_len
         else:
-            # bytearray
-            data_ptr = <const unsigned char*> PyByteArray_AS_STRING(data)
-            total = (<object>data).__len__()
+            # Accept bytes/bytearray; fallback to bytes(data)
+            if PyBytes_Check(data):
+                data_ptr = <const unsigned char*> PyBytes_AsString(data)
+                total = (<object>data).__len__()
+            elif PyByteArray_Check(data):
+                data_ptr = <const unsigned char*> PyByteArray_AS_STRING(data)
+                total = (<object>data).__len__()
+            else:
+                data = bytes(data)
+                data_ptr = <const unsigned char*> PyBytes_AsString(data)
+                total = (<object>data).__len__()
+            self._last_obj = data
+            self._last_ptr = data_ptr
+            self._last_len = total
+
+        # Single-frame fast path
+        if total <= MAX_PAYLOAD:
+            # First attempt without releasing GIL to avoid per-call nogil overhead
+            if self._out_ring.try_push_frame_from(data_ptr, <size_t>total):
+                return
+            # If ring is full, wait and push with GIL released
+            with nogil:
+                while not self._out_ring.wait_for_space(<unsigned int>1000):
+                    pass
+                while not self._out_ring.try_push_frame_from(data_ptr, <size_t>total):
+                    pass
+            return
+
+        # General path
+        offset = 0
         while offset < total:
             take = MAX_PAYLOAD if MAX_PAYLOAD <= (total - offset) else (total - offset)
+            # Try once without releasing GIL
             if not self._out_ring.try_push_frame_from(data_ptr + offset, <size_t>take):
-                # keep reference without slicing
-                self._pending.append((data, offset, take))
+                with nogil:
+                    while not self._out_ring.wait_for_space(<unsigned int>1000):
+                        pass
+                    while not self._out_ring.try_push_frame_from(data_ptr + offset, <size_t>take):
+                        pass
             offset += take
+

@@ -9,8 +9,8 @@ from opencis.cxl.transport.shm_stream_c import ShmStreamReader, ShmStreamWriter
 from opencis.util.logger import logger
 
 
-DEFAULT_ELEM_SIZE = 256
-DEFAULT_CAPACITY = 8192
+DEFAULT_ELEM_SIZE = 128
+DEFAULT_CAPACITY = 65536
 HEADER_SIZE = 4
 MAX_PAYLOAD = DEFAULT_ELEM_SIZE - HEADER_SIZE
 
