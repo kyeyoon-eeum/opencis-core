@@ -26,7 +26,11 @@ from opencis.util.number import (
 
 class PacketDataMixin:
     def get_data_as_int(self) -> int:
-        return int.from_bytes(self.get_data(), "little")
+        data = self.get_data()
+        # Handle both bytes and memoryview objects
+        if hasattr(data, 'tobytes'):
+            return int.from_bytes(data.tobytes(), "little")
+        return int.from_bytes(data, "little")
 
     def set_data_as_int(self, data: int, length: int = None):
         if length is None:
