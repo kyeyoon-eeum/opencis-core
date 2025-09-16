@@ -32,12 +32,12 @@ cdef class ShmPacketReader:
             return
         self._reader.read_into_buf(dst, n)
 
-    cdef Py_ssize_t _read_one_packet_bytes(self):
+    cdef Py_ssize_t _read_one_packet_bytes(self, unsigned char *buf):
         # SystemHeader: payload_type (4 bits) + payload_length (12 bits)
         cdef Py_ssize_t hdr_size = 2
-        self._read_exactly(self._packet_buffer, hdr_size)
+        self._read_exactly(buf, hdr_size)
 
-        cdef uint16_t hdr_bytes = (<uint16_t*>self._packet_buffer)[0]
+        cdef uint16_t hdr_bytes = (<uint16_t*>buf)[0]
         cdef Py_ssize_t total_len = <Py_ssize_t>((hdr_bytes >> 4) & 0x0FFF)
         cdef Py_ssize_t remaining = total_len - hdr_size
         if remaining < 0:
@@ -99,7 +99,7 @@ cdef class ShmPacketReader:
         return pkt
 
     cpdef object get_packet(self):
-        cdef Py_ssize_t packet_length = self._read_one_packet_bytes()
+        cdef Py_ssize_t packet_length = self._read_one_packet_bytes(&self._packet_buffer[0])
         cdef unsigned char* buf = &self._packet_buffer[0]
         cdef unsigned char payload_type = buf[0] & 0x0F  # low 4 bits
 
@@ -110,6 +110,46 @@ cdef class ShmPacketReader:
 
         # Import constants for direct comparisons
         from opencis.cxl.cci.common import CCI_FM_API_COMMAND_OPCODE
+
+        # Define constants for packet types (hexadecimal)
+        # CXL.io format types
+        cdef:
+            unsigned char CFG_RD0 = 0x04
+            unsigned char CFG_RD1 = 0x05
+            unsigned char CFG_WR0 = 0x44
+            unsigned char CFG_WR1 = 0x45
+            unsigned char MRD_32B = 0x00
+            unsigned char MRD_64B = 0x20
+            unsigned char MWR_32B = 0x40
+            unsigned char MWR_64B = 0x60
+            unsigned char CPL = 0x0A
+            unsigned char CPL_D = 0x4A
+            unsigned char CPL_LK = 0x0B
+            unsigned char CPL_D_LK = 0x4B
+
+            # CXL.mem message classes
+            unsigned char M2S_REQ = 0x01
+            unsigned char M2S_RWD = 0x02
+            unsigned char M2S_BIRSP = 0x03
+            unsigned char S2M_BISNP = 0x04
+            unsigned char S2M_NDR = 0x05
+            unsigned char S2M_DRS = 0x06
+
+            # CXL.cache message classes
+            unsigned char D2H_REQ = 0x01
+            unsigned char D2H_RSP = 0x02
+            unsigned char D2H_DATA = 0x03
+            unsigned char H2D_REQ = 0x04
+            unsigned char H2D_RSP = 0x05
+            unsigned char H2D_DATA = 0x06
+
+            # Sideband types
+            unsigned char CONNECTION_REQUEST = 0x00
+
+            # CCI opcodes
+            unsigned short GET_LD_INFO = 0x00
+            unsigned short GET_LD_ALLOCATIONS = 0x01
+            unsigned short SET_LD_ALLOCATIONS = 0x02
 
         # Import packet classes for pool access
         from opencis.cxl.transport.cxl_io_packets import (
@@ -131,15 +171,16 @@ cdef class ShmPacketReader:
         if payload_type == 1:  # SYSTEM_PAYLOAD_TYPE.CXL_IO
             # SystemHeader(2) + TlpPrefix(4) → CxlIoHeader starts at 6
             fmt_type = buf[6]
-            if fmt_type == 4 or fmt_type == 5:  # CFG_RD0, CFG_RD1
+            if fmt_type == CFG_RD0 or fmt_type == CFG_RD1:
                 pkt = self._acquire(CxlIoCfgRdPacket)
-            elif fmt_type == 68 or fmt_type == 69:  # CFG_WR0, CFG_WR1
+            elif fmt_type == CFG_WR0 or fmt_type == CFG_WR1:
                 pkt = self._acquire(CxlIoCfgWrPacket)
-            elif fmt_type == 0 or fmt_type == 32:  # MRD_32B, MRD_64B
+            elif fmt_type == MRD_32B or fmt_type == MRD_64B:
                 pkt = self._acquire(CxlIoMemRdPacket)
-            elif fmt_type == 64 or fmt_type == 96:  # MWR_32B, MWR_64B
+            elif fmt_type == MWR_32B or fmt_type == MWR_64B:
                 pkt = self._acquire(CxlIoMemWrPacket)
-            elif fmt_type == 10 or fmt_type == 74 or fmt_type == 11 or fmt_type == 75:  # CPL, CPL_D, CPL_LK, CPL_D_LK
+            elif (fmt_type == CPL or fmt_type == CPL_D or
+                  fmt_type == CPL_LK or fmt_type == CPL_D_LK):
                 pkt = self._acquire(CxlIoCompletionPacket)
             else:
                 raise RuntimeError(f"Unsupported CXL.IO protocol 0x{fmt_type:02x}")
@@ -159,17 +200,17 @@ cdef class ShmPacketReader:
         elif payload_type == 2:  # SYSTEM_PAYLOAD_TYPE.CXL_MEM
             # SystemHeader(2) + CxlMemHeader(2) → msg_class at offset 3
             msg_class = buf[3]
-            if msg_class == 1:  # M2S_REQ
+            if msg_class == M2S_REQ:
                 pkt = self._acquire(CxlMemM2SReqPacket)
-            elif msg_class == 2:  # M2S_RWD
+            elif msg_class == M2S_RWD:
                 pkt = self._acquire(CxlMemM2SRwDPacket)
-            elif msg_class == 3:  # M2S_BIRSP
+            elif msg_class == M2S_BIRSP:
                 pkt = self._acquire(CxlMemM2SBIRspPacket)
-            elif msg_class == 4:  # S2M_BISNP
+            elif msg_class == S2M_BISNP:
                 pkt = self._acquire(CxlMemS2MBISnpPacket)
-            elif msg_class == 5:  # S2M_NDR
+            elif msg_class == S2M_NDR:
                 pkt = self._acquire(CxlMemS2MNDRPacket)
-            elif msg_class == 6:  # S2M_DRS
+            elif msg_class == S2M_DRS:
                 pkt = self._acquire(CxlMemS2MDRSPacket)
             else:
                 raise RuntimeError(f"Unsupported CXL.MEM msg_class {msg_class}")
@@ -189,17 +230,17 @@ cdef class ShmPacketReader:
         elif payload_type == 3:  # SYSTEM_PAYLOAD_TYPE.CXL_CACHE
             # SystemHeader(2) + CxlCacheHeader(2) → msg_class at offset 3
             msg_class_cache = buf[3]
-            if msg_class_cache == 1:  # D2H_REQ
+            if msg_class_cache == D2H_REQ:
                 pkt = self._acquire(CxlCacheCacheD2HReqPacket)
-            elif msg_class_cache == 2:  # D2H_RSP
+            elif msg_class_cache == D2H_RSP:
                 pkt = self._acquire(CxlCacheCacheD2HRspPacket)
-            elif msg_class_cache == 3:  # D2H_DATA
+            elif msg_class_cache == D2H_DATA:
                 pkt = self._acquire(CxlCacheCacheD2HDataPacket)
-            elif msg_class_cache == 4:  # H2D_REQ
+            elif msg_class_cache == H2D_REQ:
                 pkt = self._acquire(CxlCacheCacheH2DReqPacket)
-            elif msg_class_cache == 5:  # H2D_RSP
+            elif msg_class_cache == H2D_RSP:
                 pkt = self._acquire(CxlCacheCacheH2DRspPacket)
-            elif msg_class_cache == 6:  # H2D_DATA
+            elif msg_class_cache == H2D_DATA:
                 pkt = self._acquire(CxlCacheCacheH2DDataPacket)
             else:
                 raise RuntimeError(f"Unsupported CXL.CACHE msg_class {msg_class_cache}")
@@ -219,7 +260,7 @@ cdef class ShmPacketReader:
         elif payload_type == 15:  # SYSTEM_PAYLOAD_TYPE.SIDEBAND
             # SystemHeader(2) + SidebandHeader(1) → type at offset 2
             sb_type = buf[2]
-            if sb_type == 0:  # CONNECTION_REQUEST
+            if sb_type == CONNECTION_REQUEST:
                 pkt = self._acquire(SidebandConnectionRequestPacket)
             else:
                 pkt = self._acquire(BaseSidebandPacket)
@@ -242,11 +283,11 @@ cdef class ShmPacketReader:
             opcode = buf[7] | (buf[8] << 8)
 
             # We convert both REQ and RSP to the Response packet variants, as before
-            if opcode == 0:  # GET_LD_INFO
+            if opcode == GET_LD_INFO:
                 pkt = self._acquire(GetLdInfoResponsePacket)
-            elif opcode == 1:  # GET_LD_ALLOCATIONS
+            elif opcode == GET_LD_ALLOCATIONS:
                 pkt = self._acquire(GetLdAllocationsResponsePacket)
-            elif opcode == 2:  # SET_LD_ALLOCATIONS
+            elif opcode == SET_LD_ALLOCATIONS:
                 pkt = self._acquire(SetLdAllocationsResponsePacket)
             else:
                 raise RuntimeError("Unsupported CCI packet")
