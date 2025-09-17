@@ -346,12 +346,11 @@ def sample_app(keepalive: bool, **kwargs):
     BYTE_COUNT = 0x1000
     logger.info("PERF_START")
 
-    # Profiled Write loop
+    # Profiled Write loop (pipelined bulk)
     pr_w = cProfile.Profile()
     pr_w.enable()
     start = time.time()
-    for offset in range(0, BYTE_COUNT, 0x40):
-        cpu.store(0x100000000000 + offset, 0x40, 0xDEADBEEF)
+    cpu.store_bulk_uncached(0x100000000000, BYTE_COUNT, 0xDEADBEEF, 0x40)
     end = time.time()
     pr_w.disable()
     wr_time = max(end - start, 1e-6)
@@ -361,12 +360,11 @@ def sample_app(keepalive: bool, **kwargs):
     pstats.Stats(pr_w, stream=s).sort_stats("cumulative").print_stats(20)
     logger.info("cProfile WRITE (top):\n" + s.getvalue())
 
-    # Profiled Read loop
+    # Profiled Read loop (pipelined bulk)
     pr_r = cProfile.Profile()
     pr_r.enable()
     start = time.time()
-    for offset in range(0, BYTE_COUNT, 0x40):
-        cpu.load(0x100000000000 + offset, 0x40)
+    _ = cpu.load_bulk_uncached(0x100000000000, BYTE_COUNT, 0x40)
     end = time.time()
     pr_r.disable()
     rd_time = max(end - start, 1e-6)

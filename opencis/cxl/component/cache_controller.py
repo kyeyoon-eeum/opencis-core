@@ -444,10 +444,48 @@ class CacheController(RunnableComponent):
         resp = self._cache_to_coh_agent_fifo.response.get()
         logger.debug(self._create_message("UNCACHED_WRITE rsp OK"))
 
+    # New pipelined APIs for UNCACHED traffic (multiple outstanding requests)
+    def pipelined_uncached_reads(self, base_addr: int, total_size: int, line_size: int = 64) -> list[int]:
+        assert line_size == self._cache_blk_size
+        assert total_size % line_size == 0
+        num_lines = total_size // line_size
+        results: list[int] = []
+        req_q = self._cache_to_coh_agent_fifo.request
+        rsp_q = self._cache_to_coh_agent_fifo.response
+        # Issue all requests first
+        addr = base_addr
+        for _ in range(num_lines):
+            req_q.put(CacheRequest(CACHE_REQUEST_TYPE.UNCACHED_READ, addr, line_size))
+            addr += line_size
+        # Collect all responses (expect CacheResponse OK)
+        for _ in range(num_lines):
+            resp = rsp_q.get()
+            assert resp.status == CACHE_RESPONSE_STATUS.OK
+            results.append(resp.data)
+        return results
+
+    def pipelined_uncached_writes(self, base_addr: int, total_size: int, value: int, line_size: int = 64) -> None:
+        assert line_size == self._cache_blk_size
+        assert total_size % line_size == 0
+        num_lines = total_size // line_size
+        req_q = self._cache_to_coh_agent_fifo.request
+        rsp_q = self._cache_to_coh_agent_fifo.response
+        # Issue all write requests first
+        addr = base_addr
+        for _ in range(num_lines):
+            req_q.put(CacheRequest(CACHE_REQUEST_TYPE.UNCACHED_WRITE, addr, line_size, value))
+            addr += line_size
+        # Drain responses to preserve semantics (expect CacheResponse OK)
+        for _ in range(num_lines):
+            resp = rsp_q.get()
+            assert resp.status == CACHE_RESPONSE_STATUS.OK
+
     # registered event loop for processor's cache load/store operations (thread worker)
     def _processor_request_worker(self) -> None:
+        req_get = self._processor_to_cache_fifo.request.get if self._processor_to_cache_fifo else None
+        rsp_put = self._processor_to_cache_fifo.response.put if self._processor_to_cache_fifo else None
         while not self._stop_evt:
-            packet = self._processor_to_cache_fifo.request.get()
+            packet = req_get()
             if packet is None:
                 logger.debug(
                     self._create_message("Stop processing processor request scheduler fifo")
@@ -456,19 +494,19 @@ class CacheController(RunnableComponent):
             if packet.type == MEMORY_REQUEST_TYPE.READ:
                 data = self.cache_coherent_load(packet.addr, packet.size)
                 resp = MemoryResponse(MEMORY_RESPONSE_STATUS.OK, data)
-                self._processor_to_cache_fifo.response.put(resp)
+                rsp_put(resp)
             elif packet.type == MEMORY_REQUEST_TYPE.UNCACHED_READ:
                 data = self._uncached_load(packet.addr, packet.size)
                 resp = MemoryResponse(MEMORY_RESPONSE_STATUS.OK, data)
-                self._processor_to_cache_fifo.response.put(resp)
+                rsp_put(resp)
             elif packet.type == MEMORY_REQUEST_TYPE.WRITE:
                 self.cache_coherent_store(packet.addr, packet.size, packet.data)
                 resp = MemoryResponse(MEMORY_RESPONSE_STATUS.OK)
-                self._processor_to_cache_fifo.response.put(resp)
+                rsp_put(resp)
             elif packet.type == MEMORY_REQUEST_TYPE.UNCACHED_WRITE:
                 self._uncached_store(packet.addr, packet.size, packet.data)
                 resp = MemoryResponse(MEMORY_RESPONSE_STATUS.OK)
-                self._processor_to_cache_fifo.response.put(resp)
+                rsp_put(resp)
             else:
                 assert False
 
@@ -495,8 +533,9 @@ class CacheController(RunnableComponent):
 
     # registered event loop for coh module's cache lookup operations (thread worker)
     def _coh_agent_request_worker(self) -> None:
+        req_get = self._coh_agent_to_cache_fifo.request.get
         while not self._stop_evt:
-            packet = self._coh_agent_to_cache_fifo.request.get()
+            packet = req_get()
             if packet is None:
                 logger.debug(
                     self._create_message("Stop processing coh agent request scheduler fifo")
@@ -505,8 +544,9 @@ class CacheController(RunnableComponent):
             self._run_coh_request(packet, self._coh_agent_to_cache_fifo)
 
     def _coh_bridge_request_worker(self) -> None:
+        req_get = self._coh_bridge_to_cache_fifo.request.get
         while not self._stop_evt:
-            packet = self._coh_bridge_to_cache_fifo.request.get()
+            packet = req_get()
             if packet is None:
                 logger.debug(
                     self._create_message("Stop processing coh bridge request scheduler fifo")

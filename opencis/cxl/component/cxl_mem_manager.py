@@ -68,8 +68,9 @@ class CxlMemManager(PacketProcessor):
         ndr_packet = CxlMemCmpPacket.create(ld_id=ld_id)
         data_packet = CxlMemMemDataPacket.create(data, ld_id=ld_id)
         logger.debug(self._create_message("DEVICE sending NDR+DRS"))
-        self._upstream_fifo.target_to_host.put(ndr_packet)
-        self._upstream_fifo.target_to_host.put(data_packet)
+        t2h_put = self._upstream_fifo.target_to_host.put
+        t2h_put(ndr_packet)
+        t2h_put(data_packet)
 
     def _process_cxl_mem_wr_packet_sync(self, mem_wr_packet: CxlMemMemWrPacket):
         if self._downstream_fifo is not None:
@@ -122,8 +123,9 @@ class CxlMemManager(PacketProcessor):
             self._dispatch_mem_packet_sync(packet)
 
     def _h2t_worker(self) -> None:
+        get_from_h2t = self._upstream_fifo.host_to_target.get
         while not self._h2t_stop.is_set():
-            packet = self._upstream_fifo.host_to_target.get()
+            packet = get_from_h2t()
             if packet is None:
                 break
             self._dispatch_mem_packet_sync(packet)
@@ -131,11 +133,13 @@ class CxlMemManager(PacketProcessor):
     def _t2h_worker(self) -> None:
         if self._downstream_fifo is None:
             return
+        ds_get = self._downstream_fifo.target_to_host.get
+        us_put = self._upstream_fifo.target_to_host.put
         while not self._t2h_stop.is_set():
-            packet = self._downstream_fifo.target_to_host.get()
+            packet = ds_get()
             if packet is None:
                 break
-            self._upstream_fifo.target_to_host.put(packet)
+            us_put(packet)
 
     def _dispatch_mem_packet_sync(self, packet: BasePacket):
         base_packet = cast(BasePacket, packet)

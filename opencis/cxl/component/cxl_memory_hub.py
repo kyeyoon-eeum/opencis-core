@@ -241,6 +241,13 @@ class CxlMemoryHub(RunnableComponent):
                 return False
         return True
 
+    # New pipelined/bulk APIs (UNCACHED; leverages HA internal pipelining)
+    def load_uncached_bulk(self, base_addr: int, total_size: int, line_size: int = 64) -> List[int]:
+        return self._cache_controller.pipelined_uncached_reads(base_addr, total_size, line_size)
+
+    def store_uncached_bulk(self, base_addr: int, total_size: int, value: int, line_size: int = 64) -> None:
+        self._cache_controller.pipelined_uncached_writes(base_addr, total_size, value, line_size)
+
     def get_root_complex(self):
         return self._root_complex
 

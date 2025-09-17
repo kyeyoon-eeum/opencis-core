@@ -77,6 +77,15 @@ class CPU(RunnableComponent):
                 pbar.update(chunk_size)
         return result
 
+    # New pipelined APIs that leverage MemoryHub bulk ops
+    def load_bulk_uncached(self, base_addr: int, total_size: int, line_size: int = 64) -> bytes:
+        words = self._cxl_memory_hub.load_uncached_bulk(base_addr, total_size, line_size)
+        # Convert list of 64B ints to bytes concatenated in little-endian
+        return b"".join(w.to_bytes(line_size, "little") for w in words)
+
+    def store_bulk_uncached(self, base_addr: int, total_size: int, value: int, line_size: int = 64) -> None:
+        self._cxl_memory_hub.store_uncached_bulk(base_addr, total_size, value, line_size)
+
     def store(self, addr: int, size: int, value: int, prog_bar: bool = False):
         if size <= 64:
             res = self._cxl_memory_hub.store(addr, size, value)

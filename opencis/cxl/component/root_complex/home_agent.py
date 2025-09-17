@@ -6,6 +6,8 @@ See LICENSE for details.
 """
 
 from dataclasses import dataclass
+from collections import deque
+import logging
 import threading
 from typing import cast
 import time
@@ -111,6 +113,10 @@ class HomeAgent(RunnableComponent):
         # Single pending buffers to avoid re-enqueue churn
         self._pending_downstream = None
         self._pending_upstream = None
+
+        # Read pipelining (UNCACHED_READ only): simple inflight window
+        self._read_window: int = 512
+        self._read_inflight: int = 0
 
     def _create_m2s_req_packet(
         self,
@@ -267,30 +273,36 @@ class HomeAgent(RunnableComponent):
 
     # .mem s2m drs handler
     # method is only used for non cacheable devices like memory expander
-    def _process_cxl_s2m_drs_packet(self, s2mdrs_packet: CxlMemS2MDRSPacket):
+    def _process_cxl_s2m_drs_packet(self, s2mdrs_packet: CxlMemS2MDRSPacket) -> CacheResponse:
         assert s2mdrs_packet.s2mdrs_header.opcode == CXL_MEM_S2MDRS_OPCODE.MEM_DATA
         logger.debug(self._create_message("Processing S2M DRS in HA"))
         self._metrics["drs_count"] += 1
-        rsp_put = self._upstream_cache_to_home_agent_fifos.response.put
 
-        # Check if this DRS corresponds to a pending NDR
+        # Build response under lock
         if self._cur_state.waiting_for_drs and self._cur_state.pending_ndr_status is not None:
-            # This DRS completes a pending NDR response
             cache_packet = CacheResponse(self._cur_state.pending_ndr_status, s2mdrs_packet.get_data_as_int())
             logger.debug(self._create_message("HA posting CacheResponse for NDR+DRS sequence"))
-            rsp_put(cache_packet)
-            # Reset the pending state
+            # Reset pending state
             self._cur_state.pending_ndr_status = None
             self._cur_state.waiting_for_drs = False
         else:
-            # Standalone DRS packet (for non-cacheable devices)
             cache_packet = CacheResponse(CACHE_RESPONSE_STATUS.OK, s2mdrs_packet.get_data_as_int())
-            rsp_put(cache_packet)
 
-        self._cur_state.state = COH_STATE_MACHINE.COH_STATE_INIT
-        self._state_version += 1
-        self._flow_control_cv.notify_all()
-        # Flow control managed by _fc_host_run flag
+        # Free one outstanding UNCACHED_READ slot on every DRS and collapse notifications
+        notify_needed = False
+        if self._read_inflight > 0:
+            self._read_inflight -= 1
+            notify_needed = True
+
+        if self._cur_state.state != COH_STATE_MACHINE.COH_STATE_INIT:
+            self._cur_state.state = COH_STATE_MACHINE.COH_STATE_INIT
+            notify_needed = True
+
+        if notify_needed:
+            self._state_version += 1
+            self._flow_control_cv.notify_all()
+
+        return cache_packet
 
     # .mem s2m bisnp handler
     def _process_cxl_s2m_bisnp_packet(self, s2mbisnp_packet: CxlMemS2MBISnpPacket):
@@ -435,10 +447,16 @@ class HomeAgent(RunnableComponent):
                 self._state_version += 1
                 self._flow_control_cv.notify_all()
             else:
-                # Cached reads/snoop ops wait for response (NDR/DRS)
-                self._cur_state.state = COH_STATE_MACHINE.COH_STATE_WAIT
-                self._state_version += 1
-                self._flow_control_cv.notify_all()
+                # For UNCACHED_READ: don't enter WAIT; throttle by window
+                if cache_packet.type == CACHE_REQUEST_TYPE.UNCACHED_READ:
+                    while self._read_inflight >= self._read_window:
+                        self._flow_control_cv.wait()
+                    self._read_inflight += 1
+                else:
+                    # Cached reads/snoop ops wait for response (NDR/DRS)
+                    self._cur_state.state = COH_STATE_MACHINE.COH_STATE_WAIT
+                    self._state_version += 1
+                    self._flow_control_cv.notify_all()
             self._downstream_cxl_mem_fifos.host_to_target.put(cxl_packet)
         logger.debug(self._create_message(f"[HA-US] exit _process_upstream_host_to_target_packets state={self._cur_state.state}"))
 
@@ -447,6 +465,7 @@ class HomeAgent(RunnableComponent):
         # Cache frequently accessed state values to reduce function call overhead
         cur_state = self._cur_state
         target_to_host_get = self._downstream_cxl_mem_fifos.target_to_host.get
+        upstream_rsp_put = self._upstream_cache_to_home_agent_fifos.response.put
         
         while True:
             # Prefer pending packet if any
@@ -468,9 +487,11 @@ class HomeAgent(RunnableComponent):
             is_ndr = cxl_packet.is_s2mndr()
             is_drs = cxl_packet.is_s2mdrs()
             if is_ndr:
-                logger.debug(self._create_message("[HA-DS] dequeued S2M NDR"))
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(self._create_message("[HA-DS] dequeued S2M NDR"))
             elif is_drs:
-                logger.debug(self._create_message("[HA-DS] dequeued S2M DRS"))
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(self._create_message("[HA-DS] dequeued S2M DRS"))
 
             bisnp_to_process = None
             with self._state_lock:
@@ -478,12 +499,19 @@ class HomeAgent(RunnableComponent):
                 
                 # Process packets based on current state with optimized conditionals
                 if is_ndr:
-                    logger.info(self._create_message("HomeAgent: received S2M NDR"))
-                    self._process_cxl_s2m_rsp_packet(cast(CxlMemS2MNDRPacket, packet))
+                    # Log NDR only when in WAIT (coherent-read path). For UNCACHED_READ (INIT), skip log.
+                    if current_state == COH_STATE_MACHINE.COH_STATE_WAIT:
+                        logger.info(self._create_message("HomeAgent: received S2M NDR"))
+                        self._process_cxl_s2m_rsp_packet(cast(CxlMemS2MNDRPacket, packet))
+                    else:
+                        self._metrics["ndr_count"] += 1
                 elif is_drs and (current_state == COH_STATE_MACHINE.COH_STATE_INIT or 
                                 current_state == COH_STATE_MACHINE.COH_STATE_WAIT):
-                    logger.info(self._create_message("HomeAgent: received S2M DRS"))
-                    self._process_cxl_s2m_drs_packet(cast(CxlMemS2MDRSPacket, packet))
+                    # Log DRS only for coherent-read WAIT path; UNCACHED_READ avoids extra logging
+                    if current_state == COH_STATE_MACHINE.COH_STATE_WAIT or self._cur_state.waiting_for_drs:
+                        logger.info(self._create_message("HomeAgent: received S2M DRS"))
+                    cache_packet = self._process_cxl_s2m_drs_packet(cast(CxlMemS2MDRSPacket, packet))
+                    # put outside lock
                 elif (not is_ndr and not is_drs) and (current_state == COH_STATE_MACHINE.COH_STATE_INIT or current_state == COH_STATE_MACHINE.COH_STATE_START) and cxl_packet.is_s2mbisnp():
                     # Handle BISNP packets with original coordination semantics:
                     # process when upstream has engaged the critical section
@@ -527,6 +555,11 @@ class HomeAgent(RunnableComponent):
                     self._flow_control_cv.notify_all()
                 continue
 
+            # If we built a cache_packet for DRS, deliver it now
+            if is_drs and ('cache_packet' in locals() and cache_packet is not None):
+                upstream_rsp_put(cache_packet)
+                cache_packet = None
+
 
     # Upstream worker handling cache requests from host
     def _process_upstream_packets_worker(self) -> None:
@@ -553,19 +586,25 @@ class HomeAgent(RunnableComponent):
                     addr_dbg = f"0x{cache_packet.addr:x}"
                 except Exception:
                     addr_dbg = "-"
-                logger.info(self._create_message(f"[HA-US] dequeued upstream type={cache_packet.type} addr={addr_dbg} state={cur_state.state}"))
+                if cache_packet.type == CACHE_REQUEST_TYPE.UNCACHED_READ:
+                    logger.debug(self._create_message(f"[HA-US] dequeued upstream type={cache_packet.type} addr={addr_dbg} state={cur_state.state}"))
+                else:
+                    logger.info(self._create_message(f"[HA-US] dequeued upstream type={cache_packet.type} addr={addr_dbg} state={cur_state.state}"))
                 # Cache state value to avoid repeated attribute access
                 current_state = cur_state.state
                 
                 # Process upstream packets with flow control coordination
                 if current_state == COH_STATE_MACHINE.COH_STATE_INIT:
                     if not self._fc_host_run:
-                        # We have priority, set flag and prepare work under lock
-                        self._fc_host_run = True
-                        self._state_version += 1
-                        self._flow_control_cv.notify_all()
-                        cur_state.state = COH_STATE_MACHINE.COH_STATE_START
-                        logger.info(self._create_message("[HA-US] state->START (upstream critical section)"))
+                        # Avoid taking upstream critical section for UNCACHED_READ to reduce overhead
+                        is_uncached_read = cache_packet.type == CACHE_REQUEST_TYPE.UNCACHED_READ
+                        if not is_uncached_read:
+                            # We have priority, set flag and prepare work under lock
+                            self._fc_host_run = True
+                            self._state_version += 1
+                            self._flow_control_cv.notify_all()
+                            cur_state.state = COH_STATE_MACHINE.COH_STATE_START
+                            logger.info(self._create_message("[HA-US] state->START (upstream critical section)"))
 
                         # Prepare packet parameters while holding the lock
                         is_write = cache_packet.type in (
@@ -626,10 +665,16 @@ class HomeAgent(RunnableComponent):
                             else:
                                 raise Exception(f"Invalid M2S Opcode Type: {cache_packet.type}")
 
-                            # Cached reads/snoop ops wait for response (NDR/DRS)
-                            cur_state.state = COH_STATE_MACHINE.COH_STATE_WAIT
-                            self._state_version += 1
-                            self._flow_control_cv.notify_all()
+                            # UNCACHED_READ pipelining: avoid WAIT; throttle by window
+                            if cache_packet.type == CACHE_REQUEST_TYPE.UNCACHED_READ:
+                                while self._read_inflight >= self._read_window:
+                                    self._flow_control_cv.wait()
+                                self._read_inflight += 1
+                            else:
+                                # Cached reads/snoop ops wait for response (NDR/DRS)
+                                cur_state.state = COH_STATE_MACHINE.COH_STATE_WAIT
+                                self._state_version += 1
+                                self._flow_control_cv.notify_all()
 
                         # Release the lock to perform queue puts
                         pass
@@ -670,7 +715,10 @@ class HomeAgent(RunnableComponent):
                         upstream_rsp_put(packet)
                         logger.info(self._create_message("[HA-US] WR ack posted to cache"))
                 elif (not is_write) and opcode_req is not None:
-                    logger.info(self._create_message(f"[HA-US] H2T RD req addr=0x{addr:x}"))
+                    if cache_packet.type == CACHE_REQUEST_TYPE.UNCACHED_READ:
+                        logger.debug(self._create_message(f"[HA-US] H2T RD req addr=0x{addr:x}"))
+                    else:
+                        logger.info(self._create_message(f"[HA-US] H2T RD req addr=0x{addr:x}"))
                     cxl_packet = self._create_m2s_req_packet(
                         opcode_req, meta_field, meta_value, snp_type, addr
                     )
