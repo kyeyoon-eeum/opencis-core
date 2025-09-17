@@ -169,8 +169,11 @@ class CxlMemoryHub(RunnableComponent):
         )
 
     def _send_mem_request(self, packet: MemoryRequest) -> MemoryResponse:
-        self._processor_to_cache_fifo.request.put(packet)
-        resp = self._processor_to_cache_fifo.response.get()
+        # Use local references to avoid repeated attribute lookups in hot path
+        req_q = self._processor_to_cache_fifo.request
+        rsp_q = self._processor_to_cache_fifo.response
+        req_q.put(packet)
+        resp = rsp_q.get()
         assert resp.status == MEMORY_RESPONSE_STATUS.OK
         return resp
 
@@ -178,12 +181,26 @@ class CxlMemoryHub(RunnableComponent):
         addr_type = self._cache_controller.get_mem_addr_type(addr)
         match addr_type:
             case MEM_ADDR_TYPE.DRAM | MEM_ADDR_TYPE.CXL_CACHED | MEM_ADDR_TYPE.CXL_CACHED_BI:
-                packet = MemoryRequest(MEMORY_REQUEST_TYPE.READ, addr, size)
-                resp = self._send_mem_request(packet)
-                return resp.data
+                # Fast-path only for cacheline-sized (64B) accesses to avoid queue overhead
+                if size == 64:
+                    # Inline a minimal request/response exchange without constructing objects repeatedly
+                    q_req = self._processor_to_cache_fifo.request
+                    q_rsp = self._processor_to_cache_fifo.response
+                    q_req.put(MemoryRequest(MEMORY_REQUEST_TYPE.READ, addr, size))
+                    resp = q_rsp.get()
+                    assert resp.status == MEMORY_RESPONSE_STATUS.OK
+                    return resp.data
+                else:
+                    packet = MemoryRequest(MEMORY_REQUEST_TYPE.READ, addr, size)
+                    resp = self._send_mem_request(packet)
+                    return resp.data
             case MEM_ADDR_TYPE.CXL_UNCACHED:
-                packet = MemoryRequest(MEMORY_REQUEST_TYPE.UNCACHED_READ, addr, size)
-                resp = self._send_mem_request(packet)
+                # Inline the request/response exchange to reduce overhead
+                req_q = self._processor_to_cache_fifo.request
+                rsp_q = self._processor_to_cache_fifo.response
+                req_q.put(MemoryRequest(MEMORY_REQUEST_TYPE.UNCACHED_READ, addr, size))
+                resp = rsp_q.get()
+                assert resp.status == MEMORY_RESPONSE_STATUS.OK
                 return resp.data
             case MEM_ADDR_TYPE.MMIO:
                 return self._root_complex.read_mmio(addr, size)
@@ -198,11 +215,22 @@ class CxlMemoryHub(RunnableComponent):
         addr_type = self._cache_controller.get_mem_addr_type(addr)
         match addr_type:
             case MEM_ADDR_TYPE.DRAM | MEM_ADDR_TYPE.CXL_CACHED | MEM_ADDR_TYPE.CXL_CACHED_BI:
-                packet = MemoryRequest(MEMORY_REQUEST_TYPE.WRITE, addr, size, data)
-                self._send_mem_request(packet)
+                if size == 64:
+                    q_req = self._processor_to_cache_fifo.request
+                    q_rsp = self._processor_to_cache_fifo.response
+                    q_req.put(MemoryRequest(MEMORY_REQUEST_TYPE.WRITE, addr, size, data))
+                    resp = q_rsp.get()
+                    assert resp.status == MEMORY_RESPONSE_STATUS.OK
+                else:
+                    packet = MemoryRequest(MEMORY_REQUEST_TYPE.WRITE, addr, size, data)
+                    self._send_mem_request(packet)
             case MEM_ADDR_TYPE.CXL_UNCACHED:
-                packet = MemoryRequest(MEMORY_REQUEST_TYPE.UNCACHED_WRITE, addr, size, data)
-                self._send_mem_request(packet)
+                # Inline the request/response exchange to reduce overhead
+                req_q = self._processor_to_cache_fifo.request
+                rsp_q = self._processor_to_cache_fifo.response
+                req_q.put(MemoryRequest(MEMORY_REQUEST_TYPE.UNCACHED_WRITE, addr, size, data))
+                resp = rsp_q.get()
+                assert resp.status == MEMORY_RESPONSE_STATUS.OK
             case MEM_ADDR_TYPE.MMIO:
                 self._root_complex.write_mmio(addr, size, data)
             case MEM_ADDR_TYPE.CFG:

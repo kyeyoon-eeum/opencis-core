@@ -5,7 +5,7 @@ This software is licensed under the terms of the Revised BSD License.
 See LICENSE for details.
 """
 
-from queue import Queue
+from queue import SimpleQueue
 from dataclasses import dataclass, field
 from enum import Enum, auto
 
@@ -22,7 +22,7 @@ class CACHE_REQUEST_TYPE(Enum):
     UNCACHED_READ = auto()
 
 
-@dataclass
+@dataclass(slots=True)
 class CacheRequest:
     type: CACHE_REQUEST_TYPE
     addr: int
@@ -44,13 +44,13 @@ class CACHE_RESPONSE_STATUS(Enum):
     RSP_MISS = auto()
 
 
-@dataclass
+@dataclass(slots=True)
 class CacheResponse:
     status: CACHE_RESPONSE_STATUS
     data: int = 0
 
 
-@dataclass
+@dataclass(slots=True)
 class CacheFifoPair:
-    request: Queue[CacheRequest] = field(default_factory=Queue)
-    response: Queue[CacheResponse] = field(default_factory=Queue)
+    request: SimpleQueue[CacheRequest] = field(default_factory=SimpleQueue)
+    response: SimpleQueue[CacheResponse] = field(default_factory=SimpleQueue)

@@ -341,23 +341,41 @@ def sample_app(keepalive: bool, **kwargs):
     if val is not None:
         logger.info(f"0x{val:X}")
 
+    import cProfile, pstats, io
+
     BYTE_COUNT = 0x1000
     logger.info("PERF_START")
+
+    # Profiled Write loop
+    pr_w = cProfile.Profile()
+    pr_w.enable()
     start = time.time()
     for offset in range(0, BYTE_COUNT, 0x40):
         cpu.store(0x100000000000 + offset, 0x40, 0xDEADBEEF)
     end = time.time()
+    pr_w.disable()
     wr_time = max(end - start, 1e-6)
     wr_throughput = (BYTE_COUNT / (1024 * 1024)) / wr_time
     logger.info(f"Write RESULTS: {wr_throughput} MB/s")
+    s = io.StringIO()
+    pstats.Stats(pr_w, stream=s).sort_stats("cumulative").print_stats(20)
+    logger.info("cProfile WRITE (top):\n" + s.getvalue())
 
+    # Profiled Read loop
+    pr_r = cProfile.Profile()
+    pr_r.enable()
     start = time.time()
     for offset in range(0, BYTE_COUNT, 0x40):
         cpu.load(0x100000000000 + offset, 0x40)
     end = time.time()
+    pr_r.disable()
     rd_time = max(end - start, 1e-6)
     rd_throughput = (BYTE_COUNT / (1024 * 1024)) / rd_time
     logger.info(f"Read RESULTS: {rd_throughput} MB/s")
+    s = io.StringIO()
+    pstats.Stats(pr_r, stream=s).sort_stats("cumulative").print_stats(20)
+    logger.info("cProfile READ (top):\n" + s.getvalue())
+
     logger.info("PERF_END")
 
 

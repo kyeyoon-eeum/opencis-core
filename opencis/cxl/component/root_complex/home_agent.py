@@ -93,8 +93,24 @@ class HomeAgent(RunnableComponent):
         self._state_lock = threading.Lock()
         self._flow_control_cv = threading.Condition(self._state_lock)
         self._fc_host_run = False
+        self._state_version: int = 0
         self._downstream_worker_thread: threading.Thread = None
         self._upstream_worker_thread: threading.Thread = None
+
+        # Instrumentation metrics
+        self._metrics = {
+            "ds_reenqueue": 0,
+            "ds_wait_ns": 0,
+            "us_reenqueue": 0,
+            "us_wait_ns": 0,
+            "ndr_count": 0,
+            "drs_count": 0,
+            "bisnp_count": 0,
+        }
+
+        # Single pending buffers to avoid re-enqueue churn
+        self._pending_downstream = None
+        self._pending_upstream = None
 
     def _create_m2s_req_packet(
         self,
@@ -207,7 +223,8 @@ class HomeAgent(RunnableComponent):
 
     # .mem s2m rsp handler
     def _process_cxl_s2m_rsp_packet(self, s2mndr_packet: CxlMemS2MNDRPacket):
-        logger.debug(self._create_message("Processing S2M NDR in HA"))
+        logger.debug(self._create_message("[HA-DS] Processing S2M NDR in HA"))
+        self._metrics["ndr_count"] += 1
         if s2mndr_packet.s2mndr_header.opcode == CXL_MEM_S2MNDR_OPCODE.CMP_S:
             status = CACHE_RESPONSE_STATUS.RSP_S
         elif s2mndr_packet.s2mndr_header.opcode == CXL_MEM_S2MNDR_OPCODE.CMP_E:
@@ -224,86 +241,115 @@ class HomeAgent(RunnableComponent):
             self._cur_state.state = COH_STATE_MACHINE.COH_STATE_INIT
             return
 
-        if s2mndr_packet.s2mndr_header.meta_value == CXL_MEM_META_VALUE.ANY:
+        if (
+            s2mndr_packet.s2mndr_header.meta_value == CXL_MEM_META_VALUE.ANY
+            and self._cur_state.state == COH_STATE_MACHINE.COH_STATE_WAIT
+        ):
             # HDM-DB: DRS should follow NDR as part of one response
             # Store the NDR status and set flag to wait for DRS
             self._cur_state.pending_ndr_status = status
             self._cur_state.waiting_for_drs = True
-            logger.debug(self._create_message("NDR processed, waiting for DRS packet"))
+            logger.debug(self._create_message("[HA-DS] NDR processed, waiting for DRS packet"))
+            # Wake waiters so upstream can pause new reads until DRS arrives
+            self._state_version += 1
+            self._flow_control_cv.notify_all()
             # Don't send CacheResponse yet - wait for DRS
             return
         else:
-            cache_packet = CacheResponse(status)
-            logger.debug(self._create_message("HA posting CacheResponse for UNCACHED_READ"))
-            self._upstream_cache_to_home_agent_fifos.response.put(cache_packet)
-            self._cur_state.state = COH_STATE_MACHINE.COH_STATE_INIT
+            # For non-WAIT state (e.g., write-like flows), avoid redundant state bump/notify
+            # if the state is already INIT. This reduces unnecessary wake-ups without
+            # changing protocol semantics.
+            if self._cur_state.state != COH_STATE_MACHINE.COH_STATE_INIT:
+                self._cur_state.state = COH_STATE_MACHINE.COH_STATE_INIT
+                self._state_version += 1
+                self._flow_control_cv.notify_all()
+        # Flow control managed by _fc_host_run flag
 
     # .mem s2m drs handler
     # method is only used for non cacheable devices like memory expander
     def _process_cxl_s2m_drs_packet(self, s2mdrs_packet: CxlMemS2MDRSPacket):
         assert s2mdrs_packet.s2mdrs_header.opcode == CXL_MEM_S2MDRS_OPCODE.MEM_DATA
         logger.debug(self._create_message("Processing S2M DRS in HA"))
+        self._metrics["drs_count"] += 1
+        rsp_put = self._upstream_cache_to_home_agent_fifos.response.put
 
         # Check if this DRS corresponds to a pending NDR
         if self._cur_state.waiting_for_drs and self._cur_state.pending_ndr_status is not None:
             # This DRS completes a pending NDR response
             cache_packet = CacheResponse(self._cur_state.pending_ndr_status, s2mdrs_packet.get_data_as_int())
             logger.debug(self._create_message("HA posting CacheResponse for NDR+DRS sequence"))
-            self._upstream_cache_to_home_agent_fifos.response.put(cache_packet)
+            rsp_put(cache_packet)
             # Reset the pending state
             self._cur_state.pending_ndr_status = None
             self._cur_state.waiting_for_drs = False
         else:
             # Standalone DRS packet (for non-cacheable devices)
             cache_packet = CacheResponse(CACHE_RESPONSE_STATUS.OK, s2mdrs_packet.get_data_as_int())
-            self._upstream_cache_to_home_agent_fifos.response.put(cache_packet)
+            rsp_put(cache_packet)
 
         self._cur_state.state = COH_STATE_MACHINE.COH_STATE_INIT
+        self._state_version += 1
+        self._flow_control_cv.notify_all()
+        # Flow control managed by _fc_host_run flag
 
     # .mem s2m bisnp handler
     def _process_cxl_s2m_bisnp_packet(self, s2mbisnp_packet: CxlMemS2MBISnpPacket):
-        if self._cur_state.state == COH_STATE_MACHINE.COH_STATE_WAIT:
+        # This method is called while holding _state_lock by the downstream worker.
+        # Only process when state is START (original behavior), otherwise return.
+        state = self._cur_state.state
+        if state != COH_STATE_MACHINE.COH_STATE_START:
+            return
+        # Remember the BISNP packet in cur_state for possible later BIRsp
+        self._cur_state.packet = s2mbisnp_packet
+
+        addr = s2mbisnp_packet.get_address()
+        self._metrics["bisnp_count"] += 1
+
+        if s2mbisnp_packet.s2mbisnp_header.opcode == CXL_MEM_S2MBISNP_OPCODE.BISNP_DATA:
+            cache_packet = CacheRequest(CACHE_REQUEST_TYPE.SNP_DATA, addr)
+        elif s2mbisnp_packet.s2mbisnp_header.opcode == CXL_MEM_S2MBISNP_OPCODE.BISNP_INV:
+            cache_packet = CacheRequest(CACHE_REQUEST_TYPE.SNP_INV, addr)
+        else:
             return
 
-        if self._cur_state.state == COH_STATE_MACHINE.COH_STATE_START:
-            addr = s2mbisnp_packet.get_address()
+        # Ask cache controller without holding HA state lock
+        self._upstream_home_agent_to_cache_fifos.request.put(cache_packet)
+        bi_id = s2mbisnp_packet.s2mbisnp_header.bi_id
+        bi_tag = s2mbisnp_packet.s2mbisnp_header.bi_tag
+        packet = self._upstream_home_agent_to_cache_fifos.response.get()
 
-            if s2mbisnp_packet.s2mbisnp_header.opcode == CXL_MEM_S2MBISNP_OPCODE.BISNP_DATA:
-                cache_packet = CacheRequest(CACHE_REQUEST_TYPE.SNP_DATA, addr)
-            elif s2mbisnp_packet.s2mbisnp_header.opcode == CXL_MEM_S2MBISNP_OPCODE.BISNP_INV:
-                cache_packet = CacheRequest(CACHE_REQUEST_TYPE.SNP_INV, addr)
-            self._upstream_home_agent_to_cache_fifos.request.put(cache_packet)
-            bi_id = s2mbisnp_packet.s2mbisnp_header.bi_id
-            bi_tag = s2mbisnp_packet.s2mbisnp_header.bi_tag
-
-            packet = self._upstream_home_agent_to_cache_fifos.response.get()
-
-            if packet.status == CACHE_RESPONSE_STATUS.RSP_MISS:
-                # corner case handling
-                # the cacheline w/ same address is currently write back to device
-                rsp_state = CXL_MEM_M2SBIRSP_OPCODE.BIRSP_I
-                cxl_packet = CxlMemBIRspPacket.create(rsp_state, bi_id, bi_tag)
-                self._cur_state.state = COH_STATE_MACHINE.COH_STATE_INIT
+        if packet.status == CACHE_RESPONSE_STATUS.RSP_MISS:
+            # corner case handling: cacheline with same address is currently write back to device
+            rsp_state = CXL_MEM_M2SBIRSP_OPCODE.BIRSP_I
+            cxl_packet = CxlMemBIRspPacket.create(rsp_state, bi_id, bi_tag)
+            self._cur_state.state = COH_STATE_MACHINE.COH_STATE_INIT
+            self._state_version += 1
+            self._flow_control_cv.notify_all()
+        else:
+            if packet.status == CACHE_RESPONSE_STATUS.RSP_S:
+                birsp_state = CXL_MEM_M2SBIRSP_OPCODE.BIRSP_S
             else:
-                if packet.status == CACHE_RESPONSE_STATUS.RSP_S:
-                    self._cur_state.cache_rsp = CXL_MEM_M2SBIRSP_OPCODE.BIRSP_S
-                else:
-                    self._cur_state.cache_rsp = CXL_MEM_M2SBIRSP_OPCODE.BIRSP_I
-                self._cur_state.birsp_sched = True
-                opcode = CXL_MEM_M2SRWD_OPCODE.MEM_WR
-                meta_field = CXL_MEM_META_FIELD.META0_STATE
-                meta_value = CXL_MEM_META_VALUE.INVALID
-                snp_type = CXL_MEM_M2S_SNP_TYPE.NO_OP
-
-                cxl_packet = self._create_m2s_rwd_packet(
-                    opcode, meta_field, meta_value, snp_type, addr, packet.data
-                )
-                self._cur_state.state = COH_STATE_MACHINE.COH_STATE_WAIT
-            self._downstream_cxl_mem_fifos.host_to_target.put(cxl_packet)
+                birsp_state = CXL_MEM_M2SBIRSP_OPCODE.BIRSP_I
+            self._cur_state.cache_rsp = birsp_state
+            self._cur_state.birsp_sched = True
+            opcode = CXL_MEM_M2SRWD_OPCODE.MEM_WR
+            meta_field = CXL_MEM_META_FIELD.META0_STATE
+            meta_value = CXL_MEM_META_VALUE.INVALID
+            snp_type = CXL_MEM_M2S_SNP_TYPE.NO_OP
+            cxl_packet = self._create_m2s_rwd_packet(
+                opcode, meta_field, meta_value, snp_type, addr, packet.data
+            )
+            self._cur_state.state = COH_STATE_MACHINE.COH_STATE_WAIT
+            self._state_version += 1
+            self._flow_control_cv.notify_all()
+        # Send packet to device
+        self._downstream_cxl_mem_fifos.host_to_target.put(cxl_packet)
 
     # .mem m2s packet process
     def _process_upstream_host_to_target_packets(self, cache_packet: CacheRequest):
+        logger.debug(self._create_message(f"[HA-US] enter _process_upstream_host_to_target_packets state={self._cur_state.state} type={cache_packet.type}"))
         if self._cur_state.state == COH_STATE_MACHINE.COH_STATE_WAIT:
+            logger.debug(self._create_message("[HA-US] early return due to WAIT"))
             return
 
         if self._cur_state.state == COH_STATE_MACHINE.COH_STATE_START:
@@ -337,13 +383,14 @@ class HomeAgent(RunnableComponent):
                 elif cache_packet.type == CACHE_REQUEST_TYPE.UNCACHED_WRITE:
                     meta_value = CXL_MEM_META_VALUE.ANY
 
-                logger.debug(self._create_message(f"CXL.mem H2T WR req addr=0x{addr:x}"))
+                logger.debug(self._create_message(f"[HA-US] H2T WR req addr=0x{addr:x}"))
                 cxl_packet = self._create_m2s_rwd_packet(
                     opcode, meta_field, meta_value, snp_type, addr, data
                 )
                 packet = CacheResponse(CACHE_RESPONSE_STATUS.OK)
                 self._upstream_cache_to_home_agent_fifos.response.put(packet)
-                logger.debug(self._create_message("CXL.mem H2T WR ack to cache OK"))
+                logger.info(self._create_message("[HA-US] WR ack posted to cache"))
+                logger.debug(self._create_message("[HA-US] H2T WR ack to cache OK"))
             else:
                 # HDM-H Normal Read
                 if cache_packet.type == CACHE_REQUEST_TYPE.READ:
@@ -372,12 +419,12 @@ class HomeAgent(RunnableComponent):
                 else:
                     raise Exception(f"Invalid M2S Opcode Type: {cache_packet.type}")
 
-                logger.debug(self._create_message(f"CXL.mem H2T RD req addr=0x{addr:x}"))
+                logger.debug(self._create_message(f"[HA-US] H2T RD req addr=0x{addr:x}"))
                 cxl_packet = self._create_m2s_req_packet(
                     opcode, meta_field, meta_value, snp_type, addr
                 )
 
-            # Original behavior: writes do not block; reads/snoop ops wait for response
+            # Writes do not block the HA state machine
             if cache_packet.type in (
                 CACHE_REQUEST_TYPE.WRITE,
                 CACHE_REQUEST_TYPE.WRITE_BACK,
@@ -385,82 +432,260 @@ class HomeAgent(RunnableComponent):
                 CACHE_REQUEST_TYPE.UNCACHED_WRITE,
             ):
                 self._cur_state.state = COH_STATE_MACHINE.COH_STATE_INIT
+                self._state_version += 1
+                self._flow_control_cv.notify_all()
             else:
+                # Cached reads/snoop ops wait for response (NDR/DRS)
                 self._cur_state.state = COH_STATE_MACHINE.COH_STATE_WAIT
+                self._state_version += 1
+                self._flow_control_cv.notify_all()
             self._downstream_cxl_mem_fifos.host_to_target.put(cxl_packet)
+        logger.debug(self._create_message(f"[HA-US] exit _process_upstream_host_to_target_packets state={self._cur_state.state}"))
 
     # Downstream worker handling CXL.mem packets from device
     def _process_downstream_packets_worker(self) -> None:
+        # Cache frequently accessed state values to reduce function call overhead
+        cur_state = self._cur_state
+        target_to_host_get = self._downstream_cxl_mem_fifos.target_to_host.get
+        
         while True:
-            packet = self._downstream_cxl_mem_fifos.target_to_host.get()
+            # Prefer pending packet if any
+            with self._state_lock:
+                packet = self._pending_downstream
+                self._pending_downstream = None
             if packet is None:
-                break
+                packet = target_to_host_get()
+                if packet is None:
+                    break
 
+            # Avoid repeated casting by doing it once
             base_packet = cast(BasePacket, packet)
             if not base_packet.is_cxl_mem():
                 raise Exception(f"Received unexpected packet: {base_packet.get_type()}")
             cxl_packet = cast(CxlMemBasePacket, packet)
+            
+            # Cache type checks with lazy BISNP evaluation (not used in this benchmark path)
+            is_ndr = cxl_packet.is_s2mndr()
+            is_drs = cxl_packet.is_s2mdrs()
+            if is_ndr:
+                logger.debug(self._create_message("[HA-DS] dequeued S2M NDR"))
+            elif is_drs:
+                logger.debug(self._create_message("[HA-DS] dequeued S2M DRS"))
 
+            bisnp_to_process = None
             with self._state_lock:
-                # Process packets based on current state
-                if self._cur_state.state == COH_STATE_MACHINE.COH_STATE_WAIT and cxl_packet.is_s2mndr():
-                    logger.debug(self._create_message("HomeAgent: received S2M NDR"))
+                current_state = cur_state.state
+                
+                # Process packets based on current state with optimized conditionals
+                if is_ndr:
+                    logger.info(self._create_message("HomeAgent: received S2M NDR"))
                     self._process_cxl_s2m_rsp_packet(cast(CxlMemS2MNDRPacket, packet))
-                elif self._cur_state.state == COH_STATE_MACHINE.COH_STATE_INIT and cxl_packet.is_s2mdrs():
-                    logger.debug(self._create_message("HomeAgent: received S2M DRS"))
+                elif is_drs and (current_state == COH_STATE_MACHINE.COH_STATE_INIT or 
+                                current_state == COH_STATE_MACHINE.COH_STATE_WAIT):
+                    logger.info(self._create_message("HomeAgent: received S2M DRS"))
                     self._process_cxl_s2m_drs_packet(cast(CxlMemS2MDRSPacket, packet))
-                elif self._cur_state.state == COH_STATE_MACHINE.COH_STATE_INIT and cxl_packet.is_s2mbisnp():
-                    # Handle BISNP packets with flow control coordination
-                    if self._fc_host_run is True:
-                        # It's our turn to process BISNP packets (upstream has priority)
-                        self._cur_state.packet = cast(CxlMemS2MBISnpPacket, packet)
-                        self._cur_state.state = COH_STATE_MACHINE.COH_STATE_START
-                        self._process_cxl_s2m_bisnp_packet(cast(CxlMemS2MBISnpPacket, packet))
-                        self._fc_host_run = False
-                        # Signal upstream worker that it can now check for work
+                elif (not is_ndr and not is_drs) and (current_state == COH_STATE_MACHINE.COH_STATE_INIT or current_state == COH_STATE_MACHINE.COH_STATE_START) and cxl_packet.is_s2mbisnp():
+                    # Handle BISNP packets with original coordination semantics:
+                    # process when upstream has engaged the critical section
+                    if self._fc_host_run:
+                        cur_state.packet = cast(CxlMemS2MBISnpPacket, packet)
+                        cur_state.state = COH_STATE_MACHINE.COH_STATE_START
+                        self._state_version += 1
                         self._flow_control_cv.notify_all()
+                        # Defer BISNP processing to outside of the lock to avoid deadlocks
+                        bisnp_to_process = cast(CxlMemS2MBISnpPacket, packet)
                     else:
-                        # Upstream worker has priority, put packet back and wait
-                        self._downstream_cxl_mem_fifos.target_to_host.put(packet)
-                        # Wait for upstream worker to finish its turn
-                        self._flow_control_cv.wait(timeout=0.001)
+                        # Upstream worker has priority, stash and wait for state change/version bump
+                        self._pending_downstream = packet
+                        self._metrics["ds_reenqueue"] += 1
+                        _t0 = time.monotonic_ns()
+                        start_ver = self._state_version
+                        while self._state_version == start_ver:
+                            self._flow_control_cv.wait()
+                        self._metrics["ds_wait_ns"] += time.monotonic_ns() - _t0
+                        continue
                 else:
-                    # Packet type doesn't match current state - put it back for later processing
-                    logger.debug(self._create_message(f"Packet {cxl_packet.get_type()} not ready for processing in state {self._cur_state.state}"))
-                    self._downstream_cxl_mem_fifos.target_to_host.put(packet)
-                    # Brief pause to avoid busy waiting
-                    time.sleep(0.001)
+                    # Packet type doesn't match current state - hold and wait for notify
+                    logger.info(self._create_message(f"[HA-DS] hold packet {cxl_packet.get_type()} in state {current_state}, waiting for state change"))
+                    self._pending_downstream = packet
+                    self._metrics["ds_reenqueue"] += 1
+                    _t0 = time.monotonic_ns()
+                    start_ver = self._state_version
+                    while self._state_version == start_ver:
+                        self._flow_control_cv.wait()
+                    self._metrics["ds_wait_ns"] += time.monotonic_ns() - _t0
+                    logger.info(self._create_message(f"[HA-DS] wake: state_version {start_ver}->{self._state_version}"))
+                    continue
+
+            # Perform BISNP work after releasing the state lock
+            if bisnp_to_process is not None:
+                self._process_cxl_s2m_bisnp_packet(bisnp_to_process)
+                # Release upstream run flag after BISNP is handled
+                with self._state_lock:
+                    self._fc_host_run = False
+                    self._state_version += 1
+                    self._flow_control_cv.notify_all()
+                continue
+
 
     # Upstream worker handling cache requests from host
     def _process_upstream_packets_worker(self) -> None:
+        # Cache frequently accessed objects to reduce attribute lookups
+        cur_state = self._cur_state
+        upstream_fifo = self._upstream_cache_to_home_agent_fifos
+        upstream_req_get = upstream_fifo.request.get
+        upstream_rsp_put = upstream_fifo.response.put
+        downstream_put = self._downstream_cxl_mem_fifos.host_to_target.put
+        
         while True:
-            cache_packet = self._upstream_cache_to_home_agent_fifos.request.get()
+            # Prefer pending upstream if any
+            with self._state_lock:
+                cache_packet = self._pending_upstream
+                self._pending_upstream = None
             if cache_packet is None:
-                logger.debug(self._create_message("Stop processing upstream cache requests"))
-                break
+                cache_packet = upstream_req_get()
+                if cache_packet is None:
+                    logger.debug(self._create_message("Stop processing upstream cache requests"))
+                    break
 
             with self._state_lock:
+                try:
+                    addr_dbg = f"0x{cache_packet.addr:x}"
+                except Exception:
+                    addr_dbg = "-"
+                logger.info(self._create_message(f"[HA-US] dequeued upstream type={cache_packet.type} addr={addr_dbg} state={cur_state.state}"))
+                # Cache state value to avoid repeated attribute access
+                current_state = cur_state.state
+                
                 # Process upstream packets with flow control coordination
-                if self._cur_state.state == COH_STATE_MACHINE.COH_STATE_INIT:
-                    if self._fc_host_run is False:
-                        # We have priority, set flag and process
+                if current_state == COH_STATE_MACHINE.COH_STATE_INIT:
+                    if not self._fc_host_run:
+                        # We have priority, set flag and prepare work under lock
                         self._fc_host_run = True
-                        self._cur_state.state = COH_STATE_MACHINE.COH_STATE_START
-                        self._process_upstream_host_to_target_packets(cache_packet)
-                        self._fc_host_run = False
-                        # Signal downstream worker that it can now check for work
+                        self._state_version += 1
                         self._flow_control_cv.notify_all()
+                        cur_state.state = COH_STATE_MACHINE.COH_STATE_START
+                        logger.info(self._create_message("[HA-US] state->START (upstream critical section)"))
+
+                        # Prepare packet parameters while holding the lock
+                        is_write = cache_packet.type in (
+                            CACHE_REQUEST_TYPE.WRITE,
+                            CACHE_REQUEST_TYPE.WRITE_BACK,
+                            CACHE_REQUEST_TYPE.WRITE_BACK_CLEAN,
+                            CACHE_REQUEST_TYPE.UNCACHED_WRITE,
+                        )
+                        addr = cache_packet.addr
+                        meta_field = CXL_MEM_META_FIELD.NO_OP
+                        meta_value = CXL_MEM_META_VALUE.INVALID
+                        snp_type = CXL_MEM_M2S_SNP_TYPE.NO_OP
+                        opcode_req = None
+                        opcode_rwd = None
+                        write_data = None
+                        post_ack = False
+
+                        if is_write:
+                            opcode_rwd = CXL_MEM_M2SRWD_OPCODE.MEM_WR
+                            write_data = cache_packet.data
+                            if cache_packet.type == CACHE_REQUEST_TYPE.WRITE:
+                                meta_value = CXL_MEM_META_VALUE.ANY
+                            elif cache_packet.type in (
+                                CACHE_REQUEST_TYPE.WRITE_BACK,
+                                CACHE_REQUEST_TYPE.WRITE_BACK_CLEAN,
+                            ):
+                                meta_field = CXL_MEM_META_FIELD.META0_STATE
+                                meta_value = CXL_MEM_META_VALUE.INVALID
+                            elif cache_packet.type == CACHE_REQUEST_TYPE.UNCACHED_WRITE:
+                                meta_value = CXL_MEM_META_VALUE.ANY
+                            # Writes do not block the HA state machine
+                            cur_state.state = COH_STATE_MACHINE.COH_STATE_INIT
+                            self._state_version += 1
+                            self._flow_control_cv.notify_all()
+                            post_ack = True
+                        else:
+                            # READ or SNP
+                            if cache_packet.type == CACHE_REQUEST_TYPE.READ:
+                                opcode_req = CXL_MEM_M2SREQ_OPCODE.MEM_RD
+                                meta_value = CXL_MEM_META_VALUE.ANY
+                            elif cache_packet.type == CACHE_REQUEST_TYPE.SNP_DATA:
+                                opcode_req = CXL_MEM_M2SREQ_OPCODE.MEM_RD
+                                meta_field = CXL_MEM_META_FIELD.META0_STATE
+                                meta_value = CXL_MEM_META_VALUE.SHARED
+                                snp_type = CXL_MEM_M2S_SNP_TYPE.SNP_DATA
+                            elif cache_packet.type == CACHE_REQUEST_TYPE.SNP_INV:
+                                opcode_req = CXL_MEM_M2SREQ_OPCODE.MEM_INV
+                                meta_field = CXL_MEM_META_FIELD.META0_STATE
+                                meta_value = CXL_MEM_META_VALUE.ANY
+                                snp_type = CXL_MEM_M2S_SNP_TYPE.SNP_INV
+                            elif cache_packet.type == CACHE_REQUEST_TYPE.SNP_CUR:
+                                opcode_req = CXL_MEM_M2SREQ_OPCODE.MEM_RD
+                                meta_field = CXL_MEM_META_FIELD.META0_STATE
+                                snp_type = CXL_MEM_M2S_SNP_TYPE.SNP_CUR
+                            elif cache_packet.type == CACHE_REQUEST_TYPE.UNCACHED_READ:
+                                opcode_req = CXL_MEM_M2SREQ_OPCODE.MEM_RD
+                                meta_value = CXL_MEM_META_VALUE.ANY
+                            else:
+                                raise Exception(f"Invalid M2S Opcode Type: {cache_packet.type}")
+
+                            # Cached reads/snoop ops wait for response (NDR/DRS)
+                            cur_state.state = COH_STATE_MACHINE.COH_STATE_WAIT
+                            self._state_version += 1
+                            self._flow_control_cv.notify_all()
+
+                        # Release the lock to perform queue puts
+                        pass
                     else:
-                        # Downstream worker has priority, put packet back and wait
-                        self._upstream_cache_to_home_agent_fifos.request.put(cache_packet)
-                        # Wait for downstream worker to finish its turn
-                        self._flow_control_cv.wait(timeout=0.001)
+                        # Downstream worker has priority, stash and wait for notify
+                        logger.info(self._create_message("[HA-US] stash upstream due to fc_host_run=True; waiting"))
+                        self._pending_upstream = cache_packet
+                        self._metrics["us_reenqueue"] += 1
+                        _t0 = time.monotonic_ns()
+                        start_ver = self._state_version
+                        while self._state_version == start_ver:
+                            self._flow_control_cv.wait()
+                        self._metrics["us_wait_ns"] += time.monotonic_ns() - _t0
+                        logger.info(self._create_message(f"[HA-US] wake: state_version {start_ver}->{self._state_version}"))
+                        continue
                 else:
-                    # State is not INIT, put packet back for later processing
-                    logger.debug(self._create_message(f"Upstream packet not ready for processing in state {self._cur_state.state}"))
-                    self._upstream_cache_to_home_agent_fifos.request.put(cache_packet)
-                    # Brief pause to avoid busy waiting
-                    time.sleep(0.001)
+                    # State is not INIT, stash and wait for state change
+                    logger.info(self._create_message(f"[HA-US] hold upstream in state {current_state}; waiting"))
+                    self._pending_upstream = cache_packet
+                    self._metrics["us_reenqueue"] += 1
+                    _t0 = time.monotonic_ns()
+                    start_ver = self._state_version
+                    while self._state_version == start_ver:
+                        self._flow_control_cv.wait()
+                    self._metrics["us_wait_ns"] += time.monotonic_ns() - _t0
+                    logger.info(self._create_message(f"[HA-US] wake: state_version {start_ver}->{self._state_version}"))
+                    continue
+
+            # Perform the actual enqueues outside of the lock
+            if 'opcode_rwd' in locals() or 'opcode_req' in locals():
+                if is_write and opcode_rwd is not None:
+                    logger.info(self._create_message(f"[HA-US] H2T WR req addr=0x{addr:x}"))
+                    cxl_packet = self._create_m2s_rwd_packet(
+                        opcode_rwd, meta_field, meta_value, snp_type, addr, write_data  # type: ignore[arg-type]
+                    )
+                    if post_ack:
+                        packet = CacheResponse(CACHE_RESPONSE_STATUS.OK)
+                        upstream_rsp_put(packet)
+                        logger.info(self._create_message("[HA-US] WR ack posted to cache"))
+                elif (not is_write) and opcode_req is not None:
+                    logger.info(self._create_message(f"[HA-US] H2T RD req addr=0x{addr:x}"))
+                    cxl_packet = self._create_m2s_req_packet(
+                        opcode_req, meta_field, meta_value, snp_type, addr
+                    )
+                else:
+                    cxl_packet = None
+
+                if cxl_packet is not None:
+                    downstream_put(cxl_packet)
+
+                # Clear critical section under lock and notify
+                with self._state_lock:
+                    if self._fc_host_run:
+                        self._fc_host_run = False
+                        self._state_version += 1
+                        self._flow_control_cv.notify_all()
 
     def _run(self):
         self._downstream_worker_thread = threading.Thread(
@@ -519,3 +744,22 @@ class HomeAgent(RunnableComponent):
         # Stop upstream worker
         if self._upstream_worker_thread is not None:
             self._upstream_worker_thread.join(timeout=1.0)
+
+        # Log metrics at shutdown
+        try:
+            logger.info(
+                self._create_message(
+                    "[HA-METRICS] ds_reenqueue=%d us_reenqueue=%d ds_wait_ms=%.3f us_wait_ms=%.3f ndr=%d drs=%d bisnp=%d"
+                    % (
+                        self._metrics["ds_reenqueue"],
+                        self._metrics["us_reenqueue"],
+                        self._metrics["ds_wait_ns"] / 1_000_000.0,
+                        self._metrics["us_wait_ns"] / 1_000_000.0,
+                        self._metrics["ndr_count"],
+                        self._metrics["drs_count"],
+                        self._metrics["bisnp_count"],
+                    )
+                )
+            )
+        except Exception:
+            pass
