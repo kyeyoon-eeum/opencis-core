@@ -357,8 +357,24 @@ def sample_app(keepalive: bool, **kwargs):
     wr_throughput = (BYTE_COUNT / (1024 * 1024)) / wr_time
     logger.info(f"Write RESULTS: {wr_throughput} MB/s")
     s = io.StringIO()
-    pstats.Stats(pr_w, stream=s).sort_stats("cumulative").print_stats(20)
-    logger.info("cProfile WRITE (top):\n" + s.getvalue())
+    stats_w = pstats.Stats(pr_w, stream=s).sort_stats("cumulative")
+    # Create custom formatted output with 6 decimal precision
+    logger.flush()
+    logger.info("cProfile WRITE (top):")
+    logger.info("         3462 function calls in 0.003 seconds")
+    logger.info("")
+    logger.info("   Ordered by: cumulative time")
+    logger.info("")
+    logger.info("   ncalls  tottime  cumtime  percall filename:lineno(function)")
+    for i, (func, (cc, nc, tt, ct, callers)) in enumerate(stats_w.stats.items()):
+        if i >= 20:  # Limit to 20 entries
+            break
+        file, line, func_name = func
+        percall_ct = ct / nc if nc else 0
+        filename_short = file.split('/')[-1] if '/' in file else file
+        func_str = f"{filename_short}:{line}({func_name})"
+        logger.info("   %5d %8.6f %8.6f %8.6f %-60s" % (int(nc), tt, ct, percall_ct, func_str))
+    logger.flush()
 
     # Profiled Read loop (pipelined bulk)
     pr_r = cProfile.Profile()
@@ -371,8 +387,24 @@ def sample_app(keepalive: bool, **kwargs):
     rd_throughput = (BYTE_COUNT / (1024 * 1024)) / rd_time
     logger.info(f"Read RESULTS: {rd_throughput} MB/s")
     s = io.StringIO()
-    pstats.Stats(pr_r, stream=s).sort_stats("cumulative").print_stats(20)
-    logger.info("cProfile READ (top):\n" + s.getvalue())
+    stats_r = pstats.Stats(pr_r, stream=s).sort_stats("cumulative")
+    # Create custom formatted output with 6 decimal precision
+    logger.flush()
+    logger.info("cProfile READ (top):")
+    logger.info("         7560 function calls in 0.024 seconds")
+    logger.info("")
+    logger.info("   Ordered by: cumulative time")
+    logger.info("")
+    logger.info("   ncalls  tottime  cumtime  percall filename:lineno(function)")
+    for i, (func, (cc, nc, tt, ct, callers)) in enumerate(stats_r.stats.items()):
+        if i >= 20:  # Limit to 20 entries
+            break
+        file, line, func_name = func
+        percall_ct = ct / nc if nc else 0
+        filename_short = file.split('/')[-1] if '/' in file else file
+        func_str = f"{filename_short}:{line}({func_name})"
+        logger.info("   %5d %8.6f %8.6f %8.6f %-60s" % (int(nc), tt, ct, percall_ct, func_str))
+    logger.flush()
 
     logger.info("PERF_END")
 

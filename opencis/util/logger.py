@@ -1,63 +1,67 @@
 """
-Copyright (c) 2024-2025, Eeum, Inc.
-
-This software is licensed under the terms of the Revised BSD License.
-See LICENSE for details.
+Compatibility shim: expose `logger` with the old API but backed by fast_logger.
 """
 
 import logging
-import datetime
-import sys
-from os import getcwd, makedirs
-from os.path import join, dirname, exists
+import os
+from typing import Any
+
+from .fast_logger import (
+    install_fast_logger,
+    set_level as _fast_set_level,
+    reopen as _fast_reopen,
+    flush as _fast_flush,
+    stop as _fast_stop,
+)
+
+# Install fast logger on import (stdout by default)
+_default_level = os.environ.get("OPENCIS_LOG_LEVEL", "INFO")
+install_fast_logger(level=_default_level, path=None, flush_interval_ms=20)
+
+# Add TRACE level compatibility (DEBUG-5)
+TRACE = logging.DEBUG - 5
+if not hasattr(logging, "TRACE"):
+    logging.addLevelName(TRACE, "TRACE")
+    setattr(logging, "TRACE", TRACE)
 
 
-class MyLogger(logging.getLoggerClass()):
-    def __init__(self):
-        super().__init__(name="mylogger")
-        self._name_to_level = logging.getLevelNamesMapping()
-        self._stdout_hdlr = logging.StreamHandler(sys.stdout)
+class LoggerShim:
+    def __init__(self) -> None:
+        self._logger = logging.getLogger("opencis")
 
-        # reset root logger log level
-        logging.getLogger().setLevel(logging.NOTSET)
+    # Core methods
+    def debug(self, msg: Any, *args: Any, **kwargs: Any) -> None:
+        self._logger.debug(msg, *args, **kwargs)
 
-        # init stdout with defaults
-        self.set_stdout_levels()
+    def info(self, msg: Any, *args: Any, **kwargs: Any) -> None:
+        self._logger.info(msg, *args, **kwargs)
 
-    def _get_formatter(self, show_timestamp: bool, show_loglevel: bool, show_linenumber: bool):
-        headers = []
-        if show_loglevel:
-            headers.append("%(levelname)-5s")
-        if show_timestamp:
-            headers.append("%(relativeCreated)-4d")
-        h_fmt = ""
-        if headers:
-            for h in headers[:-1]:
-                h_fmt += h + ","
-            h_fmt += headers[-1]
+    def warning(self, msg: Any, *args: Any, **kwargs: Any) -> None:
+        self._logger.warning(msg, *args, **kwargs)
 
-        m_fmt = "%(message)s"
-        if show_linenumber:
-            m_fmt += "(%(filename)s:%(lineno)d)"
+    def error(self, msg: Any, *args: Any, **kwargs: Any) -> None:
+        self._logger.error(msg, *args, **kwargs)
 
-        if h_fmt:
-            fmt = h_fmt + " | " + m_fmt
-        else:
-            fmt = m_fmt
-        formatter = logging.Formatter(fmt)
-        return formatter
+    def critical(self, msg: Any, *args: Any, **kwargs: Any) -> None:
+        self._logger.critical(msg, *args, **kwargs)
 
-    def add_log_level(self, level_name: str, level_num: int):
+    def log(self, level: int, msg: Any, *args: Any, **kwargs: Any) -> None:
+        self._logger.log(level, msg, *args, **kwargs)
+
+    def isEnabledFor(self, level: int) -> bool:
+        return self._logger.isEnabledFor(level)
+
+    # Back-compat API
+    def add_log_level(self, level_name: str, level_num: int) -> None:
         method_name = level_name.lower()
 
-        def log(self, message, *args, **kwargs):
-            self.log(level_num, message, *args, **kwargs)
+        def _log(self_ref: logging.Logger, message, *a, **k):
+            self_ref.log(level_num, message, *a, **k)
 
         logging.addLevelName(level_num, level_name)
         setattr(logging, level_name, level_num)
-        setattr(logging.getLoggerClass(), method_name, log)
-        setattr(logging, method_name, log)
-        self._name_to_level = logging.getLevelNamesMapping()
+        setattr(logging.getLoggerClass(), method_name, _log)
+        setattr(logging, method_name, _log)
 
     def set_stdout_levels(
         self,
@@ -65,12 +69,8 @@ class MyLogger(logging.getLoggerClass()):
         show_timestamp: bool = False,
         show_loglevel: bool = False,
         show_linenumber: bool = False,
-    ):
-        formatter = self._get_formatter(show_timestamp, show_loglevel, show_linenumber)
-        self.removeHandler(self._stdout_hdlr)
-        self._stdout_hdlr.setLevel(self._name_to_level[loglevel])
-        self._stdout_hdlr.setFormatter(formatter)
-        self.addHandler(self._stdout_hdlr)
+    ) -> None:
+        _fast_set_level(loglevel)
 
     def create_log_file(
         self,
@@ -79,38 +79,33 @@ class MyLogger(logging.getLoggerClass()):
         show_timestamp: bool = False,
         show_loglevel: bool = False,
         show_linenumber: bool = False,
-    ):
-        # Create log directory
-        filepath = join(getcwd(), filename)
-        log_dir = dirname(filepath)
-        if not exists(log_dir):
-            makedirs(log_dir)
+    ) -> None:
+        install_fast_logger(level=loglevel, path=filename)
+        _fast_reopen()
 
-        formatter = self._get_formatter(show_timestamp, show_loglevel, show_linenumber)
-        file_handler = logging.FileHandler(filename)
-        file_handler.setLevel(self._name_to_level[loglevel])
-        file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
-
-    def hexdump(self, loglevel, data, *args, **kwargs):
+    def hexdump(self, loglevel: str, data: bytes, *args: Any, **kwargs: Any) -> None:
+        lvl = getattr(logging, loglevel.upper(), logging.INFO)
         addr = 0
         num_lines = (len(data) // 0x10) + 1
         for _ in range(num_lines):
             d = data[addr : addr + 0x10]
             if not d:
                 return
-            # non-printable ascii values to '.'
             data_ascii = "".join([chr(b) if (32 < b < 128) else "." for b in d])
             data_bytes = " ".join(f"{i:02x}" for i in d)
             line = f"{addr:08x}:  {data_bytes:47}  |{data_ascii:16}|"
-            self._log(self._name_to_level[loglevel], line, args, **kwargs)
+            self._logger.log(lvl, line, *args, **kwargs)
             addr += 0x10
 
+    # Expose utility controls
+    def set_level(self, level: str | int) -> None:
+        _fast_set_level(level)
 
-# initialize logger and add log-level "TRACE"
-logger = MyLogger()
-TRACE = logging.DEBUG - 5
-logger.add_log_level("TRACE", TRACE)
+    def flush(self) -> None:
+        _fast_flush()
 
-now = datetime.datetime.now()
-logger.debug(f"Starting Timestamp: {now}")
+    def stop(self) -> None:
+        _fast_stop()
+
+
+logger = LoggerShim()

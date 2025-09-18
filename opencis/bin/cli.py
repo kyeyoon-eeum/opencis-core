@@ -225,7 +225,8 @@ def start(
 ):
     """Start components"""
 
-    log_level = log_level if not None else "INFO"
+    # Fix default log level handling
+    log_level = log_level if log_level is not None else "INFO"
     config_components = ["switch", "sld-group", "mld-group", "host-group"]
     comp = list(comp)
 
@@ -234,14 +235,13 @@ def start(
     if missing_cfg:
         raise click.BadParameter(f"Must specify <config file> for: {', '.join(missing_cfg)}")
 
-    # Logger setup
-    if log_level or show_timestamp or show_loglevel or show_linenumber:
-        logger.set_stdout_levels(
-            loglevel=log_level,
-            show_timestamp=show_timestamp,
-            show_loglevel=show_loglevel,
-            show_linenumber=show_linenumber,
-        )
+    # Logger setup: always set stdout level so INFO logs are visible by default
+    logger.set_stdout_levels(
+        loglevel=log_level,
+        show_timestamp=show_timestamp,
+        show_loglevel=show_loglevel,
+        show_linenumber=show_linenumber,
+    )
 
     if log_file:
         logger.create_log_file(
