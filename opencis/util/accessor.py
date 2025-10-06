@@ -5,29 +5,70 @@ This software is licensed under the terms of the Revised BSD License.
 See LICENSE for details.
 """
 
-from typing import Final
+from typing import Final, Optional
+import os
+import mmap
 
 
 class FileAccessor:
     def __init__(self, filename: str, size: int):
         self.filename: Final[str] = filename
+        # Ensure file exists with requested size
         with open(filename, "wb") as file:
-            file.write(b"\x00" * size)
+            file.truncate(size)
             file.flush()
+        # Keep a persistent fd and mmap for fast access
+        self._fd: int = os.open(filename, os.O_RDWR)
+        try:
+            self._mmap = mmap.mmap(self._fd, length=size, access=mmap.ACCESS_WRITE)
+        except Exception:
+            os.close(self._fd)
+            raise
+        self._size: int = size
 
     def _write_blocking(self, offset: int, data: int, size: int) -> None:
-        with open(self.filename, "r+b") as file:
-            file.seek(offset)
-            file.write(data.to_bytes(size, byteorder="little"))
+        # Write directly into the mmap slice
+        start = offset
+        end = offset + size
+        if not (0 <= start < self._size) or not (0 < end <= self._size):
+            raise ValueError("write out of range")
+        self._mmap[start:end] = data.to_bytes(size, byteorder="little")
 
     def _read_blocking(self, offset: int, size: int) -> int:
-        with open(self.filename, "rb") as file:
-            file.seek(offset)
-            data = file.read(size)
-            return int.from_bytes(data, byteorder="little")
+        start = offset
+        end = offset + size
+        if not (0 <= start < self._size) or not (0 < end <= self._size):
+            raise ValueError("read out of range")
+        # Use memoryview to avoid creating an intermediate bytes object
+        mv = memoryview(self._mmap)
+        return int.from_bytes(mv[start:end], byteorder="little")
 
     def write(self, offset: int, data: int, size: int) -> None:
         self._write_blocking(offset, data, size)
 
     def read(self, offset: int, size: int) -> int:
         return self._read_blocking(offset, size)
+
+    def read_bytes(self, offset: int, size: int) -> bytes:
+        start = offset
+        end = offset + size
+        if not (0 <= start < self._size) or not (0 < end <= self._size):
+            raise ValueError("read_bytes out of range")
+        # Return a bytes copy to avoid exposing mmap buffer lifetime issues
+        return bytes(self._mmap[start:end])
+
+    def close(self) -> None:
+        try:
+            if hasattr(self, "_mmap") and self._mmap is not None:
+                self._mmap.flush()
+                self._mmap.close()
+        finally:
+            if hasattr(self, "_fd") and self._fd is not None:
+                os.close(self._fd)
+                self._fd = None  # type: ignore[assignment]
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass

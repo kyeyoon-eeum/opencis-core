@@ -445,27 +445,34 @@ class CacheController(RunnableComponent):
         logger.debug(self._create_message("UNCACHED_WRITE rsp OK"))
 
     # New pipelined APIs for UNCACHED traffic (multiple outstanding requests)
-    def pipelined_uncached_reads(self, base_addr: int, total_size: int, line_size: int = 64) -> list[int]:
-        assert line_size == self._cache_blk_size
+    def pipelined_uncached_reads(self, base_addr: int, total_size: int, line_size: int = 64) -> bytearray:
+        # For uncached operations, allow larger line_size for performance
+        assert line_size >= self._cache_blk_size and line_size % self._cache_blk_size == 0
         assert total_size % line_size == 0
         num_lines = total_size // line_size
-        results: list[int] = []
+        results = bytearray(total_size)
         req_q = self._cache_to_coh_agent_fifo.request
         rsp_q = self._cache_to_coh_agent_fifo.response
+
         # Issue all requests first
         addr = base_addr
         for _ in range(num_lines):
             req_q.put(CacheRequest(CACHE_REQUEST_TYPE.UNCACHED_READ, addr, line_size))
             addr += line_size
+
         # Collect all responses (expect CacheResponse OK)
+        offset = 0
         for _ in range(num_lines):
             resp = rsp_q.get()
             assert resp.status == CACHE_RESPONSE_STATUS.OK
-            results.append(resp.data)
+            line_bytes = resp.data.to_bytes(line_size, 'little')
+            results[offset:offset + line_size] = line_bytes
+            offset += line_size
         return results
 
     def pipelined_uncached_writes(self, base_addr: int, total_size: int, value: int, line_size: int = 64) -> None:
-        assert line_size == self._cache_blk_size
+        # For uncached operations, allow larger line_size for performance
+        assert line_size >= self._cache_blk_size and line_size % self._cache_blk_size == 0
         assert total_size % line_size == 0
         num_lines = total_size // line_size
         req_q = self._cache_to_coh_agent_fifo.request

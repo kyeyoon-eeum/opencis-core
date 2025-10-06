@@ -71,23 +71,18 @@ class CharDriverAccessor:
     def __init__(self, filename: str, size: int):
         self.filename = filename
         self.size = size
+        # Persistent file descriptors for read and write paths
+        self._fd_rd = os.open(self.filename, os.O_RDONLY)
+        self._fd_wr = os.open(self.filename, os.O_WRONLY)
 
     def _write_blocking(self, offset: int, data: int, size: int) -> None:
         data_bytes = data.to_bytes(size, "little")
-        fd = os.open(self.filename, os.O_WRONLY, 0o644)
-        try:
-            os.lseek(fd, offset, os.SEEK_SET)
-            os.write(fd, data_bytes)
-        finally:
-            os.close(fd)
+        os.lseek(self._fd_wr, offset, os.SEEK_SET)
+        os.write(self._fd_wr, data_bytes)
 
     def _read_blocking(self, offset: int, size: int) -> int:
-        fd = os.open(self.filename, os.O_RDONLY)
-        try:
-            os.lseek(fd, offset, os.SEEK_SET)
-            data = os.read(fd, size)
-        finally:
-            os.close(fd)
+        os.lseek(self._fd_rd, offset, os.SEEK_SET)
+        data = os.read(self._fd_rd, size)
         return int.from_bytes(data, "little")
 
     def write(self, offset: int, data: int, size: int):
@@ -95,6 +90,16 @@ class CharDriverAccessor:
 
     def read(self, offset: int, size: int) -> int:
         return self._read_blocking(offset, size)
+
+    def close(self) -> None:
+        try:
+            if getattr(self, "_fd_rd", None) is not None:
+                os.close(self._fd_rd)
+                self._fd_rd = None
+        finally:
+            if getattr(self, "_fd_wr", None) is not None:
+                os.close(self._fd_wr)
+                self._fd_wr = None
 
 
 class MemoryDeviceIdentity(UnalignedBitStructure):

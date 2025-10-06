@@ -214,10 +214,10 @@ class CxlMemDcoh(PacketProcessor):
             self._memory_device_component.write_mem_dpa(dpa, data)
 
         if data_read is True:
-            ndr_packet, drs_packet = self._create_mem_rsp_packet(
+            # Send only DRS for MEM_RD to match UNCACHED_READ protocol
+            _, drs_packet = self._create_mem_rsp_packet(
                 rsp_code, data, meta_value=CXL_MEM_META_VALUE.ANY
             )
-            self._upstream_fifo.target_to_host.put(ndr_packet)
             self._upstream_fifo.target_to_host.put(drs_packet)
         else:
             ndr_packet, _ = self._create_mem_rsp_packet(rsp_code, data)

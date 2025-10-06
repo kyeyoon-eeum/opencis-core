@@ -265,6 +265,7 @@ class CxlMemMemDataPacket(
         meta_value: CXL_MEM_META_VALUE = CXL_MEM_META_VALUE.ANY,
         ld_id: int = 0,
     ) -> "CxlMemMemDataPacket":
+        _data_int = data
         data = data.to_bytes(64, byteorder="little")
         packet = super().create(
             SYSTEM_PAYLOAD_TYPE.CXL_MEM,  # system_header__payload_type,
@@ -276,6 +277,10 @@ class CxlMemMemDataPacket(
             ld_id,  # s2mdrs_header__ld_id,
             data,  # data
         )
+        try:
+            setattr(packet, "_data_int", _data_int)
+        except Exception:
+            pass
         return packet
 
 

@@ -26,6 +26,13 @@ from opencis.util.number import (
 
 class PacketDataMixin:
     def get_data_as_int(self) -> int:
+        # Fast-path: cached integer on certain packet classes (e.g., DRS)
+        try:
+            v = getattr(self, "_data_int")
+            if isinstance(v, int):
+                return v
+        except Exception:
+            pass
         data = self.get_data()
         # Handle both bytes and memoryview objects
         if hasattr(data, 'tobytes'):

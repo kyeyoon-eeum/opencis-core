@@ -313,37 +313,18 @@ def sample_app(keepalive: bool, **kwargs):
 
     cpu = kwargs["cpu"]
     logger.info("[USER-APP] Starting...")
-    # Helper to run potentially blocking ops with a short timeout
-    import threading
 
-    # def try_call(fn, timeout_s: float = 0.02):
-    #     result_holder = {"done": False, "val": None}
-
-    #     def _runner():
-    #         try:
-    #             result_holder["val"] = fn()
-    #         except Exception:
-    #             pass
-    #         finally:
-    #             result_holder["done"] = True
-
-    #     t = threading.Thread(target=_runner, daemon=True)
-    #     t.start()
-    #     t.join(timeout=timeout_s)
-    #     return result_holder["done"], result_holder["val"]
-
-    # Best-effort warmup without blocking
-    cpu.store(0x100000000000, 0x40, 0xDEADBEEF)
-    val = cpu.load(0x100000000000, 0x40)
+    cpu.store_bulk_uncached(0x100000000000, 0x40, 0xDEADBEEF)
+    val = cpu.load_bulk_uncached(0x100000000000, 0x40)
     if val is not None:
-        logger.info(f"0x{val:X}")
-    val = cpu.load(0x100000000040, 0x40)
+        logger.info(f"0x{val}, supposed to include 0xDEADBEEF")
+    val = cpu.load_bulk_uncached(0x100000000040, 0x40)
     if val is not None:
-        logger.info(f"0x{val:X}")
+        logger.info(f"0x{val}, supposed to be all 0x0")
 
     import cProfile, pstats, io
 
-    BYTE_COUNT = 0x1000
+    BYTE_COUNT = 0x10000
     logger.info("PERF_START")
 
     # Profiled Write loop (pipelined bulk)
@@ -353,7 +334,7 @@ def sample_app(keepalive: bool, **kwargs):
     cpu.store_bulk_uncached(0x100000000000, BYTE_COUNT, 0xDEADBEEF, 0x40)
     end = time.time()
     pr_w.disable()
-    wr_time = max(end - start, 1e-6)
+    wr_time = end - start
     wr_throughput = (BYTE_COUNT / (1024 * 1024)) / wr_time
     logger.info(f"Write RESULTS: {wr_throughput} MB/s")
     s = io.StringIO()
@@ -366,9 +347,8 @@ def sample_app(keepalive: bool, **kwargs):
     logger.info("   Ordered by: cumulative time")
     logger.info("")
     logger.info("   ncalls  tottime  cumtime  percall filename:lineno(function)")
-    for i, (func, (cc, nc, tt, ct, callers)) in enumerate(stats_w.stats.items()):
-        if i >= 20:  # Limit to 20 entries
-            break
+    for i, func in enumerate(stats_w.fcn_list[:20]):  # Use the sorted function list
+        cc, nc, tt, ct, callers = stats_w.stats[func]
         file, line, func_name = func
         percall_ct = ct / nc if nc else 0
         filename_short = file.split('/')[-1] if '/' in file else file
@@ -380,10 +360,11 @@ def sample_app(keepalive: bool, **kwargs):
     pr_r = cProfile.Profile()
     pr_r.enable()
     start = time.time()
-    _ = cpu.load_bulk_uncached(0x100000000000, BYTE_COUNT, 0x40)
+    # Use no-return API to avoid list creation overhead
+    cpu.load_bulk_uncached(0x100000000000, BYTE_COUNT, 0x40)
     end = time.time()
     pr_r.disable()
-    rd_time = max(end - start, 1e-6)
+    rd_time = end - start
     rd_throughput = (BYTE_COUNT / (1024 * 1024)) / rd_time
     logger.info(f"Read RESULTS: {rd_throughput} MB/s")
     s = io.StringIO()
@@ -396,9 +377,8 @@ def sample_app(keepalive: bool, **kwargs):
     logger.info("   Ordered by: cumulative time")
     logger.info("")
     logger.info("   ncalls  tottime  cumtime  percall filename:lineno(function)")
-    for i, (func, (cc, nc, tt, ct, callers)) in enumerate(stats_r.stats.items()):
-        if i >= 20:  # Limit to 20 entries
-            break
+    for i, func in enumerate(stats_r.fcn_list[:20]):  # Use the sorted function list
+        cc, nc, tt, ct, callers = stats_r.stats[func]
         file, line, func_name = func
         percall_ct = ct / nc if nc else 0
         filename_short = file.split('/')[-1] if '/' in file else file

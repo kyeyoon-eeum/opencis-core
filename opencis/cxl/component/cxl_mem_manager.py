@@ -64,13 +64,11 @@ class CxlMemManager(PacketProcessor):
         ld_id = mem_rd_packet.m2sreq_header.ld_id
         logger.debug(self._create_message(f"CXL.mem Read: HPA addr:0x{addr:08x} LD-ID:{ld_id}"))
 
-        # Send NDR (Cmp-Status) followed by DRS (MemData) so host can proceed
-        ndr_packet = CxlMemCmpPacket.create(ld_id=ld_id)
+        # Optimization: For terminal memory device (no downstream), send only DRS (data)
+        # without a preceding NDR to reduce response traffic. Host paths for UNCACHED reads
+        # and simple reads will accept DRS and proceed.
         data_packet = CxlMemMemDataPacket.create(data, ld_id=ld_id)
-        logger.debug(self._create_message("DEVICE sending NDR+DRS"))
-        t2h_put = self._upstream_fifo.target_to_host.put
-        t2h_put(ndr_packet)
-        t2h_put(data_packet)
+        self._upstream_fifo.target_to_host.put(data_packet)
 
     def _process_cxl_mem_wr_packet_sync(self, mem_wr_packet: CxlMemMemWrPacket):
         if self._downstream_fifo is not None:
@@ -139,7 +137,17 @@ class CxlMemManager(PacketProcessor):
             packet = ds_get()
             if packet is None:
                 break
+            # Batch drain: forward the first packet, then try to opportunistically
+            # pull and forward a few more without blocking to reduce wakeups.
             us_put(packet)
+            try:
+                for _ in range(256):  # small batch size; tuneable
+                    nxt = self._downstream_fifo.target_to_host.get_nowait()
+                    if nxt is None:
+                        break
+                    us_put(nxt)
+            except Exception:
+                pass
 
     def _dispatch_mem_packet_sync(self, packet: BasePacket):
         base_packet = cast(BasePacket, packet)

@@ -78,10 +78,12 @@ class CPU(RunnableComponent):
         return result
 
     # New pipelined APIs that leverage MemoryHub bulk ops
-    def load_bulk_uncached(self, base_addr: int, total_size: int, line_size: int = 64) -> bytes:
-        words = self._cxl_memory_hub.load_uncached_bulk(base_addr, total_size, line_size)
-        # Convert list of 64B ints to bytes concatenated in little-endian
-        return b"".join(w.to_bytes(line_size, "little") for w in words)
+    def load_bulk_uncached(self, base_addr: int, total_size: int, line_size: int = 64) -> bytearray:
+        return self._cxl_memory_hub.load_uncached_bulk(base_addr, total_size, line_size)
+
+    def load_bulk_uncached_words(self, base_addr: int, total_size: int, line_size: int = 64) -> bytearray:
+        """Load uncached data in bulk and return as bytearray. """
+        return self._cxl_memory_hub.load_uncached_bulk(base_addr, total_size, line_size)
 
     def store_bulk_uncached(self, base_addr: int, total_size: int, value: int, line_size: int = 64) -> None:
         self._cxl_memory_hub.store_uncached_bulk(base_addr, total_size, value, line_size)

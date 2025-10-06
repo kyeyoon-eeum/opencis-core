@@ -196,11 +196,8 @@ class CxlMemoryHub(RunnableComponent):
                     return resp.data
             case MEM_ADDR_TYPE.CXL_UNCACHED:
                 # Inline the request/response exchange to reduce overhead
-                req_q = self._processor_to_cache_fifo.request
-                rsp_q = self._processor_to_cache_fifo.response
-                req_q.put(MemoryRequest(MEMORY_REQUEST_TYPE.UNCACHED_READ, addr, size))
-                resp = rsp_q.get()
-                assert resp.status == MEMORY_RESPONSE_STATUS.OK
+                packet = MemoryRequest(MEMORY_REQUEST_TYPE.UNCACHED_READ, addr, size)
+                resp = self._send_mem_request(packet)
                 return resp.data
             case MEM_ADDR_TYPE.MMIO:
                 return self._root_complex.read_mmio(addr, size)
@@ -242,7 +239,7 @@ class CxlMemoryHub(RunnableComponent):
         return True
 
     # New pipelined/bulk APIs (UNCACHED; leverages HA internal pipelining)
-    def load_uncached_bulk(self, base_addr: int, total_size: int, line_size: int = 64) -> List[int]:
+    def load_uncached_bulk(self, base_addr: int, total_size: int, line_size: int = 64) -> bytearray:
         return self._cache_controller.pipelined_uncached_reads(base_addr, total_size, line_size)
 
     def store_uncached_bulk(self, base_addr: int, total_size: int, value: int, line_size: int = 64) -> None:

@@ -9,6 +9,7 @@ import threading
 from dataclasses import dataclass
 from enum import StrEnum, IntEnum
 from typing import cast, Optional, Dict, Union, List, Any
+import logging
 
 from opencis.util.logger import logger
 from opencis.cxl.cci.common import CCI_FM_API_COMMAND_OPCODE
@@ -187,14 +188,6 @@ class CxlPacketProcessor(RunnableComponent):
         else:
             raise Exception(f"Unsupported component type {component_type.name}")
 
-    @staticmethod
-    def _is_disconnection_notification(packet) -> bool:
-        base_packet = cast(BasePacket, packet)
-        if base_packet.system_header.payload_type != SYSTEM_PAYLOAD_TYPE.SIDEBAND:
-            return False
-        sideband = cast(BaseSidebandPacket, packet)
-        return sideband.sideband_header.type == SIDEBAND_TYPES.CONNECTION_DISCONNECTED
-
     def _push_tlp_table_entry(self, cxl_io_packet: CxlIoBasePacket):
         tid = cxl_io_packet.get_transaction_id()
         # Since USP and R (Root Port) are agnostic to the existence (or even the concept of)
@@ -255,7 +248,41 @@ class CxlPacketProcessor(RunnableComponent):
                     # Ignore other sideband frames
                     logger.debug("[%s] Received sideband; ignoring", self.get_message_label())
                     continue
-                if packet.is_cxl_io():
+                if packet.is_cxl_mem():
+                    if (
+                        self._component_type != CXL_COMPONENT_TYPE.LD
+                        and self._incoming.cxl_mem is None
+                    ):
+                        logger.error(
+                            "[%s] Got CXL.mem packet on no CXL.mem FIFO", self.get_message_label()
+                        )
+                        continue
+                    logger.debug(
+                        "[%s] Received %s CXL.mem packet",
+                        self.get_message_label(),
+                        self._incoming_dir,
+                    )
+                    cxl_mem_packet = cast(CxlMemBasePacket, packet)
+                    if self._component_type == CXL_COMPONENT_TYPE.LD:
+                        # Add LD routing code
+                        if cxl_mem_packet.is_m2sreq():
+                            ld_id = cxl_mem_packet.m2sreq_header.ld_id
+                        elif cxl_mem_packet.is_m2srwd():
+                            ld_id = cxl_mem_packet.m2srwd_header.ld_id
+                        elif cxl_mem_packet.is_s2mndr():
+                            ld_id = cxl_mem_packet.s2mndr_header.ld_id
+                        elif cxl_mem_packet.is_s2mdrs():
+                            ld_id = cxl_mem_packet.s2mdrs_header.ld_id
+                        else:
+                            logger.warning(
+                                "[%s] Unexpected CXL.mem packet", self.get_message_label()
+                            )
+
+                        self._incoming[ld_id].cxl_mem.put(cxl_mem_packet)
+                    else:
+                        self._incoming.cxl_mem.put(cxl_mem_packet)
+
+                elif packet.is_cxl_io():
                     cxl_io_packet = cast(CxlIoBasePacket, packet)
                     if cxl_io_packet.is_cpl() or cxl_io_packet.is_cpld():
                         logger.debug(
@@ -312,40 +339,6 @@ class CxlPacketProcessor(RunnableComponent):
                             "[%s] %s", self.get_message_label(), packet.get_pretty_string()
                         )
                         continue
-                elif packet.is_cxl_mem():
-                    if (
-                        self._component_type != CXL_COMPONENT_TYPE.LD
-                        and self._incoming.cxl_mem is None
-                    ):
-                        logger.error(
-                            "[%s] Got CXL.mem packet on no CXL.mem FIFO", self.get_message_label()
-                        )
-                        continue
-                    logger.debug(
-                        "[%s] Received %s CXL.mem packet",
-                        self.get_message_label(),
-                        self._incoming_dir,
-                    )
-                    cxl_mem_packet = cast(CxlMemBasePacket, packet)
-                    if self._component_type == CXL_COMPONENT_TYPE.LD:
-                        # Add LD routing code
-                        if cxl_mem_packet.is_m2sreq():
-                            ld_id = cxl_mem_packet.m2sreq_header.ld_id
-                        elif cxl_mem_packet.is_m2srwd():
-                            ld_id = cxl_mem_packet.m2srwd_header.ld_id
-                        elif cxl_mem_packet.is_s2mndr():
-                            ld_id = cxl_mem_packet.s2mndr_header.ld_id
-                        elif cxl_mem_packet.is_s2mdrs():
-                            ld_id = cxl_mem_packet.s2mdrs_header.ld_id
-                        else:
-                            logger.warning(
-                                "[%s] Unexpected CXL.mem packet", self.get_message_label()
-                            )
-
-                        self._incoming[ld_id].cxl_mem.put(cxl_mem_packet)
-                    else:
-                        self._incoming.cxl_mem.put(cxl_mem_packet)
-
                 elif packet.is_cxl_cache():
                     if self._incoming.cxl_cache is None:
                         logger.error(
@@ -476,8 +469,6 @@ class CxlPacketProcessor(RunnableComponent):
                 packet = q.get()
             except Exception:
                 break
-            if self._is_disconnection_notification(packet):
-                break
             cxl_io_packet = cast(CxlIoBasePacket, packet)
             if cxl_io_packet.is_cpl() or cxl_io_packet.is_cpld():
                 with self._tlp_lock:
@@ -502,8 +493,7 @@ class CxlPacketProcessor(RunnableComponent):
                 packet = q.get()
             except Exception:
                 break
-            if self._is_disconnection_notification(packet):
-                break
+
             cxl_io_packet = cast(CxlIoBasePacket, packet)
             if cxl_io_packet.is_cpl() or cxl_io_packet.is_cpld():
                 with self._tlp_lock:
@@ -531,8 +521,6 @@ class CxlPacketProcessor(RunnableComponent):
                 packet = q.get()
             except Exception:
                 break
-            if self._is_disconnection_notification(packet):
-                break
             try:
                 view = packet.get_view()  # type: ignore[attr-defined]
             except Exception:
@@ -551,8 +539,6 @@ class CxlPacketProcessor(RunnableComponent):
             try:
                 packet = q.get()
             except Exception:
-                break
-            if self._is_disconnection_notification(packet):
                 break
             try:
                 view = packet.get_view()  # type: ignore[attr-defined]
@@ -620,8 +606,6 @@ class CxlPacketProcessor(RunnableComponent):
                 else:
                     break
             except Exception:
-                break
-            if self._is_disconnection_notification(packet):
                 break
             try:
                 view = packet.get_view()  # type: ignore[attr-defined]
