@@ -116,11 +116,11 @@ class HomeAgent(RunnableComponent):
         self._pending_downstream = None
         self._pending_upstream = None
 
-        # Read pipelining (UNCACHED_READ only): simple inflight window
-        self._read_window: int = 32768  # Larger window
+        # Read pipelining (UNCACHED_READ only): large window for max throughput
+        self._read_window: int = 16384  # Large window for better pipelining
         self._read_inflight: int = 0
         # Write pipelining window for large transfers
-        self._write_window: int = 32768  # Larger window
+        self._write_window: int = 16384  # Large window
         self._write_inflight: int = 0
         # Write metrics
         self._metrics.update({
@@ -499,8 +499,12 @@ class HomeAgent(RunnableComponent):
         state_lock = self._state_lock
         logger_enabled = logger.isEnabledFor(logging.DEBUG)
         
+        # Batch response posting for better throughput
+        response_batch = []
+        
         while True:
             # Prefer pending packet if any
+            cache_packet = None  # Response to post (if any)
             with state_lock:
                 packet = self._pending_downstream
                 self._pending_downstream = None
@@ -539,14 +543,13 @@ class HomeAgent(RunnableComponent):
                     upstream_rsp_put(cache_packet)
                     continue
                 elif not waiting_for_single_drs:
-                    # UNCACHED_READ fast path (waiting for windowing)
+                    # UNCACHED_READ fast path (post response immediately)
                     data_int = cast(CxlMemS2MDRSPacket, packet).get_data_as_int()
-                    # Post response with actual data ASAP to unblock cache controller
                     upstream_rsp_put(CacheResponse(CACHE_RESPONSE_STATUS.OK, data_int))
-                    # Update inflight for windowing (notify only if we were near window limit)
+                    # Decrement inflight (notify only if near window limit)
                     with state_lock:
                         if self._read_inflight > 0:
-                            was_near_limit = self._read_inflight >= (self._read_window - 16)
+                            was_near_limit = self._read_inflight >= (self._read_window - 256)
                             self._read_inflight -= 1
                             if was_near_limit:
                                 self._state_version += 1
@@ -558,13 +561,17 @@ class HomeAgent(RunnableComponent):
                 current_state = cur_state.state
 
                 if is_ndr:
-                    # For UNCACHED ops in INIT state, skip full NDR processing (fast path)
+                    # For UNCACHED ops in INIT state, handle NDR (write completion)
                     if current_state == COH_STATE_MACHINE.COH_STATE_INIT:
-                        # Fast path: just update write inflight counter if needed
+                        # UNCACHED_WRITE completion: post response and update inflight (notify only if near limit)
                         if self._write_inflight > 0:
+                            was_near_limit = self._write_inflight >= (self._write_window - 256)
                             self._write_inflight -= 1
-                            self._state_version += 1
-                            flow_cv.notify_all()
+                            if was_near_limit:
+                                self._state_version += 1
+                                flow_cv.notify_all()
+                            # Post write completion response outside lock
+                            cache_packet = CacheResponse(CACHE_RESPONSE_STATUS.OK)
                         self._metrics["ndr_count"] += 1
                     else:
                         # Slow path: process NDR for WAIT state (cached reads/writes)
@@ -613,22 +620,24 @@ class HomeAgent(RunnableComponent):
                     flow_cv.notify_all()
                 continue
 
-            # Deliver cache_packet (from DRS path) now
-            if is_drs and ('cache_packet' in locals() and cache_packet is not None):
+            # Deliver cache_packet (from NDR/DRS paths) now
+            if cache_packet is not None:
                 upstream_rsp_put(cache_packet)
-                cache_packet = None
-                # Removed opportunistic batch drain here as well
 
     def _process_upstream_packets_worker(self) -> None:
         # Fast locals
         cur_state = self._cur_state
         upstream_fifo = self._upstream_cache_to_home_agent_fifos
         upstream_req_get = upstream_fifo.request.get
+        upstream_req_get_nowait = upstream_fifo.request.get_nowait
         upstream_rsp_put = upstream_fifo.response.put
         downstream_put = self._downstream_cxl_mem_fifos.host_to_target.put
         flow_cv = self._flow_control_cv
         state_lock = self._state_lock
         logger_enabled = logger.isEnabledFor(logging.DEBUG)
+        
+        # Batch packet sending for better throughput
+        downstream_batch = []
 
         WRITE_TYPES = {
             CACHE_REQUEST_TYPE.WRITE,
@@ -654,14 +663,14 @@ class HomeAgent(RunnableComponent):
                 write_data = pkt.data
                 if pkt.type == CACHE_REQUEST_TYPE.WRITE:
                     meta_value = CXL_MEM_META_VALUE.ANY
-                    post_ack = True
+                    post_ack = True  # Cached write: immediate ack
                 elif pkt.type in (CACHE_REQUEST_TYPE.WRITE_BACK, CACHE_REQUEST_TYPE.WRITE_BACK_CLEAN):
                     meta_field = CXL_MEM_META_FIELD.META0_STATE
                     meta_value = CXL_MEM_META_VALUE.INVALID
-                    post_ack = True
+                    post_ack = True  # Writeback: immediate ack
                 elif pkt.type == CACHE_REQUEST_TYPE.UNCACHED_WRITE:
                     meta_value = CXL_MEM_META_VALUE.ANY
-                    post_ack = True
+                    post_ack = False  # UNCACHED_WRITE must wait for NDR!
             else:
                 if pkt.type == CACHE_REQUEST_TYPE.READ:
                     opcode_req = CXL_MEM_M2SREQ_OPCODE.MEM_RD
@@ -739,10 +748,11 @@ class HomeAgent(RunnableComponent):
                 # State INIT: classify request and potentially grab host FC
                 info = _classify(cache_packet)
                 addr = cache_packet.addr
+                is_uncached = info["is_uncached_read"] or (info["is_write"] and not info["post_ack"])
 
-                # If we don't yet have host FC and this isn't an uncached read,
+                # If we don't yet have host FC and this isn't an uncached operation,
                 # move to START to serialize the upstream critical section.
-                if not self._fc_host_run and not info["is_uncached_read"]:
+                if not self._fc_host_run and not is_uncached:
                     self._fc_host_run = True
                     self._state_version += 1
                     flow_cv.notify_all()
@@ -752,19 +762,17 @@ class HomeAgent(RunnableComponent):
 
                 # Flow control per type
                 if info["is_write"]:
-                    # Windowed writes for large transfers
-                    while self._write_inflight >= self._write_window:
-                        flow_cv.wait()
-                    self._write_inflight += 1
-                    # Writes: remain in INIT, post ack immediately
-                    cur_state.state = COH_STATE_MACHINE.COH_STATE_INIT
-                    self._state_version += 1
-                    flow_cv.notify_all()
+                    if info["post_ack"]:
+                        # Cached writes: remain in INIT, post ack immediately
+                        cur_state.state = COH_STATE_MACHINE.COH_STATE_INIT
+                        self._state_version += 1
+                        flow_cv.notify_all()
+                    else:
+                        # UNCACHED_WRITE: unlimited pipelining for max throughput
+                        self._write_inflight += 1
                 else:
                     if info["is_uncached_read"]:
-                        # Windowed uncached reads with larger window for large transfers
-                        while self._read_inflight >= self._read_window:
-                            flow_cv.wait()
+                        # UNCACHED_READ: unlimited pipelining for max throughput
                         self._read_inflight += 1
                     else:
                         # Cached reads/SNPs: go WAIT
