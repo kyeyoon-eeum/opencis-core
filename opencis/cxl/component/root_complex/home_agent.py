@@ -541,14 +541,16 @@ class HomeAgent(RunnableComponent):
                 elif not waiting_for_single_drs:
                     # UNCACHED_READ fast path (waiting for windowing)
                     data_int = cast(CxlMemS2MDRSPacket, packet).get_data_as_int()
-                    # Update inflight for windowing
+                    # Post response with actual data ASAP to unblock cache controller
+                    upstream_rsp_put(CacheResponse(CACHE_RESPONSE_STATUS.OK, data_int))
+                    # Update inflight for windowing (notify only if we were near window limit)
                     with state_lock:
                         if self._read_inflight > 0:
+                            was_near_limit = self._read_inflight >= (self._read_window - 16)
                             self._read_inflight -= 1
-                            self._state_version += 1
-                            flow_cv.notify_all()
-                    # upstream_rsp_put(CacheResponse(CACHE_RESPONSE_STATUS.OK, data_int))  # Response already posted by upstream worker for UNCACHED_READ
-                    # Removed opportunistic batch drain to avoid starvation/misordering
+                            if was_near_limit:
+                                self._state_version += 1
+                                flow_cv.notify_all()
                     continue
 
             bisnp_to_process = None
@@ -556,13 +558,17 @@ class HomeAgent(RunnableComponent):
                 current_state = cur_state.state
 
                 if is_ndr:
-                    # Always process NDR to handle write completions and read WAIT paths
-                    self._process_cxl_s2m_rsp_packet(cast(CxlMemS2MNDRPacket, packet))
-                    # For non-WAIT NDR (immediate ack writes), decrement write inflight
-                    if current_state != COH_STATE_MACHINE.COH_STATE_WAIT and self._write_inflight > 0:
-                        self._write_inflight -= 1
-                        self._state_version += 1
-                        flow_cv.notify_all()
+                    # For UNCACHED ops in INIT state, skip full NDR processing (fast path)
+                    if current_state == COH_STATE_MACHINE.COH_STATE_INIT:
+                        # Fast path: just update write inflight counter if needed
+                        if self._write_inflight > 0:
+                            self._write_inflight -= 1
+                            self._state_version += 1
+                            flow_cv.notify_all()
+                        self._metrics["ndr_count"] += 1
+                    else:
+                        # Slow path: process NDR for WAIT state (cached reads/writes)
+                        self._process_cxl_s2m_rsp_packet(cast(CxlMemS2MNDRPacket, packet))
                 elif is_drs and (current_state == COH_STATE_MACHINE.COH_STATE_INIT or current_state == COH_STATE_MACHINE.COH_STATE_WAIT):
                     if current_state == COH_STATE_MACHINE.COH_STATE_WAIT and self._cur_state.waiting_for_drs and logger_enabled:
                         logger.debug(self._create_message("HomeAgent: received S2M DRS"))
@@ -663,7 +669,7 @@ class HomeAgent(RunnableComponent):
                 elif pkt.type == CACHE_REQUEST_TYPE.UNCACHED_READ:
                     opcode_req = CXL_MEM_M2SREQ_OPCODE.MEM_RD
                     meta_value = CXL_MEM_META_VALUE.ANY
-                    post_ack = True  # Post immediate response like UNCACHED_WRITE
+                    # Do NOT post_ack for UNCACHED_READ - wait for DRS with actual data
                 elif pkt.type == CACHE_REQUEST_TYPE.SNP_DATA:
                     opcode_req = CXL_MEM_M2SREQ_OPCODE.MEM_RD
                     meta_field = CXL_MEM_META_FIELD.META0_STATE

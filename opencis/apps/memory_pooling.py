@@ -317,10 +317,10 @@ def sample_app(keepalive: bool, **kwargs):
     cpu.store_bulk_uncached(0x100000000000, 0x40, 0xDEADBEEF)
     val = cpu.load_bulk_uncached(0x100000000000, 0x40)
     if val is not None:
-        logger.info(f"0x{val}, supposed to include 0xDEADBEEF")
+        logger.info(f"READ 0x100000000000: val is 0x{int.from_bytes(val, 'little'):X}, supposed to be 0xDEADBEEF")
     val = cpu.load_bulk_uncached(0x100000000040, 0x40)
     if val is not None:
-        logger.info(f"0x{val}, supposed to be all 0x0")
+        logger.info(f"READ 0x100000000040: val is 0x{int.from_bytes(val, 'little'):X}, supposed to be 0x0")
 
     import cProfile, pstats, io
 
