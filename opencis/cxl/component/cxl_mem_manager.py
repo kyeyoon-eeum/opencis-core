@@ -51,7 +51,6 @@ class CxlMemManager(PacketProcessor):
 
     def _process_cxl_mem_rd_packet_sync(self, mem_rd_packet: CxlMemMemRdPacket):
         if self._downstream_fifo is not None:
-            logger.debug(self._create_message("Forwarding CXL.mem MEM_RD packet"))
             self._downstream_fifo.host_to_target.put(mem_rd_packet)
             return
 
@@ -59,10 +58,8 @@ class CxlMemManager(PacketProcessor):
             raise Exception("CxlMemoryDeviceComponent isn't set yet")
 
         addr = mem_rd_packet.get_address()
-        logger.debug(self._create_message(f"DEVICE MEM_RD addr=0x{addr:x}"))
         data = self._memory_device_component.read_mem_sync(addr)
         ld_id = mem_rd_packet.m2sreq_header.ld_id
-        logger.debug(self._create_message(f"CXL.mem Read: HPA addr:0x{addr:08x} LD-ID:{ld_id}"))
 
         # Optimization: For terminal memory device (no downstream), send only DRS (data)
         # without a preceding NDR to reduce response traffic. Host paths for UNCACHED reads
@@ -72,7 +69,6 @@ class CxlMemManager(PacketProcessor):
 
     def _process_cxl_mem_wr_packet_sync(self, mem_wr_packet: CxlMemMemWrPacket):
         if self._downstream_fifo is not None:
-            logger.debug(self._create_message("Forwarding CXL.mem MEM_WR packet"))
             self._downstream_fifo.host_to_target.put(mem_wr_packet)
             return
 
@@ -82,11 +78,6 @@ class CxlMemManager(PacketProcessor):
         addr = mem_wr_packet.get_address()
         data = mem_wr_packet.get_data_as_int()
         ld_id = mem_wr_packet.m2srwd_header.ld_id
-        logger.debug(
-            self._create_message(
-                f"CXL.mem Write: HPA addr:0x{addr:08x} LD-ID:{ld_id} Data:0x{data:08x}"
-            )
-        )
         self._memory_device_component.write_mem_sync(addr, data)
 
         packet = CxlMemCmpPacket.create(ld_id=ld_id)

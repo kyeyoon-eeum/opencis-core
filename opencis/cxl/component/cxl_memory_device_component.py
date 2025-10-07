@@ -8,6 +8,7 @@ See LICENSE for details.
 from dataclasses import dataclass
 from enum import IntEnum
 import os
+import struct
 import time
 from typing import TypedDict, List, Optional
 
@@ -72,17 +73,37 @@ class CharDriverAccessor:
         self.filename = filename
         self.size = size
         # Use buffered file I/O for better performance (avoids syscall per operation)
-        self._file = open(self.filename, "r+b", buffering=1024*1024)  # 1MB buffer
+        self._file = open(self.filename, "r+b", buffering=2*1024*1024)  # 2MB buffer
+        # Pre-compiled struct for 64-byte blocks (8 x 8-byte values)
+        self._struct_64 = struct.Struct('<8Q')
+        # Cache for write value (avoid repeated to_bytes)
+        self._write_cache = {}
 
     def _write_blocking(self, offset: int, data: int, size: int) -> None:
-        data_bytes = data.to_bytes(size, "little")
+        if size == 64:
+            # Fast path: use struct for 64-byte writes
+            # Check cache first
+            if data not in self._write_cache:
+                # Convert to 8 qwords
+                words = tuple((data >> (i * 64)) & 0xFFFFFFFFFFFFFFFF for i in range(8))
+                self._write_cache[data] = self._struct_64.pack(*words)
+            data_bytes = self._write_cache[data]
+        else:
+            # Fallback for other sizes
+            data_bytes = data.to_bytes(size, "little")
         self._file.seek(offset)
         self._file.write(data_bytes)
 
     def _read_blocking(self, offset: int, size: int) -> int:
         self._file.seek(offset)
-        data = self._file.read(size)
-        return int.from_bytes(data, "little")
+        data_bytes = self._file.read(size)
+        if size == 64:
+            # Fast path: use struct for 64-byte reads
+            words = self._struct_64.unpack(data_bytes)
+            result = sum(word << (i * 64) for i, word in enumerate(words))
+            return result
+        else:
+            return int.from_bytes(data_bytes, "little")
 
     def write(self, offset: int, data: int, size: int):
         self._write_blocking(offset, data, size)

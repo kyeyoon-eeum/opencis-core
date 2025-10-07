@@ -499,8 +499,14 @@ class HomeAgent(RunnableComponent):
         state_lock = self._state_lock
         logger_enabled = logger.isEnabledFor(logging.DEBUG)
         
-        # Batch response posting for better throughput
-        response_batch = []
+        # Pre-allocate common response objects to avoid repeated allocation
+        ok_response = CacheResponse(CACHE_RESPONSE_STATUS.OK)
+        
+        # Cache common values
+        s2m_drs_class = CXL_MEM_MSG_CLASS.S2M_DRS
+        s2m_ndr_class = CXL_MEM_MSG_CLASS.S2M_NDR
+        state_init = COH_STATE_MACHINE.COH_STATE_INIT
+        state_wait = COH_STATE_MACHINE.COH_STATE_WAIT
         
         while True:
             # Prefer pending packet if any
@@ -520,8 +526,8 @@ class HomeAgent(RunnableComponent):
 
             # Cache packet type checks to avoid repeated method calls
             msg_class = cxl_packet.cxl_mem_header.msg_class
-            is_ndr = msg_class == CXL_MEM_MSG_CLASS.S2M_NDR
-            is_drs = msg_class == CXL_MEM_MSG_CLASS.S2M_DRS
+            is_ndr = msg_class == s2m_ndr_class
+            is_drs = msg_class == s2m_drs_class
             if logger_enabled:
                 if is_ndr:
                     logger.debug(self._create_message("[HA-DS] dequeued S2M NDR"))
@@ -533,7 +539,7 @@ class HomeAgent(RunnableComponent):
                 # Check if we're waiting on a single DRS
                 waiting_for_single_drs = False
                 with state_lock:
-                    waiting_for_single_drs = (cur_state.state == COH_STATE_MACHINE.COH_STATE_WAIT) and self._cur_state.waiting_for_drs
+                    waiting_for_single_drs = (cur_state.state == state_wait) and self._cur_state.waiting_for_drs
 
                 if waiting_for_single_drs:
                     # Bypass all other coherence logic - process DRS directly
@@ -543,17 +549,11 @@ class HomeAgent(RunnableComponent):
                     upstream_rsp_put(cache_packet)
                     continue
                 elif not waiting_for_single_drs:
-                    # UNCACHED_READ fast path (post response immediately)
-                    data_int = cast(CxlMemS2MDRSPacket, packet).get_data_as_int()
+                    # UNCACHED_READ fast path (post response immediately, zero overhead)
+                    drs_pkt = cast(CxlMemS2MDRSPacket, packet)
+                    data_int = drs_pkt.get_data_as_int()
+                    # Create response with data inline
                     upstream_rsp_put(CacheResponse(CACHE_RESPONSE_STATUS.OK, data_int))
-                    # Decrement inflight (notify only if near window limit)
-                    with state_lock:
-                        if self._read_inflight > 0:
-                            was_near_limit = self._read_inflight >= (self._read_window - 256)
-                            self._read_inflight -= 1
-                            if was_near_limit:
-                                self._state_version += 1
-                                flow_cv.notify_all()
                     continue
 
             bisnp_to_process = None
@@ -562,16 +562,9 @@ class HomeAgent(RunnableComponent):
 
                 if is_ndr:
                     # For UNCACHED ops in INIT state, handle NDR (write completion)
-                    if current_state == COH_STATE_MACHINE.COH_STATE_INIT:
-                        # UNCACHED_WRITE completion: post response and update inflight (notify only if near limit)
-                        if self._write_inflight > 0:
-                            was_near_limit = self._write_inflight >= (self._write_window - 256)
-                            self._write_inflight -= 1
-                            if was_near_limit:
-                                self._state_version += 1
-                                flow_cv.notify_all()
-                            # Post write completion response outside lock
-                            cache_packet = CacheResponse(CACHE_RESPONSE_STATUS.OK)
+                    if current_state == state_init:
+                        # UNCACHED_WRITE completion: use pre-allocated response
+                        cache_packet = ok_response
                         self._metrics["ndr_count"] += 1
                     else:
                         # Slow path: process NDR for WAIT state (cached reads/writes)
@@ -636,20 +629,32 @@ class HomeAgent(RunnableComponent):
         state_lock = self._state_lock
         logger_enabled = logger.isEnabledFor(logging.DEBUG)
         
-        # Batch packet sending for better throughput
-        downstream_batch = []
+        # Pre-cache common constants for fast comparison
+        req_type_uncached_read = CACHE_REQUEST_TYPE.UNCACHED_READ
+        req_type_uncached_write = CACHE_REQUEST_TYPE.UNCACHED_WRITE
+        req_type_write = CACHE_REQUEST_TYPE.WRITE
+        req_type_writeback = CACHE_REQUEST_TYPE.WRITE_BACK
+        req_type_writeback_clean = CACHE_REQUEST_TYPE.WRITE_BACK_CLEAN
+        req_type_read = CACHE_REQUEST_TYPE.READ
+        req_type_snp_data = CACHE_REQUEST_TYPE.SNP_DATA
+        req_type_snp_inv = CACHE_REQUEST_TYPE.SNP_INV
+        req_type_snp_cur = CACHE_REQUEST_TYPE.SNP_CUR
+        
+        # Pre-allocate common response for immediate acks
+        ok_response = CacheResponse(CACHE_RESPONSE_STATUS.OK)
 
         WRITE_TYPES = {
-            CACHE_REQUEST_TYPE.WRITE,
-            CACHE_REQUEST_TYPE.WRITE_BACK,
-            CACHE_REQUEST_TYPE.WRITE_BACK_CLEAN,
-            CACHE_REQUEST_TYPE.UNCACHED_WRITE,
+            req_type_write,
+            req_type_writeback,
+            req_type_writeback_clean,
+            req_type_uncached_write,
         }
 
         def _classify(pkt):
             """Return a dict describing how to handle the packet."""
-            is_write = pkt.type in WRITE_TYPES
-            is_uncached_read = pkt.type == CACHE_REQUEST_TYPE.UNCACHED_READ
+            pkt_type = pkt.type
+            is_write = pkt_type in WRITE_TYPES
+            is_uncached_read = pkt_type == req_type_uncached_read
             meta_field = CXL_MEM_META_FIELD.NO_OP
             meta_value = CXL_MEM_META_VALUE.INVALID
             snp_type = CXL_MEM_M2S_SNP_TYPE.NO_OP
@@ -661,35 +666,35 @@ class HomeAgent(RunnableComponent):
             if is_write:
                 opcode_rwd = CXL_MEM_M2SRWD_OPCODE.MEM_WR
                 write_data = pkt.data
-                if pkt.type == CACHE_REQUEST_TYPE.WRITE:
+                if pkt_type == req_type_write:
                     meta_value = CXL_MEM_META_VALUE.ANY
                     post_ack = True  # Cached write: immediate ack
-                elif pkt.type in (CACHE_REQUEST_TYPE.WRITE_BACK, CACHE_REQUEST_TYPE.WRITE_BACK_CLEAN):
+                elif pkt_type in (req_type_writeback, req_type_writeback_clean):
                     meta_field = CXL_MEM_META_FIELD.META0_STATE
                     meta_value = CXL_MEM_META_VALUE.INVALID
                     post_ack = True  # Writeback: immediate ack
-                elif pkt.type == CACHE_REQUEST_TYPE.UNCACHED_WRITE:
+                elif pkt_type == req_type_uncached_write:
                     meta_value = CXL_MEM_META_VALUE.ANY
                     post_ack = False  # UNCACHED_WRITE must wait for NDR!
             else:
-                if pkt.type == CACHE_REQUEST_TYPE.READ:
+                if pkt_type == req_type_read:
                     opcode_req = CXL_MEM_M2SREQ_OPCODE.MEM_RD
                     meta_value = CXL_MEM_META_VALUE.ANY
-                elif pkt.type == CACHE_REQUEST_TYPE.UNCACHED_READ:
+                elif pkt_type == req_type_uncached_read:
                     opcode_req = CXL_MEM_M2SREQ_OPCODE.MEM_RD
                     meta_value = CXL_MEM_META_VALUE.ANY
                     # Do NOT post_ack for UNCACHED_READ - wait for DRS with actual data
-                elif pkt.type == CACHE_REQUEST_TYPE.SNP_DATA:
+                elif pkt_type == req_type_snp_data:
                     opcode_req = CXL_MEM_M2SREQ_OPCODE.MEM_RD
                     meta_field = CXL_MEM_META_FIELD.META0_STATE
                     meta_value = CXL_MEM_META_VALUE.SHARED
                     snp_type = CXL_MEM_M2S_SNP_TYPE.SNP_DATA
-                elif pkt.type == CACHE_REQUEST_TYPE.SNP_INV:
+                elif pkt_type == req_type_snp_inv:
                     opcode_req = CXL_MEM_M2SREQ_OPCODE.MEM_INV
                     meta_field = CXL_MEM_META_FIELD.META0_STATE
                     meta_value = CXL_MEM_META_VALUE.ANY
                     snp_type = CXL_MEM_M2S_SNP_TYPE.SNP_INV
-                elif pkt.type == CACHE_REQUEST_TYPE.SNP_CUR:
+                elif pkt_type == req_type_snp_cur:
                     opcode_req = CXL_MEM_M2SREQ_OPCODE.MEM_RD
                     meta_field = CXL_MEM_META_FIELD.META0_STATE
                     snp_type = CXL_MEM_M2S_SNP_TYPE.SNP_CUR
@@ -760,25 +765,17 @@ class HomeAgent(RunnableComponent):
                     if logger_enabled:
                         logger.debug(self._create_message("[HA-US] state->START (upstream critical section)"))
 
-                # Flow control per type
+                # Flow control per type (uncached ops: no state changes for max throughput)
                 if info["is_write"]:
                     if info["post_ack"]:
-                        # Cached writes: remain in INIT, post ack immediately
+                        # Cached writes: post ack immediately
                         cur_state.state = COH_STATE_MACHINE.COH_STATE_INIT
-                        self._state_version += 1
-                        flow_cv.notify_all()
-                    else:
-                        # UNCACHED_WRITE: unlimited pipelining for max throughput
-                        self._write_inflight += 1
+                    # UNCACHED_WRITE: no state change
                 else:
-                    if info["is_uncached_read"]:
-                        # UNCACHED_READ: unlimited pipelining for max throughput
-                        self._read_inflight += 1
-                    else:
+                    if not info["is_uncached_read"]:
                         # Cached reads/SNPs: go WAIT
                         cur_state.state = COH_STATE_MACHINE.COH_STATE_WAIT
-                        self._state_version += 1
-                        flow_cv.notify_all()
+                    # UNCACHED_READ: no state change
 
             # Outside lock: build + send packet and acks
             cxl_packet = None
@@ -790,7 +787,7 @@ class HomeAgent(RunnableComponent):
                     info["snp_type"], addr, info["write_data"]  # type: ignore[arg-type]
                 )
                 if info["post_ack"]:
-                    upstream_rsp_put(CacheResponse(CACHE_RESPONSE_STATUS.OK))
+                    upstream_rsp_put(ok_response)
                     self._metrics["write_acks"] += 1
                     if logger_enabled:
                         logger.debug(self._create_message("[HA-US] WR ack posted to cache"))

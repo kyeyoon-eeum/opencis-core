@@ -451,22 +451,26 @@ class CacheController(RunnableComponent):
         assert total_size % line_size == 0
         num_lines = total_size // line_size
         results = bytearray(total_size)
-        req_q = self._cache_to_coh_agent_fifo.request
-        rsp_q = self._cache_to_coh_agent_fifo.response
-
-        # Issue all requests first
+        req_q_put = self._cache_to_coh_agent_fifo.request.put
+        rsp_q_get = self._cache_to_coh_agent_fifo.response.get
+        req_type = CACHE_REQUEST_TYPE.UNCACHED_READ
+        
+        # Issue all requests first (minimize overhead)
         addr = base_addr
         for _ in range(num_lines):
-            req_q.put(CacheRequest(CACHE_REQUEST_TYPE.UNCACHED_READ, addr, line_size))
+            req_q_put(CacheRequest(req_type, addr, line_size))
             addr += line_size
 
-        # Collect all responses (expect CacheResponse OK)
+        # Collect all responses with optimized conversion
         offset = 0
+        mv = memoryview(results)
+        status_ok = CACHE_RESPONSE_STATUS.OK
         for _ in range(num_lines):
-            resp = rsp_q.get()
-            assert resp.status == CACHE_RESPONSE_STATUS.OK
+            resp = rsp_q_get()
+            assert resp.status == status_ok
+            # Direct write to memoryview to avoid intermediate bytes object
             line_bytes = resp.data.to_bytes(line_size, 'little')
-            results[offset:offset + line_size] = line_bytes
+            mv[offset:offset + line_size] = line_bytes
             offset += line_size
         return results
 
@@ -475,17 +479,20 @@ class CacheController(RunnableComponent):
         assert line_size >= self._cache_blk_size and line_size % self._cache_blk_size == 0
         assert total_size % line_size == 0
         num_lines = total_size // line_size
-        req_q = self._cache_to_coh_agent_fifo.request
-        rsp_q = self._cache_to_coh_agent_fifo.response
-        # Issue all write requests first
+        req_q_put = self._cache_to_coh_agent_fifo.request.put
+        rsp_q_get = self._cache_to_coh_agent_fifo.response.get
+        req_type = CACHE_REQUEST_TYPE.UNCACHED_WRITE
+        
+        # Issue all write requests first (minimize overhead)
         addr = base_addr
         for _ in range(num_lines):
-            req_q.put(CacheRequest(CACHE_REQUEST_TYPE.UNCACHED_WRITE, addr, line_size, value))
+            req_q_put(CacheRequest(req_type, addr, line_size, value))
             addr += line_size
         # Drain responses to preserve semantics (expect CacheResponse OK)
+        status_ok = CACHE_RESPONSE_STATUS.OK
         for _ in range(num_lines):
-            resp = rsp_q.get()
-            assert resp.status == CACHE_RESPONSE_STATUS.OK
+            resp = rsp_q_get()
+            assert resp.status == status_ok
 
     # registered event loop for processor's cache load/store operations (thread worker)
     def _processor_request_worker(self) -> None:
