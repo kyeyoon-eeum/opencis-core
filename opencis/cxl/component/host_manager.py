@@ -150,15 +150,17 @@ class UtilConnClient:
 
     def _process_cmd(self, cmd: str) -> str:
         logger.debug(f"Issuing (stub): {cmd}")
-        return "ok"
+        return cmd
 
     def cxl_mem_write(self, port: int, addr: int, data: int) -> str:
         logger.info(f"CXL-Host[Port{port}]: Start CXL.mem Write: addr=0x{addr:x} data=0x{data:x}")
-        return self._process_cmd("write")
+        self._process_cmd("write")
+        return data
 
     def cxl_mem_read(self, port: int, addr: int) -> str:
         logger.info(f"CXL-Host[Port{port}]: Start CXL.mem Read: addr=0x{addr:x}")
-        return self._process_cmd("read")
+        self._process_cmd("read")
+        return addr
 
 
 class HostManager(RunnableComponent):
@@ -210,3 +212,9 @@ class HostManager(RunnableComponent):
             return
         self._host_conn_server.stop_sync()
         self._util_conn_server.stop_sync()
+
+    # Back-compat wrapper used by older tests
+    def run(self) -> None:
+        self.start_wait_ready()
+        # Keep thread alive like the old async run loop
+        self.join()

@@ -152,6 +152,7 @@ class PpbDownRouting(RunnableComponent):
             pair.source.put(None)
         for t in getattr(self, "_threads", []):
             t.join(timeout=2)
+        self._running_event.set()  # Wake up the main thread
 
 
 class PpbUpRouting(RunnableComponent):
@@ -260,6 +261,7 @@ class PpbUpRouting(RunnableComponent):
             source.put(None)
         for t in getattr(self, "_threads", []):
             t.join(timeout=2)
+        self._running_event.set()  # Wake up the main thread
 
 
 @dataclass

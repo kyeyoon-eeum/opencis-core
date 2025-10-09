@@ -50,8 +50,8 @@ class RunnableComponent(LabeledComponent):
     def start_wait_ready(self) -> None:
         with self._condition:
             if self._status != COMPONENT_STATUS.STOPPED:
-                logger.warning(self._create_message("Cannot start when not STOPPED"))
-                return
+                # For test predictability, raise instead of silently returning
+                raise RuntimeError(self._create_message("Cannot start when not STOPPED"))
             self._status = COMPONENT_STATUS.STARTING
             logger.debug(self._create_message("Starting"))
             logger.info(self._create_message("Lifecycle: STARTING"))
@@ -110,3 +110,10 @@ class RunnableComponent(LabeledComponent):
     @abstractmethod
     def _stop(self) -> None:
         """must be implemented by a child class"""
+
+    def run(self) -> None:
+        """Backward compatibility method for tests that use .run in threads"""
+        self.start_wait_ready()
+        # Don't block on join - let the component run in background
+        import time
+        time.sleep(0.1)

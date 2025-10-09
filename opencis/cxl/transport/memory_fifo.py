@@ -5,7 +5,7 @@ This software is licensed under the terms of the Revised BSD License.
 See LICENSE for details.
 """
 
-from queue import SimpleQueue
+from queue import Queue
 from dataclasses import dataclass, field
 from enum import Enum, auto
 
@@ -38,5 +38,5 @@ class MemoryResponse:
 
 @dataclass(slots=True)
 class MemoryFifoPair:
-    request: SimpleQueue[MemoryRequest] = field(default_factory=SimpleQueue)
-    response: SimpleQueue[MemoryResponse] = field(default_factory=SimpleQueue)
+    request: Queue[MemoryRequest] = field(default_factory=Queue)
+    response: Queue[MemoryResponse] = field(default_factory=Queue)

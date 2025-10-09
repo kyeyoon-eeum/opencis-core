@@ -482,8 +482,9 @@ class CxlCacheDcoh(PacketProcessor):
         )
         self._main_thread.start()
         self._change_status_to_running()
-        stop_event = threading.Event()
-        stop_event.wait()
+        # Allow threads to start
+        import time
+        time.sleep(0.1)
 
     def _stop(self):
         self._demux_stop.set()

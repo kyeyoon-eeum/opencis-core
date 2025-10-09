@@ -227,11 +227,13 @@ class CxlPacketProcessor(RunnableComponent):
         return fifo_type
 
     def _reader_thread_main(self):
-        logger.debug(self._create_message(f"Reader thread starting for {self._incoming_dir}"))
+        logger.info(self._create_message(f"Reader thread starting for {self._incoming_dir}"))
         # Reader thread loop
         while not self._reader_thread_stop.is_set():  # pylint: disable=too-many-nested-blocks
             try:
+                # logger.info(self._create_message("Waiting for packet..."))
                 packet = self._reader.get_packet()
+                # logger.info(self._create_message(f"Received packet: {type(packet)}"))
                 # Gracefully handle sideband frames that may appear on the stream (e.g., transport handshakes)
                 base_packet = cast(BasePacket, packet)
                 if base_packet.system_header.payload_type == SYSTEM_PAYLOAD_TYPE.SIDEBAND:
@@ -316,7 +318,9 @@ class CxlPacketProcessor(RunnableComponent):
                         # Add MLD
                         if self._component_type == CXL_COMPONENT_TYPE.LD:
                             ld_id = cxl_io_packet.tlp_prefix.ld_id
+                            logger.info(self._create_message(f"Putting CFG packet with ld_id={ld_id} into incoming queue"))
                             self._incoming[ld_id].cfg_space.put(cxl_io_packet)
+                            logger.info(self._create_message(f"Put CFG packet in queue, queue size now: {self._incoming[ld_id].cfg_space.qsize()}"))
                         else:
                             self._incoming.cfg_space.put(cxl_io_packet)
                     elif cxl_io_packet.is_mmio():
@@ -376,7 +380,9 @@ class CxlPacketProcessor(RunnableComponent):
                     raise Exception(message)
             except Exception as e:
                 msg = str(e)
-                logger.debug("[%s] %s", self.get_message_label(), msg)
+                logger.info(self._create_message(f"Exception in reader thread: {msg}"))
+                import traceback
+                logger.info(f"Traceback: {traceback.format_exc()}")
                 if "aborted" in msg or "cancelled" in msg or "Connection disconnected" in msg:
                     notification_packet = BaseSidebandPacket.create(
                         SIDEBAND_TYPES.CONNECTION_DISCONNECTED
@@ -435,12 +441,11 @@ class CxlPacketProcessor(RunnableComponent):
                 self._fmld.stop_sync()
             except Exception:
                 pass
-        # Stop reader thread
+        # Stop reader thread (don't wait since it's daemon and may be stuck)
         try:
             self._reader_thread_stop.set()
             self._reader.abort()
-            if self._reader_thread is not None:
-                self._reader_thread.join(timeout=1.0)
+            # Don't join - reader thread is daemon and will exit with process
         except Exception:
             pass
         # Stop outgoing workers
@@ -469,6 +474,13 @@ class CxlPacketProcessor(RunnableComponent):
                 packet = q.get()
             except Exception:
                 break
+
+            # Check if this is a sideband packet (not CXL.io)
+            base_packet = cast(BasePacket, packet)
+            if base_packet.system_header.payload_type == SYSTEM_PAYLOAD_TYPE.SIDEBAND:
+                # Skip sideband packets in CFG queue
+                continue
+
             cxl_io_packet = cast(CxlIoBasePacket, packet)
             if cxl_io_packet.is_cpl() or cxl_io_packet.is_cpld():
                 with self._tlp_lock:
@@ -493,6 +505,18 @@ class CxlPacketProcessor(RunnableComponent):
                 packet = q.get()
             except Exception:
                 break
+
+            # Check if this is a sideband packet (not CXL.io)
+            base_packet = cast(BasePacket, packet)
+            if base_packet.system_header.payload_type == SYSTEM_PAYLOAD_TYPE.SIDEBAND:
+                # Sideband packets need to be written out even from MMIO queue
+                try:
+                    view = packet.get_view()  # type: ignore[attr-defined]
+                except Exception:
+                    view = bytes(packet)
+                with self._writer_lock:
+                    self._writer.write(view)
+                continue
 
             cxl_io_packet = cast(CxlIoBasePacket, packet)
             if cxl_io_packet.is_cpl() or cxl_io_packet.is_cpld():

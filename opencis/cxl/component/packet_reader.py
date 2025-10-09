@@ -31,19 +31,21 @@ class PacketReader(LabeledComponent):
         super().__init__(lambda class_name: f"{label_prefix}{class_name}{label_suffix}")
         if not isinstance(reader, ShmStreamReader):
             raise TypeError("PacketReader requires ShmStreamReader")
-        # Reach into SHM ring directly for best performance
-        ep = getattr(reader, "_ep", None)
-        if ep is None or getattr(ep, "_in_ring", None) is None:
-            raise TypeError("ShmStreamReader is missing underlying ring")
-        self._ring = ep._in_ring
+        # Prefer direct ring when available, but fall back to C reader only
+        self._ring = getattr(getattr(reader, "_ep", None), "_in_ring", None)
         self._reader = _prc.ShmPacketReader(reader)
         self._aborted = False
 
-    def get_packet(self):
+    def get_packet(self, timeout_ms: int = 0):
         if self._aborted:
             raise Exception("PacketReader is already aborted")
         # Cython path returns already-parsed packet object
-        return self._reader.get_packet()
+        try:
+            return self._reader.get_packet()
+        except Exception as e:
+            if self._aborted:
+                raise Exception("PacketReader is aborted") from e
+            raise
 
     def abort(self):
         if self._aborted:

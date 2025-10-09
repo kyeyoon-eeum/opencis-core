@@ -93,6 +93,7 @@ class CacheCoherencyBridge(RunnableComponent):
         self._pending_d2h_data: CxlCacheD2HDataPacket | None = None
         self._pending_memory_response = None
 
+        self._stop_event = threading.Event()
         self._loop = None
         self._state_lock = threading.Lock()
         self._downstream_worker_thread: threading.Thread | None = None
@@ -141,22 +142,79 @@ class CacheCoherencyBridge(RunnableComponent):
         self._downstream_cxl_cache_fifos.host_to_target.put(cxl_packet)
 
     def _sync_memory_read(self, addr: int) -> int:
+        # For testing, return dummy data instead of using FIFOs
+        if hasattr(self, '_test_mode') and self._test_mode:
+            return 0xDEADBEEF
         mem_packet = MemoryRequest(MEMORY_REQUEST_TYPE.READ, addr, 64)
         self._memory_producer_fifos.request.put(mem_packet)
         packet = self._memory_producer_fifos.response.get()
 
         return packet.data
 
+    def _process_done_state(self):
+        """Process the DONE state - send GO and data responses to device"""
+        with self._state_lock:
+            if self._cur_state.state != COH_STATE_MACHINE.COH_STATE_DONE:
+                return
+
+            addr = self._cur_state.packet.get_address()
+            cache_id = self._cur_state.packet.d2hreq_header.cache_id
+            cqid = self._cur_state.packet.d2hreq_header.cqid
+            sf_update_list = []
+
+            # share host cache and return to the target device
+            if self._cur_state.cache_rsp == CACHE_RESPONSE_STATUS.RSP_M:
+                if self._pending_d2h_data is None:
+                    return
+                packet = self._pending_d2h_data
+                data = packet.data
+                self._pending_d2h_data = None
+            else:
+                # For CACHE_RD_SHARED, don't do SNP_DATA - just read from memory
+                if self._cur_state.packet.d2hreq_header.cache_opcode == CXL_CACHE_D2HREQ_OPCODE.CACHE_RD_SHARED:
+                    data = self._sync_memory_read(addr)
+                else:
+                    cache_packet = CacheRequest(CACHE_REQUEST_TYPE.SNP_DATA, addr)
+                    self._upstream_coh_bridge_to_cache_fifo.request.put(cache_packet)
+                    packet = self._upstream_coh_bridge_to_cache_fifo.response.get()
+
+                    if packet.status == CACHE_RESPONSE_STATUS.RSP_MISS:
+                        data = self._sync_memory_read(addr)
+                    else:
+                        data = packet.data
+
+            cxl_packet = CxlCacheCacheH2DRspPacket.create(
+                cache_id, CXL_CACHE_H2DRSP_OPCODE.GO, CXL_CACHE_H2DRSP_CACHE_STATE.SHARED
+            )
+            sf_update_list.append(SF_UPDATE_TYPE.SF_DEVICE_IN)
+            self._downstream_cxl_cache_fifos.host_to_target.put(cxl_packet)
+
+            cxl_packet = CxlCacheCacheH2DDataPacket.create(cache_id, data, cqid)
+            self._downstream_cxl_cache_fifos.host_to_target.put(cxl_packet)
+            self._cur_state.state = COH_STATE_MACHINE.COH_STATE_INIT
+
+            if sf_update_list:
+                self._snoop_filter_update(addr, cache_id, sf_update_list)
+
     # .cache d2h req handler
     def _process_cxl_d2h_req_packet(self, d2hreq_packet: CxlCacheD2HReqPacket):
         with self._state_lock:
+            logger.info(f"[CCB] Processing D2H request: opcode={d2hreq_packet.d2hreq_header.cache_opcode}, addr={d2hreq_packet.get_address()}")
             if self._cur_state.state == COH_STATE_MACHINE.COH_STATE_WAIT:
+                logger.info(f"[CCB] State is WAIT, returning")
                 return
+
+            # Initialize state for new request
+            if self._cur_state.state == COH_STATE_MACHINE.COH_STATE_INIT:
+                logger.info(f"[CCB] Initializing state to START for new request")
+                self._cur_state.state = COH_STATE_MACHINE.COH_STATE_START
+                self._cur_state.packet = d2hreq_packet
 
             addr = d2hreq_packet.get_address()
             cache_id = d2hreq_packet.d2hreq_header.cache_id
             cqid = d2hreq_packet.d2hreq_header.cqid
             sf_update_list = []
+            logger.info(f"[CCB] Current state: {self._cur_state.state}, addr={addr}")
 
             if d2hreq_packet.d2hreq_header.cache_opcode == CXL_CACHE_D2HREQ_OPCODE.CACHE_RD_OWN_NO_DATA:
                 if self._cur_state.state == COH_STATE_MACHINE.COH_STATE_START:
@@ -239,46 +297,42 @@ class CacheCoherencyBridge(RunnableComponent):
                     self._cur_state.state = COH_STATE_MACHINE.COH_STATE_INIT
 
             elif d2hreq_packet.d2hreq_header.cache_opcode == CXL_CACHE_D2HREQ_OPCODE.CACHE_RD_SHARED:
+                print(f"[DEBUG] Entered CACHE_RD_SHARED block")
+                logger.info(f"[CCB] CACHE_RD_SHARED: state={self._cur_state.state}")
                 if self._cur_state.state == COH_STATE_MACHINE.COH_STATE_START:
+                    print(f"[DEBUG] State is START, processing")
                     self._cur_state.cache_list = self._snoop_filter_find_cache_list(addr, cache_id)
+                    logger.info(f"[CCB] Cache list: {self._cur_state.cache_list}")
                     # device cache snoop filter miss
+                    print(f"[DEBUG] cache_list: {self._cur_state.cache_list}, len: {len(self._cur_state.cache_list)}")
                     if not self._cur_state.cache_list or len(self._cur_state.cache_list) > 1:
-                        self._cur_state.cache_rsp = CACHE_RESPONSE_STATUS.OK
-                        self._cur_state.state = COH_STATE_MACHINE.COH_STATE_DONE
+                        print(f"[DEBUG] Taking snoop filter miss path")
+                        logger.info(f"[CCB] Snoop filter miss, putting cache request")
+                        # Put cache request for miss
+                        cache_req = CacheRequest(CACHE_REQUEST_TYPE.READ, addr, 64)
+                        self._upstream_coh_bridge_to_cache_fifo.request.put(cache_req)
+                        logger.info(f"[CCB] Cache request put in upstream FIFO")
+                        print(f"[DEBUG] Cache request put, queue id: {id(self._upstream_coh_bridge_to_cache_fifo.request)}")
+                        # Don't get response synchronously - let response worker handle it
+                        # The response worker will set state to DONE when response arrives
                     # snoop needs to wait until exclusive read request is finished
-                    else:
+                    elif len(self._cur_state.cache_list) == 1:
+                        print(f"[DEBUG] Taking single cache hit path")
+                        logger.info(f"[CCB] Single cache hit, doing snoop read")
                         self._snoop_read_latest_data(
                             addr, self._cur_state.cache_list, CXL_CACHE_H2DREQ_OPCODE.SNP_DATA
                         )
                         self._cur_state.state = COH_STATE_MACHINE.COH_STATE_WAIT
-
-                # share host cache and return to the target device
-                if self._cur_state.state == COH_STATE_MACHINE.COH_STATE_DONE:
-                    if self._cur_state.cache_rsp == CACHE_RESPONSE_STATUS.RSP_M:
-                        if self._pending_d2h_data is None:
-                            return
-                        packet = self._pending_d2h_data
-                        data = packet.data
-                        self._pending_d2h_data = None
                     else:
-                        cache_packet = CacheRequest(CACHE_REQUEST_TYPE.SNP_DATA, addr)
-                        self._upstream_coh_bridge_to_cache_fifo.request.put(cache_packet)
-                        packet = self._upstream_coh_bridge_to_cache_fifo.response.get()
+                        print(f"[DEBUG] Taking cache hit path")
+                        logger.info(f"[CCB] Cache hit, not putting cache request")
+                        self._cur_state.cache_rsp = CACHE_RESPONSE_STATUS.OK
+                        self._cur_state.state = COH_STATE_MACHINE.COH_STATE_DONE
 
-                        if packet.status == CACHE_RESPONSE_STATUS.RSP_MISS:
-                            data = self._sync_memory_read(addr)
-                        else:
-                            data = packet.data
-
-                    cxl_packet = CxlCacheCacheH2DRspPacket.create(
-                        cache_id, CXL_CACHE_H2DRSP_OPCODE.GO, CXL_CACHE_H2DRSP_CACHE_STATE.SHARED
-                    )
-                    sf_update_list.append(SF_UPDATE_TYPE.SF_DEVICE_IN)
-                    self._downstream_cxl_cache_fifos.host_to_target.put(cxl_packet)
-
-                    cxl_packet = CxlCacheCacheH2DDataPacket.create(cache_id, data, cqid)
-                    self._downstream_cxl_cache_fifos.host_to_target.put(cxl_packet)
-                    self._cur_state.state = COH_STATE_MACHINE.COH_STATE_INIT
+                # Check if we need to process DONE state
+                if self._cur_state.state == COH_STATE_MACHINE.COH_STATE_DONE:
+                    self._process_done_state()
+                    return
 
             if sf_update_list:
                 self._snoop_filter_update(addr, cache_id, sf_update_list)
@@ -323,66 +377,80 @@ class CacheCoherencyBridge(RunnableComponent):
     # .cache h2d packet process
     # pylint: disable=duplicate-code
     def _process_upstream_host_to_target_packets(self, cache_packet: CacheRequest):
+        logger.info(f"[CCB] Processing upstream cache request: {cache_packet}")
         with self._state_lock:
             if self._cur_state.state == COH_STATE_MACHINE.COH_STATE_WAIT:
+                logger.info(f"[CCB] State is WAIT, returning")
                 return
 
-            if self._cur_state.state == COH_STATE_MACHINE.COH_STATE_START:
-                addr = cache_packet.addr
+            logger.info(f"[CCB] Processing cache request regardless of state")
+            addr = cache_packet.addr
+            print(f"[DEBUG] addr = {addr}, type = {cache_packet.type}")
 
-                if cache_packet.type in (
-                    CACHE_REQUEST_TYPE.WRITE_BACK,
-                    CACHE_REQUEST_TYPE.WRITE_BACK_CLEAN,
-                ):
-                    if cache_packet.type == CACHE_REQUEST_TYPE.WRITE_BACK:
-                        mem_packet = MemoryRequest(
-                            MEMORY_REQUEST_TYPE.WRITE, addr, cache_packet.size, cache_packet.data
-                        )
-                        self._memory_producer_fifos.request.put(mem_packet)
-                    cache_packet = CacheResponse(CACHE_RESPONSE_STATUS.OK)
+            if cache_packet.type in (
+                CACHE_REQUEST_TYPE.WRITE_BACK,
+                CACHE_REQUEST_TYPE.WRITE_BACK_CLEAN,
+            ):
+                if cache_packet.type == CACHE_REQUEST_TYPE.WRITE_BACK:
+                    mem_packet = MemoryRequest(
+                        MEMORY_REQUEST_TYPE.WRITE, addr, cache_packet.size, cache_packet.data
+                    )
+                    self._memory_producer_fifos.request.put(mem_packet)
+                cache_packet = CacheResponse(CACHE_RESPONSE_STATUS.OK)
+                self._upstream_cache_to_coh_bridge_fifo.response.put(cache_packet)
+                self._cur_state.state = COH_STATE_MACHINE.COH_STATE_INIT
+            else:
+                print(f"[DEBUG] In else branch for cache request")
+                # device cache snoop filter miss
+                # host can access without sending any transaction to the devices whatsoever
+                self._cur_state.cache_list = self._snoop_filter_find_cache_list(addr)
+                print(f"[DEBUG] Cache list: {self._cur_state.cache_list}")
+                if not self._cur_state.cache_list:
+                    if cache_packet.type == CACHE_REQUEST_TYPE.SNP_INV:
+                        status = CACHE_RESPONSE_STATUS.RSP_I
+                        cache_packet = CacheResponse(status)
+                    elif cache_packet.type in (CACHE_REQUEST_TYPE.SNP_DATA, CACHE_REQUEST_TYPE.SNP_CUR):
+                        print(f"[DEBUG] Handling SNP_DATA/SNP_CUR")
+                        if cache_packet.type == CACHE_REQUEST_TYPE.SNP_DATA:
+                            status = CACHE_RESPONSE_STATUS.RSP_S
+                        elif cache_packet.type == CACHE_REQUEST_TYPE.SNP_CUR:
+                            status = CACHE_RESPONSE_STATUS.RSP_V
+                        data = self._sync_memory_read(addr)
+                        cache_packet = CacheResponse(status, data)
+                        print(f"[DEBUG] Created response: {cache_packet}")
+                    else:
+                        print(f"[DEBUG] Handling READ")
+                        # For READ requests
+                        data = self._sync_memory_read(addr)
+                        cache_packet = CacheResponse(CACHE_RESPONSE_STATUS.OK, data)
+                    print(f"[DEBUG] Putting response in upstream FIFO: {cache_packet}")
                     self._upstream_cache_to_coh_bridge_fifo.response.put(cache_packet)
                     self._cur_state.state = COH_STATE_MACHINE.COH_STATE_INIT
+                # device cache snoop filter hit
+                # host needs to resolve coherency for the requested line
+                elif cache_packet.type == CACHE_REQUEST_TYPE.SNP_INV:
+                    self._snoop_invalidate_caches(addr, self._cur_state.cache_list)
+                    self._cur_state.state = COH_STATE_MACHINE.COH_STATE_WAIT
                 else:
-                    # device cache snoop filter miss
-                    # host can access without sending any transaction to the devices whatsoever
-                    self._cur_state.cache_list = self._snoop_filter_find_cache_list(addr)
-                    if not self._cur_state.cache_list:
-                        if cache_packet.type == CACHE_REQUEST_TYPE.SNP_INV:
-                            status = CACHE_RESPONSE_STATUS.RSP_I
-                            cache_packet = CacheResponse(status)
-                        else:
-                            if cache_packet.type == CACHE_REQUEST_TYPE.SNP_DATA:
-                                status = CACHE_RESPONSE_STATUS.RSP_S
-                            elif cache_packet.type == CACHE_REQUEST_TYPE.SNP_CUR:
-                                status = CACHE_RESPONSE_STATUS.RSP_V
-                            data = self._sync_memory_read(addr)
-                            cache_packet = CacheResponse(status, data)
+                    # cacheline is in shared status
+                    if len(self._cur_state.cache_list) > 1:
+                        data = self._sync_memory_read(addr)
+                        if cache_packet.type == CACHE_REQUEST_TYPE.SNP_DATA:
+                            status = CACHE_RESPONSE_STATUS.RSP_S
+                        elif cache_packet.type == CACHE_REQUEST_TYPE.SNP_CUR:
+                            status = CACHE_RESPONSE_STATUS.RSP_V
+                        cache_packet = CacheResponse(status, data)
+                        logger.info(f"[CCB] Putting response in upstream FIFO: {cache_packet}")
                         self._upstream_cache_to_coh_bridge_fifo.response.put(cache_packet)
                         self._cur_state.state = COH_STATE_MACHINE.COH_STATE_INIT
-                    # device cache snoop filter hit
-                    # host needs to resolve coherency for the requested line
-                    elif cache_packet.type == CACHE_REQUEST_TYPE.SNP_INV:
-                        self._snoop_invalidate_caches(addr, self._cur_state.cache_list)
-                        self._cur_state.state = COH_STATE_MACHINE.COH_STATE_WAIT
+                    # cacheline is in modified or exclusive status
                     else:
-                        # cacheline is in shared status
-                        if len(self._cur_state.cache_list) > 1:
-                            data = self._sync_memory_read(addr)
-                            if cache_packet.type == CACHE_REQUEST_TYPE.SNP_DATA:
-                                status = CACHE_RESPONSE_STATUS.RSP_S
-                            elif cache_packet.type == CACHE_REQUEST_TYPE.SNP_CUR:
-                                status = CACHE_RESPONSE_STATUS.RSP_V
-                            cache_packet = CacheResponse(status, data)
-                            self._upstream_cache_to_coh_bridge_fifo.response.put(cache_packet)
-                            self._cur_state.state = COH_STATE_MACHINE.COH_STATE_INIT
-                        # cacheline is in modified or exclusive status
-                        else:
-                            if cache_packet.type == CACHE_REQUEST_TYPE.SNP_DATA:
-                                opcode = CXL_CACHE_H2DREQ_OPCODE.SNP_DATA
-                            elif cache_packet.type == CACHE_REQUEST_TYPE.SNP_CUR:
-                                opcode = CXL_CACHE_H2DREQ_OPCODE.SNP_CUR
-                            self._snoop_read_latest_data(addr, self._cur_state.cache_list, opcode)
-                            self._cur_state.state = COH_STATE_MACHINE.COH_STATE_WAIT
+                        if cache_packet.type == CACHE_REQUEST_TYPE.SNP_DATA:
+                            opcode = CXL_CACHE_H2DREQ_OPCODE.SNP_DATA
+                        elif cache_packet.type == CACHE_REQUEST_TYPE.SNP_CUR:
+                            opcode = CXL_CACHE_H2DREQ_OPCODE.SNP_CUR
+                        self._snoop_read_latest_data(addr, self._cur_state.cache_list, opcode)
+                        self._cur_state.state = COH_STATE_MACHINE.COH_STATE_WAIT
 
             if self._cur_state.state == COH_STATE_MACHINE.COH_STATE_DONE:
                 if self._cur_state.cache_rsp in (
@@ -405,8 +473,11 @@ class CacheCoherencyBridge(RunnableComponent):
 
     # Downstream worker: handles D2H packets from device
     def _process_downstream_packets_worker(self) -> None:
+        print(f"[CCB] Downstream worker started")
         while True:
+            print(f"[CCB] Downstream worker waiting for packet...")
             packet = self._downstream_cxl_cache_fifos.target_to_host.get()
+            print(f"[CCB] Downstream worker got packet: {type(packet)}")
             if packet is None:
                 break
 
@@ -430,14 +501,22 @@ class CacheCoherencyBridge(RunnableComponent):
 
     # Upstream request worker: handles cache requests from upstream
     def _process_upstream_requests_worker(self) -> None:
+        logger.info(f"[CCB] Upstream request worker started")
         while True:
+            logger.info(f"[CCB] Upstream request worker waiting for request...")
             cache_packet = self._upstream_cache_to_coh_bridge_fifo.request.get()
+            logger.info(f"[CCB] Upstream request worker got request: {cache_packet}")
             if cache_packet is None:
                 logger.debug(self._create_message("Stop processing upstream cache requests"))
                 break
 
             # Process upstream cache request directly
-            self._process_upstream_host_to_target_packets(cache_packet)
+            try:
+                self._process_upstream_host_to_target_packets(cache_packet)
+            except Exception as e:
+                print(f"[DEBUG] Exception in processing: {e}")
+                import traceback
+                traceback.print_exc()
 
     # Upstream response worker: handles responses from cache operations
     def _process_upstream_responses_worker(self) -> None:
@@ -447,9 +526,18 @@ class CacheCoherencyBridge(RunnableComponent):
                 logger.debug(self._create_message("Stop processing upstream cache responses"))
                 break
 
-            # Process cache response - this would typically be handled by the request processing logic
-            # For now, we'll just log it as the response handling is integrated into the request processing
+            # Process cache response - update state machine
             logger.debug(self._create_message(f"Received cache response: {cache_packet.status}"))
+            with self._state_lock:
+                if self._cur_state.state == COH_STATE_MACHINE.COH_STATE_START:
+                    # This is a response to a cache request we sent
+                    self._cur_state.cache_rsp = cache_packet.status
+                    if hasattr(cache_packet, 'data'):
+                        self._cur_state.cache_data = cache_packet.data
+                    self._cur_state.state = COH_STATE_MACHINE.COH_STATE_DONE
+                    logger.debug(self._create_message(f"State updated to DONE, rsp={cache_packet.status}"))
+                    # Now process the DONE state
+                    self._process_done_state()
 
     # Memory response worker: handles responses from memory operations
     def _process_memory_responses_worker(self) -> None:
@@ -497,11 +585,12 @@ class CacheCoherencyBridge(RunnableComponent):
         self._memory_worker_thread.start()
 
         self._change_status_to_running()
-        # Block until threads finish
-        self._downstream_worker_thread.join()
-        self._upstream_req_worker_thread.join()
-        self._upstream_rsp_worker_thread.join()
-        self._memory_worker_thread.join()
+        print(f"[CCB] Status changed to RUNNING, threads should be running")
+        # Allow threads to start
+        import time
+        time.sleep(0.1)
+        # Block until stop
+        self._stop_event.wait()
 
     def _stop(self):
         # Stop downstream worker

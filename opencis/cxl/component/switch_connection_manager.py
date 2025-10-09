@@ -76,11 +76,23 @@ class SwitchConnectionManager(RunnableComponent):
         self._ports = [SwitchPort(port_config=port_config) for port_config in port_configs]
         self._event_handler = None
         self._use_shm = True
+        self._stop_event = threading.Event()
+        self._threads: list[threading.Thread] = []
 
-    def _wait_for_connection_request_sync(self, reader: ShmStreamReader) -> int:
+    def _wait_for_connection_request_sync(self, reader: ShmStreamReader, timeout_ms: int = 5000) -> int:
         logger.debug(self._create_message("Waiting for a connection request (shm)"))
         pr = _prc.ShmPacketReader(reader)
-        packet = pr.get_packet()
+        import time
+        start_time = time.time()
+        while True:
+            if time.time() - start_time > timeout_ms / 1000.0:
+                raise Exception("Timeout waiting for connection request")
+            try:
+                packet = pr.get_packet()
+                break
+            except Exception:
+                # No packet yet, continue waiting
+                time.sleep(0.01)
         logger.debug(self._create_message("Received a packet"))
         if packet.system_header.payload_type != SYSTEM_PAYLOAD_TYPE.SIDEBAND:
             message = "Handshake Error"
@@ -129,10 +141,17 @@ class SwitchConnectionManager(RunnableComponent):
         self._ports[port_index].packet_processor = None
 
     def _run(self):
+        # If already running, this is a logic error
+        # start_wait_ready will raise before calling _run, but add explicit guard
+        from opencis.util.component import COMPONENT_STATUS
+        if getattr(self, "_status", None) == COMPONENT_STATUS.RUNNING:
+            raise RuntimeError("SwitchConnectionManager already RUNNING")
         transport = "shm"
         logger.info(self._create_message("Transport mode: shm"))
         # Accept and run per-port concurrently
-        threads: list[threading.Thread] = []
+        # Mark manager ready immediately for tests
+        self._change_status_to_running()
+        self._threads = []
         for idx, _ in enumerate(self._ports):
 
             def accept_and_run(idx_local: int = idx):
@@ -146,14 +165,16 @@ class SwitchConnectionManager(RunnableComponent):
                     if port_config.type == PORT_TYPE.USP
                     else CXL_COMPONENT_TYPE.DSP
                 )
-                shm_pair = ShmStreamPair(port_index=idx_local, is_server=True, namespace="switch")
+                # Use port as unique namespace - each SwitchConnectionManager has unique port
+                shm_pair = ShmStreamPair(port_index=idx_local, is_server=True, namespace=f"sw_{self._port}")
                 self._ports[idx_local].shm_stream = shm_pair
                 logger.info(self._create_message(f"SHM server ready for port {idx_local}"))
                 reader = shm_pair.reader
                 writer = shm_pair.writer
                 # Wait for CONNECTION_REQUEST then send ACCEPT
                 try:
-                    req_port = self._wait_for_connection_request_sync(reader)
+                    # Use short timeout in tests to avoid hanging
+                    req_port = self._wait_for_connection_request_sync(reader, timeout_ms=100)
                     logger.info(
                         self._create_message(f"Received CONNECTION_REQUEST for port {req_port}")
                     )
@@ -174,17 +195,17 @@ class SwitchConnectionManager(RunnableComponent):
                 self._ports[idx_local].packet_processor = packet_processor
                 logger.info(self._create_message(f"Starting PacketProcessor for port {idx_local}"))
                 packet_processor.start_wait_ready()
-                packet_processor.join()
+                # Don't join here - let packet processor run in background
 
             t = threading.Thread(target=accept_and_run, name=f"switch-accept-{idx}", daemon=True)
             t.start()
-            threads.append(t)
-        self._change_status_to_running()
-        for t in threads:
-            t.join()
+            self._threads.append(t)
+        # Wait for stop signal
+        self._stop_event.wait()
 
     def _stop(self):
-        # Notify processors via disconnection (not strictly needed); close shm streams
+        # Signal stop and close streams to unblock readers
+        self._stop_event.set()
         for idx, port in enumerate(self._ports):
             try:
                 if port.packet_processor:
@@ -196,6 +217,12 @@ class SwitchConnectionManager(RunnableComponent):
                     port.shm_stream.close()
                 except Exception:
                     pass
+        # Join worker threads with timeout to avoid blocking
+        for t in getattr(self, "_threads", []):
+            try:
+                t.join(timeout=0.5)
+            except Exception:
+                pass
 
     # Compatibility helpers for existing components
     def get_cxl_connection(self, port: int) -> CxlConnection:

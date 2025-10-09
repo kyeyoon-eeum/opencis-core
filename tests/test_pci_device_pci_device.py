@@ -5,10 +5,7 @@ This software is licensed under the terms of the Revised BSD License.
 See LICENSE for details.
 """
 
-from asyncio import gather, create_task
 from typing import cast
-import pytest
-
 
 from opencis.util.logger import logger
 from opencis.util.pci import create_bdf
@@ -36,8 +33,7 @@ def test_pci_device():
     PciDevice(transport_connection=transport_connection)
 
 
-@pytest.mark.asyncio
-async def test_pci_device_run_stop():
+def test_pci_device_run_stop():
     transport_connection = PciConnection()
     identity = PciComponentIdentity(
         vendor_id=EEUM_VID,
@@ -49,16 +45,11 @@ async def test_pci_device_run_stop():
         transport_connection=transport_connection, identity=identity, label="TestDevice"
     )
 
-    async def wait_and_stop():
-        await device.wait_for_ready()
-        await device.stop()
-
-    tasks = [create_task(device.run()), create_task(wait_and_stop())]
-    await gather(*tasks)
+    device.start_wait_ready()
+    device.stop_sync()
 
 
-@pytest.mark.asyncio
-async def test_pci_device_run_stop_without_label():
+def test_pci_device_run_stop_without_label():
     transport_connection = PciConnection()
     identity = PciComponentIdentity(
         vendor_id=EEUM_VID,
@@ -68,16 +59,11 @@ async def test_pci_device_run_stop_without_label():
     )
     device = PciDevice(transport_connection=transport_connection, identity=identity)
 
-    async def wait_and_stop():
-        await device.wait_for_ready()
-        await device.stop()
-
-    tasks = [create_task(device.run()), create_task(wait_and_stop())]
-    await gather(*tasks)
+    device.start_wait_ready()
+    device.stop_sync()
 
 
-@pytest.mark.asyncio
-async def test_pci_device_config_space():
+def test_pci_device_config_space():
     transport_connection = PciConnection()
     identity = PciComponentIdentity(
         vendor_id=EEUM_VID,
@@ -93,59 +79,52 @@ async def test_pci_device_config_space():
         bar_size=bar_size,
     )
 
-    async def test_config_space(transport_connection: PciConnection):
-        # NOTE: Test Config Space Type0 Read - VID/DID
-        logger.info("[PyTest] Testing Config Space Type0 Read (VID/DID)")
-        packet = CxlIoCfgRdPacket.create(create_bdf(0, 0, 0), 0, 4, is_type0=True)
+    device.start_wait_ready()
 
-        await transport_connection.cfg_fifo.host_to_target.put(packet)
-        packet = await transport_connection.cfg_fifo.target_to_host.get()
-        assert is_cxl_io_completion_status_sc(packet)
-        cpld_packet = cast(CxlIoCompletionPacket, packet)
-        assert cpld_packet.get_data_as_int() == (EEUM_VID | (SW_EP_DID << 16))
+    # NOTE: Test Config Space Type0 Read - VID/DID
+    logger.info("[PyTest] Testing Config Space Type0 Read (VID/DID)")
+    packet = CxlIoCfgRdPacket.create(create_bdf(0, 0, 0), 0, 4, is_type0=True)
+    transport_connection.cfg_fifo.host_to_target.put(packet)
+    packet = transport_connection.cfg_fifo.target_to_host.get()
+    assert is_cxl_io_completion_status_sc(packet)
+    cpld_packet = cast(CxlIoCompletionPacket, packet)
+    assert cpld_packet.get_data_as_int() == (EEUM_VID | (SW_EP_DID << 16))
 
-        # NOTE: Test Config Space Type0 Write - BAR WRITE
-        logger.info("[PyTest] Testing Config Space Type0 Write (BAR)")
-        packet = CxlIoCfgWrPacket.create(create_bdf(0, 0, 0), 0x10, 4, 0xFFFFFFFF, is_type0=True)
-        await transport_connection.cfg_fifo.host_to_target.put(packet)
-        packet = await transport_connection.cfg_fifo.target_to_host.get()
-        assert is_cxl_io_completion_status_sc(packet)
+    # NOTE: Test Config Space Type0 Write - BAR WRITE
+    logger.info("[PyTest] Testing Config Space Type0 Write (BAR)")
+    packet = CxlIoCfgWrPacket.create(create_bdf(0, 0, 0), 0x10, 4, 0xFFFFFFFF, is_type0=True)
+    transport_connection.cfg_fifo.host_to_target.put(packet)
+    packet = transport_connection.cfg_fifo.target_to_host.get()
+    assert is_cxl_io_completion_status_sc(packet)
 
-        # NOTE: Test Config Space Type0 Read - BAR READ
-        logger.info("[PyTest] Testing Config Space Type0 Read (BAR)")
-        packet = CxlIoCfgRdPacket.create(create_bdf(0, 0, 0), 0x10, 4, is_type0=True)
-        await transport_connection.cfg_fifo.host_to_target.put(packet)
-        packet = await transport_connection.cfg_fifo.target_to_host.get()
-        assert is_cxl_io_completion_status_sc(packet)
-        cpld_packet = cast(CxlIoCompletionPacket, packet)
-        size = 0xFFFFFFFF - cpld_packet.get_data_as_int() + 1
-        assert size == bar_size
+    # NOTE: Test Config Space Type0 Read - BAR READ
+    logger.info("[PyTest] Testing Config Space Type0 Read (BAR)")
+    packet = CxlIoCfgRdPacket.create(create_bdf(0, 0, 0), 0x10, 4, is_type0=True)
+    transport_connection.cfg_fifo.host_to_target.put(packet)
+    packet = transport_connection.cfg_fifo.target_to_host.get()
+    assert is_cxl_io_completion_status_sc(packet)
+    cpld_packet = cast(CxlIoCompletionPacket, packet)
+    size = 0xFFFFFFFF - cpld_packet.get_data_as_int() + 1
+    assert size == bar_size
 
-        # NOTE: Test Config Space Type1 Read - VID/DID: Expect UR
-        logger.info("[PyTest] Testing Config Space Type1 Read - Expect UR")
-        packet = CxlIoCfgRdPacket.create(create_bdf(0, 0, 0), 0, 4, is_type0=False)
-        await transport_connection.cfg_fifo.host_to_target.put(packet)
-        packet = await transport_connection.cfg_fifo.target_to_host.get()
-        assert is_cxl_io_completion_status_ur(packet)
+    # NOTE: Test Config Space Type1 Read - VID/DID: Expect UR
+    logger.info("[PyTest] Testing Config Space Type1 Read - Expect UR")
+    packet = CxlIoCfgRdPacket.create(create_bdf(0, 0, 0), 0, 4, is_type0=False)
+    transport_connection.cfg_fifo.host_to_target.put(packet)
+    packet = transport_connection.cfg_fifo.target_to_host.get()
+    assert is_cxl_io_completion_status_ur(packet)
 
-        # NOTE: Test Config Space Type1 Write - BAR WRITE: Expect UR
-        logger.info("[PyTest] Testing Config Space Type1 Write - Expect UR")
-        packet = CxlIoCfgWrPacket.create(create_bdf(0, 0, 0), 0x10, 4, 0xFFFFFFFF, is_type0=False)
-        await transport_connection.cfg_fifo.host_to_target.put(packet)
-        packet = await transport_connection.cfg_fifo.target_to_host.get()
-        assert is_cxl_io_completion_status_ur(packet)
+    # NOTE: Test Config Space Type1 Write - BAR WRITE: Expect UR
+    logger.info("[PyTest] Testing Config Space Type1 Write - Expect UR")
+    packet = CxlIoCfgWrPacket.create(create_bdf(0, 0, 0), 0x10, 4, 0xFFFFFFFF, is_type0=False)
+    transport_connection.cfg_fifo.host_to_target.put(packet)
+    packet = transport_connection.cfg_fifo.target_to_host.get()
+    assert is_cxl_io_completion_status_ur(packet)
 
-    async def wait_test_stop():
-        await device.wait_for_ready()
-        await test_config_space(transport_connection)
-        await device.stop()
-
-    tasks = [create_task(device.run()), create_task(wait_test_stop())]
-    await gather(*tasks)
+    device.stop_sync()
 
 
-@pytest.mark.asyncio
-async def test_pci_device_mmio():
+def test_pci_device_mmio():
     transport_connection = PciConnection()
     identity = PciComponentIdentity(
         vendor_id=EEUM_VID,
@@ -162,60 +141,54 @@ async def test_pci_device_mmio():
     )
     base_addresss = 0x1000000
 
-    async def configure_bar(transport_connection: PciConnection):
-        logger.info("[PyTest] Setting BAR Address")
-        # NOTE: Test Config Space Type0 Write - BAR WRITE
-        packet = CxlIoCfgWrPacket.create(
-            create_bdf(0, 0, 0), 0x10, 4, value=base_addresss, is_type0=True
-        )
-        await transport_connection.cfg_fifo.host_to_target.put(packet)
-        packet = await transport_connection.cfg_fifo.target_to_host.get()
-        assert is_cxl_io_completion_status_sc(packet)
+    device.start_wait_ready()
 
-    async def test_mmio(transport_connection: PciConnection):
-        logger.info("[PyTest] Accessing MMIO register")
-        # NOTE: Write 0xDEADBEEF
-        data = 0xDEADBEEF
-        packet = CxlIoMemWrPacket.create(base_addresss, 4, data=data)
-        await transport_connection.mmio_fifo.host_to_target.put(packet)
+    # Configure BAR
+    logger.info("[PyTest] Setting BAR Address")
+    packet = CxlIoCfgWrPacket.create(
+        create_bdf(0, 0, 0), 0x10, 4, value=base_addresss, is_type0=True
+    )
+    transport_connection.cfg_fifo.host_to_target.put(packet)
+    packet = transport_connection.cfg_fifo.target_to_host.get()
+    assert is_cxl_io_completion_status_sc(packet)
 
-        # NOTE: Confirm 0xDEADBEEF is written
-        packet = CxlIoMemRdPacket.create(base_addresss, 4)
-        await transport_connection.mmio_fifo.host_to_target.put(packet)
-        packet = await transport_connection.mmio_fifo.target_to_host.get()
-        assert is_cxl_io_completion_status_sc(packet)
-        cpld_packet = cast(CxlIoCompletionPacket, packet)
-        assert cpld_packet.get_data_as_int() == data
+    # Test MMIO
+    logger.info("[PyTest] Accessing MMIO register")
+    # NOTE: Write 0xDEADBEEF
+    data = 0xDEADBEEF
+    packet = CxlIoMemWrPacket.create(base_addresss, 4, data=data)
+    transport_connection.mmio_fifo.host_to_target.put(packet)
 
-        # NOTE: Write OOB (Upper Boundary), Expect No Error
-        packet = CxlIoMemWrPacket.create(base_addresss + bar_size, 4, data=data)
-        await transport_connection.mmio_fifo.host_to_target.put(packet)
+    # NOTE: Confirm 0xDEADBEEF is written
+    packet = CxlIoMemRdPacket.create(base_addresss, 4)
+    transport_connection.mmio_fifo.host_to_target.put(packet)
+    packet = transport_connection.mmio_fifo.target_to_host.get()
+    assert is_cxl_io_completion_status_sc(packet)
+    cpld_packet = cast(CxlIoCompletionPacket, packet)
+    assert cpld_packet.get_data_as_int() == data
 
-        # NOTE: Write OOB (Lower Boundary), Expect No Error
-        packet = CxlIoMemWrPacket.create(base_addresss - 4, 4, data=data)
-        await transport_connection.mmio_fifo.host_to_target.put(packet)
+    # NOTE: Write OOB (Upper Boundary), Expect No Error
+    packet = CxlIoMemWrPacket.create(base_addresss + bar_size, 4, data=data)
+    transport_connection.mmio_fifo.host_to_target.put(packet)
 
-        # NOTE: Read OOB (Upper Boundary), Expect 0
-        packet = CxlIoMemRdPacket.create(base_addresss + bar_size, 4)
-        await transport_connection.mmio_fifo.host_to_target.put(packet)
-        packet = await transport_connection.mmio_fifo.target_to_host.get()
-        assert is_cxl_io_completion_status_sc(packet)
-        cpld_packet = cast(CxlIoCompletionPacket, packet)
-        assert cpld_packet.get_data_as_int() == 0
+    # NOTE: Write OOB (Lower Boundary), Expect No Error
+    packet = CxlIoMemWrPacket.create(base_addresss - 4, 4, data=data)
+    transport_connection.mmio_fifo.host_to_target.put(packet)
 
-        # NOTE: Read OOB (Lower Boundary), Expect 0
-        packet = CxlIoMemRdPacket.create(base_addresss - 4, 4)
-        await transport_connection.mmio_fifo.host_to_target.put(packet)
-        packet = await transport_connection.mmio_fifo.target_to_host.get()
-        assert is_cxl_io_completion_status_sc(packet)
-        cpld_packet = cast(CxlIoCompletionPacket, packet)
-        assert cpld_packet.get_data_as_int() == 0
+    # NOTE: Read OOB (Upper Boundary), Expect 0
+    packet = CxlIoMemRdPacket.create(base_addresss + bar_size, 4)
+    transport_connection.mmio_fifo.host_to_target.put(packet)
+    packet = transport_connection.mmio_fifo.target_to_host.get()
+    assert is_cxl_io_completion_status_sc(packet)
+    cpld_packet = cast(CxlIoCompletionPacket, packet)
+    assert cpld_packet.get_data_as_int() == 0
 
-    async def wait_test_stop():
-        await device.wait_for_ready()
-        await configure_bar(transport_connection)
-        await test_mmio(transport_connection)
-        await device.stop()
+    # NOTE: Read OOB (Lower Boundary), Expect 0
+    packet = CxlIoMemRdPacket.create(base_addresss - 4, 4)
+    transport_connection.mmio_fifo.host_to_target.put(packet)
+    packet = transport_connection.mmio_fifo.target_to_host.get()
+    assert is_cxl_io_completion_status_sc(packet)
+    cpld_packet = cast(CxlIoCompletionPacket, packet)
+    assert cpld_packet.get_data_as_int() == 0
 
-    tasks = [create_task(device.run()), create_task(wait_test_stop())]
-    await gather(*tasks)
+    device.stop_sync()

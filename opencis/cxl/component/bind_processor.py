@@ -89,6 +89,7 @@ class GenericBindProcessor(RunnableComponent):
             pair.source.put(None)
         for t in self._threads:
             t.join(timeout=2)
+        self._running_event.set()  # Wake up the main thread
 
 
 class PpbDspBindProcessor(GenericBindProcessor):

@@ -78,7 +78,7 @@ class CxlRootPortDevice(RunnableComponent):
         self._mmio_store: dict[int, int] = {}
 
     # --- Simple host-physical address utilities ---
-    def enumerate_sync(self, memory_base_address: int) -> MmioEnumerationInfo:
+    def enumerate(self, memory_base_address: int) -> MmioEnumerationInfo:
         self._hpa_base = memory_base_address
         # In lieu of real discovery, expose a default used range (64 MiB)
         self._used_hpa_size = 0x04000000
@@ -161,6 +161,10 @@ class CxlRootPortDevice(RunnableComponent):
         )
         usp = EnumerationItem(bdf=0, class_code=0, is_bridge=True, mmio_range=mmio)
         return EnumerationInfo(devices=[usp])
+
+    # Backwards-compatible method name expected by tests
+    def scan_devices(self) -> "EnumerationInfo":
+        return self.scan_devices_sync()
 
     # --- Runnable lifecycle (sync) ---
     def _run(self):

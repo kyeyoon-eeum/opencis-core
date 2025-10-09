@@ -23,16 +23,16 @@ def get_memory_bin_name(index_primary: int = 0, index_secondary: int = -1) -> st
     func_name = sys._getframe(1).f_code.co_name
 
     base_dir = "/tmp"
-    while True:
-        if index_secondary != -1:
-            bin_name_only = f"mem_{func_name}_{index_primary}-{index_secondary}.bin"
-        else:
-            bin_name_only = f"mem_{func_name}_{index_primary}.bin"
-        bin_name = os.path.join(base_dir, bin_name_only)
-        # Check if the bin name already exists
-        if not os.path.exists(bin_name):
-            break
-        index_primary += 1
+    # Add PID and a unique ID to prevent collisions in parallel test execution
+    import uuid
+    unique_id = str(uuid.uuid4())[:8]
+    pid = os.getpid()
+    
+    if index_secondary != -1:
+        bin_name_only = f"mem_{func_name}_{pid}_{unique_id}_{index_primary}-{index_secondary}.bin"
+    else:
+        bin_name_only = f"mem_{func_name}_{pid}_{unique_id}_{index_primary}.bin"
+    bin_name = os.path.join(base_dir, bin_name_only)
 
     # Make sure we remove it upon exit
     atexit.register(partial(cleanup, bin_name))

@@ -21,7 +21,7 @@ def test_mmio_register_with_cxl_memory_device_component():
     identity.volatile_only_capacity = 256 * 1024 * 1024
     identity.persistent_only_capacity = 0
     identity.partition_alignment = 0
-    cxl_component = CxlMemoryDeviceComponent(identity)
+    cxl_component = CxlMemoryDeviceComponent(identity, memory_file="")
     options = CombinedMmioRegiterOptions(cxl_component=cxl_component)
     register = CombinedMmioRegister(options=options)
     len_expected = CombinedMmioRegister.get_size_from_options(options)

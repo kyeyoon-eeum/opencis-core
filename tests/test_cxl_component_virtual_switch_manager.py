@@ -5,7 +5,6 @@ This software is licensed under the terms of the Revised BSD License.
 See LICENSE for details.
 """
 
-from asyncio import create_task, gather
 import pytest
 
 from opencis.cxl.component.physical_port_manager import (
@@ -24,7 +23,7 @@ from opencis.cxl.component.virtual_switch_manager import (
 from opencis.util.unaligned_bit_structure import UnalignedBitStructure
 
 
-def test_virtual_switch_manager_init():
+def test_virtual_switch_manager_init(unique_ports):
     UnalignedBitStructure.make_quiet()
     port_configs = [
         PortConfig(PORT_TYPE.USP),
@@ -32,7 +31,7 @@ def test_virtual_switch_manager_init():
         PortConfig(PORT_TYPE.DSP),
         PortConfig(PORT_TYPE.DSP),
     ]
-    switch_connection_manager = SwitchConnectionManager(port_configs, port=0)
+    switch_connection_manager = SwitchConnectionManager(port_configs, port=unique_ports['switch'])
     physical_port_manager = PhysicalPortManager(
         switch_connection_manager=switch_connection_manager, port_configs=port_configs
     )
@@ -44,7 +43,7 @@ def test_virtual_switch_manager_init():
             vppb_counts=vppb_counts,
             initial_bounds=initial_bounds,
             irq_host="127.0.0.1",
-            irq_port=0,
+            irq_port=unique_ports['fabric'],
         )
     ]
     allocated_ld = {}
@@ -63,8 +62,7 @@ def test_virtual_switch_manager_init():
     assert virtual_switch_manager.get_virtual_switch_counts() == len(switch_configs)
 
 
-@pytest.mark.asyncio
-async def test_virtual_switch_manager_run_and_stop():
+def test_virtual_switch_manager_run_and_stop(unique_ports):
     UnalignedBitStructure.make_quiet()
     port_configs = [
         PortConfig(PORT_TYPE.USP),
@@ -72,7 +70,7 @@ async def test_virtual_switch_manager_run_and_stop():
         PortConfig(PORT_TYPE.DSP),
         PortConfig(PORT_TYPE.DSP),
     ]
-    switch_connection_manager = SwitchConnectionManager(port_configs, port=0)
+    switch_connection_manager = SwitchConnectionManager(port_configs, port=unique_ports['switch'])
     physical_port_manager = PhysicalPortManager(
         switch_connection_manager=switch_connection_manager, port_configs=port_configs
     )
@@ -84,7 +82,7 @@ async def test_virtual_switch_manager_run_and_stop():
             vppb_counts=vppb_counts,
             initial_bounds=initial_bounds,
             irq_host="127.0.0.1",
-            irq_port=0,
+            irq_port=unique_ports['fabric'],
         )
     ]
     allocated_ld = {}
@@ -96,18 +94,12 @@ async def test_virtual_switch_manager_run_and_stop():
         allocated_ld=allocated_ld,
     )
 
-    async def wait_and_stop():
-        await switch_connection_manager.wait_for_ready()
-        await physical_port_manager.wait_for_ready()
-        await virtual_switch_manager.wait_for_ready()
-        await switch_connection_manager.stop()
-        await physical_port_manager.stop()
-        await virtual_switch_manager.stop()
+    # Start all components
+    switch_connection_manager.start_wait_ready()
+    physical_port_manager.start_wait_ready()
+    virtual_switch_manager.start_wait_ready()
 
-    tasks = [
-        create_task(switch_connection_manager.run()),
-        create_task(physical_port_manager.run()),
-        create_task(virtual_switch_manager.run()),
-        create_task(wait_and_stop()),
-    ]
-    await gather(*tasks)
+    # Stop all components
+    virtual_switch_manager.stop_sync()
+    physical_port_manager.stop_sync()
+    switch_connection_manager.stop_sync()

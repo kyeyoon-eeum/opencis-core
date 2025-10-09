@@ -64,8 +64,7 @@ def test_mmio_manager():
     assert bar_entry.base_address == expected_value
 
 
-@pytest.mark.asyncio
-async def test_mmio_manager_write():
+def test_mmio_manager_write():
     # pylint: disable=protected-access
     upstream_fifo = FifoPair()
     bar_entry = BarEntry()
@@ -75,8 +74,10 @@ async def test_mmio_manager_write():
     bar_entry.base_address = 0
     bar_entry.register = MagicMock()
     packet = CxlIoMemWrPacket.create(addr=0, length=4, data=0xF)
-    await upstream_fifo.host_to_target.put(packet)
-    await mmio_manager._process_host_to_target(run_once=True)
+    upstream_fifo.host_to_target.put(packet)
+    upstream_fifo.host_to_target.put(None)
+    # Directly invoke the worker once for deterministic processing
+    mmio_manager._host_to_target_worker()
     assert upstream_fifo.host_to_target.qsize() == 0
     bar_entry.register.write_bytes.assert_not_called()
 
@@ -124,8 +125,7 @@ class BytesLikeMock(MagicMock):
         return super().__format__(format_spec)
 
 
-@pytest.mark.asyncio
-async def test_mmio_manager_read():
+def test_mmio_manager_read():
     # pylint: disable=protected-access
     upstream_fifo = FifoPair()
     bar_entry = BarEntry()
@@ -136,42 +136,46 @@ async def test_mmio_manager_read():
     bar_entry.base_address = 0
     bar_entry.register = None
     packet = CxlIoMemRdPacket.create(addr=0, length=4)
-    await upstream_fifo.host_to_target.put(packet)
-    await mmio_manager._process_host_to_target(run_once=True)
+    upstream_fifo.host_to_target.put(packet)
+    upstream_fifo.host_to_target.put(None)
+    mmio_manager._host_to_target_worker()
     assert upstream_fifo.host_to_target.qsize() == 0
     assert upstream_fifo.target_to_host.qsize() == 1
-    await upstream_fifo.target_to_host.get()
+    upstream_fifo.target_to_host.get()
 
     # Test when register is empty
     bar_entry.base_address = 0x1000
     bar_entry.register = None
     packet = CxlIoMemRdPacket.create(addr=0x1000, length=4)
-    await upstream_fifo.host_to_target.put(packet)
-    await mmio_manager._process_host_to_target(run_once=True)
+    upstream_fifo.host_to_target.put(packet)
+    upstream_fifo.host_to_target.put(None)
+    mmio_manager._host_to_target_worker()
     assert upstream_fifo.host_to_target.qsize() == 0
     assert upstream_fifo.target_to_host.qsize() == 1
-    await upstream_fifo.target_to_host.get()
+    upstream_fifo.target_to_host.get()
 
     # Test when address is out of bound
     bar_entry.base_address = 0x1000
     bar_entry.register = BytesLikeMock()
     bar_entry.register.__len__.return_value = 0x10
     packet = CxlIoMemRdPacket.create(addr=0x1000 - 1, length=4)
-    await upstream_fifo.host_to_target.put(packet)
-    await mmio_manager._process_host_to_target(run_once=True)
+    upstream_fifo.host_to_target.put(packet)
+    upstream_fifo.host_to_target.put(None)
+    mmio_manager._host_to_target_worker()
     assert upstream_fifo.host_to_target.qsize() == 0
     bar_entry.register.read_bytes.assert_not_called()
     assert upstream_fifo.target_to_host.qsize() == 1
-    await upstream_fifo.target_to_host.get()
+    upstream_fifo.target_to_host.get()
 
     # Test when address is valid
     bar_entry.base_address = 0x1000
     bar_entry.register = BytesLikeMock()
     bar_entry.register.__len__.return_value = 0x10
     packet = CxlIoMemRdPacket.create(addr=0x1000, length=4)
-    await upstream_fifo.host_to_target.put(packet)
-    await mmio_manager._process_host_to_target(run_once=True)
+    upstream_fifo.host_to_target.put(packet)
+    upstream_fifo.host_to_target.put(None)
+    mmio_manager._host_to_target_worker()
     assert upstream_fifo.host_to_target.qsize() == 0
     bar_entry.register.read_bytes.assert_called_with(0, 3)
     assert upstream_fifo.target_to_host.qsize() == 1
-    await upstream_fifo.target_to_host.get()
+    upstream_fifo.target_to_host.get()

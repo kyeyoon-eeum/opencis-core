@@ -5,7 +5,6 @@ This software is licensed under the terms of the Revised BSD License.
 See LICENSE for details.
 """
 
-import asyncio
 import pytest
 
 from opencis.cxl.component.cache_controller import (
@@ -64,7 +63,7 @@ def cxl_dcoh_cache_controller():
     return CacheController(config)
 
 
-async def send_cache_req(
+def send_cache_req(
     cc: CacheController,
     req: CacheRequest,
 ) -> MemoryResponse:
@@ -75,50 +74,48 @@ async def send_cache_req(
             cache_fifo = cc._coh_bridge_to_cache_fifo
         else:
             cache_fifo = cc._coh_agent_to_cache_fifo
-    await cache_fifo.request.put(req)
-    resp = await cache_fifo.response.get()
+    cache_fifo.request.put(req)
+    resp = cache_fifo.response.get()
     return resp
 
 
-async def send_cached_mem_request(
+def send_cached_mem_request(
     cc: CacheController,
     req: MemoryRequest,
     is_cache_wb: bool,
     is_cache_snp: bool = False,
 ) -> MemoryResponse:
-    await cc._processor_to_cache_fifo.request.put(req)
+    cc._processor_to_cache_fifo.request.put(req)
     if is_cache_wb:
-        cache_req = await cc._cache_to_coh_agent_fifo.request.get()
-        await cc._cache_to_coh_agent_fifo.response.put(CacheResponse(CACHE_RESPONSE_STATUS.OK))
+        cache_req = cc._cache_to_coh_agent_fifo.request.get()
+        cc._cache_to_coh_agent_fifo.response.put(CacheResponse(CACHE_RESPONSE_STATUS.OK))
         assert cache_req.type == CACHE_REQUEST_TYPE.WRITE_BACK
     if is_cache_snp:
-        cache_req = await cc._cache_to_coh_agent_fifo.request.get()
-        await cc._cache_to_coh_agent_fifo.response.put(CacheResponse(CACHE_RESPONSE_STATUS.OK))
+        cache_req = cc._cache_to_coh_agent_fifo.request.get()
+        cc._cache_to_coh_agent_fifo.response.put(CacheResponse(CACHE_RESPONSE_STATUS.OK))
         assert cache_req.type == CACHE_REQUEST_TYPE.SNP_DATA
-    resp = await cc._processor_to_cache_fifo.response.get()
+    resp = cc._processor_to_cache_fifo.response.get()
     assert resp.status == MEMORY_RESPONSE_STATUS.OK
     return resp
 
 
-async def send_uncached_mem_request(
+def send_uncached_mem_request(
     cc: CacheController,
     req: MemoryRequest,
 ) -> MemoryResponse:
-    await cc._processor_to_cache_fifo.request.put(req)
-    cache_req = await cc._cache_to_coh_agent_fifo.request.get()
-    await cc._cache_to_coh_agent_fifo.response.put(CacheResponse(CACHE_RESPONSE_STATUS.OK))
+    cc._processor_to_cache_fifo.request.put(req)
+    cache_req = cc._cache_to_coh_agent_fifo.request.get()
+    cc._cache_to_coh_agent_fifo.response.put(CacheResponse(CACHE_RESPONSE_STATUS.OK))
     assert cache_req.type in (CACHE_REQUEST_TYPE.UNCACHED_WRITE, CACHE_REQUEST_TYPE.UNCACHED_READ)
-    resp = await cc._processor_to_cache_fifo.response.get()
+    resp = cc._processor_to_cache_fifo.response.get()
     assert resp.status == MEMORY_RESPONSE_STATUS.OK
     return resp
 
 
-@pytest.mark.asyncio
-async def test_cxl_host_cc_mem_req(cxl_host_cache_controller):
+def test_cxl_host_cc_mem_req(cxl_host_cache_controller):
     cc: CacheController
     cc = cxl_host_cache_controller
-    tasks = []
-    tasks.append(await cc.run_wait_ready())
+    cc.start_wait_ready()
 
     cc.add_mem_range(0x0, 0x1000, MEM_ADDR_TYPE.CXL_CACHED)
 
@@ -126,70 +123,65 @@ async def test_cxl_host_cc_mem_req(cxl_host_cache_controller):
     for i in range(CACHE_NUM_ASSOC):
         addr = i * 0x40
         req = MemoryRequest(MEMORY_REQUEST_TYPE.WRITE, addr, 0x40, 0x1111111111111111)
-        await send_cached_mem_request(cc, req, False)
+        send_cached_mem_request(cc, req, False)
 
     # cache miss write: write-back only
     addr = CACHE_NUM_ASSOC * 0x40
     mem_req = MemoryRequest(MEMORY_REQUEST_TYPE.WRITE, addr, 0x40, 0xDEADBEEFDEADBEEF)
-    resp = await send_cached_mem_request(cc, mem_req, True)
+    resp = send_cached_mem_request(cc, mem_req, True)
 
     # cache hit read
     addr = CACHE_NUM_ASSOC * 0x40
     req = MemoryRequest(MEMORY_REQUEST_TYPE.READ, addr, 0x40)
-    resp = await send_cached_mem_request(cc, req, False, False)
+    resp = send_cached_mem_request(cc, req, False, False)
     assert resp.data == 0xDEADBEEFDEADBEEF
 
     # cache miss read: write-back and snoop
     addr = 0
     req = MemoryRequest(MEMORY_REQUEST_TYPE.READ, addr, 0x40)
-    resp = await send_cached_mem_request(cc, req, True, True)
+    resp = send_cached_mem_request(cc, req, True, True)
     # assert resp.data == 0x1111111111111111
 
     # cache hit write
     addr = 0
     mem_req = MemoryRequest(MEMORY_REQUEST_TYPE.WRITE, addr, 0x40, 0xDEADBEEFDEADBEEF)
-    resp = await send_cached_mem_request(cc, mem_req, False, False)
+    resp = send_cached_mem_request(cc, mem_req, False, False)
 
-    await cc.stop()
-    asyncio.gather(*tasks)
+    cc.stop_sync()
 
 
-@pytest.mark.asyncio
-async def test_cxl_host_cc_cache_invalid(cxl_host_cache_controller):
+def test_cxl_host_cc_cache_invalid(cxl_host_cache_controller):
     cc: CacheController
     cc = cxl_host_cache_controller
-    tasks = []
-    tasks.append(await cc.run_wait_ready())
+    cc.start_wait_ready()
 
     cc.add_mem_range(0, 0x1000, MEM_ADDR_TYPE.DRAM)
     cc.add_mem_range(0x1000, 0x1000, MEM_ADDR_TYPE.CXL_CACHED_BI)
 
     addr = 0
     mem_req = MemoryRequest(MEMORY_REQUEST_TYPE.WRITE, addr, 0x40, 0xDEADBEEFDEADBEEF)
-    await cc._processor_to_cache_fifo.request.put(mem_req)
-    cache_req = await cc._cache_to_coh_bridge_fifo.request.get()
-    await cc._cache_to_coh_bridge_fifo.response.put(CacheResponse(CACHE_RESPONSE_STATUS.RSP_I))
+    cc._processor_to_cache_fifo.request.put(mem_req)
+    cache_req = cc._cache_to_coh_bridge_fifo.request.get()
+    cc._cache_to_coh_bridge_fifo.response.put(CacheResponse(CACHE_RESPONSE_STATUS.RSP_I))
     assert cache_req.type == CACHE_REQUEST_TYPE.SNP_INV
-    await cc._processor_to_cache_fifo.response.get()
+    cc._processor_to_cache_fifo.response.get()
 
     addr = 0x1000
     mem_req = MemoryRequest(MEMORY_REQUEST_TYPE.WRITE, addr, 0x40, 0xDEADBEEFDEADBEEF)
-    await cc._processor_to_cache_fifo.request.put(mem_req)
-    cache_req = await cc._cache_to_coh_agent_fifo.request.get()
-    await cc._cache_to_coh_agent_fifo.response.put(CacheResponse(CACHE_RESPONSE_STATUS.RSP_I))
+    cc._processor_to_cache_fifo.request.put(mem_req)
+    cache_req = cc._cache_to_coh_agent_fifo.request.get()
+    cc._cache_to_coh_agent_fifo.response.put(CacheResponse(CACHE_RESPONSE_STATUS.RSP_I))
     assert cache_req.type == CACHE_REQUEST_TYPE.SNP_INV
-    await cc._processor_to_cache_fifo.response.get()
+    cc._processor_to_cache_fifo.response.get()
 
-    await cc.stop()
-    asyncio.gather(*tasks)
+    cc.stop_sync()
 
 
-@pytest.mark.asyncio
-async def test_cxl_host_cc_cache_req(cxl_host_cache_controller):
+
+def test_cxl_host_cc_cache_req(cxl_host_cache_controller):
     cc: CacheController
     cc = cxl_host_cache_controller
-    tasks = []
-    tasks.append(await cc.run_wait_ready())
+    cc.start_wait_ready()
 
     cc.add_mem_range(0x0, 0x1000, MEM_ADDR_TYPE.CXL_CACHED)
 
@@ -197,78 +189,73 @@ async def test_cxl_host_cc_cache_req(cxl_host_cache_controller):
     for i in range(CACHE_NUM_ASSOC):
         addr = i * 0x40
         req = MemoryRequest(MEMORY_REQUEST_TYPE.WRITE, addr, 0x40, 0x1111111111111111)
-        await send_cached_mem_request(cc, req, False)
+        send_cached_mem_request(cc, req, False)
 
     # SNP_DATA
     req = CacheRequest(CACHE_REQUEST_TYPE.SNP_DATA, 0, 0x40)
-    resp = await send_cache_req(cc, req)
+    resp = send_cache_req(cc, req)
     # Data is now modified, should respond RSP_M
     # It will be translated to RSP_S_FWD_M in CacheDcoh
     assert resp.status == CACHE_RESPONSE_STATUS.RSP_M
 
     # SNP_CUR
     req = CacheRequest(CACHE_REQUEST_TYPE.SNP_CUR, 0, 0x40)
-    resp = await send_cache_req(cc, req)
+    resp = send_cache_req(cc, req)
     assert resp.status == CACHE_RESPONSE_STATUS.RSP_V
 
     # WRITE_BACK
     req = CacheRequest(CACHE_REQUEST_TYPE.WRITE_BACK, 0, 0x40)
-    resp = await send_cache_req(cc, req)
+    resp = send_cache_req(cc, req)
     assert resp.status == CACHE_RESPONSE_STATUS.RSP_V
 
     # SNP_INV
     req = CacheRequest(CACHE_REQUEST_TYPE.SNP_INV, 0, 0x40)
-    resp = await send_cache_req(cc, req)
+    resp = send_cache_req(cc, req)
     assert resp.status == CACHE_RESPONSE_STATUS.RSP_I
 
     # cache miss
     req = CacheRequest(CACHE_REQUEST_TYPE.SNP_DATA, 0x1000, 0x40)
-    resp = await send_cache_req(cc, req)
+    resp = send_cache_req(cc, req)
     assert resp.status == CACHE_RESPONSE_STATUS.RSP_MISS
 
-    await cc.stop()
-    asyncio.gather(*tasks)
+    cc.stop_sync()
 
 
-@pytest.mark.asyncio
-async def test_cxl_host_cc_cxl_uncached(cxl_host_cache_controller):
+
+def test_cxl_host_cc_cxl_uncached(cxl_host_cache_controller):
     cc: CacheController
     cc = cxl_host_cache_controller
-    tasks = []
-    tasks.append(await cc.run_wait_ready())
+    cc.start_wait_ready()
 
     cc.add_mem_range(0x0, 0x1000, MEM_ADDR_TYPE.CXL_UNCACHED)
 
     addr = 0
     mem_req = MemoryRequest(MEMORY_REQUEST_TYPE.UNCACHED_WRITE, addr, 0x40, 0xDEADBEEFDEADBEEF)
-    await send_uncached_mem_request(cc, mem_req)
+    send_uncached_mem_request(cc, mem_req)
 
     addr = 0
     mem_req = MemoryRequest(MEMORY_REQUEST_TYPE.UNCACHED_READ, addr, 0x40)
-    await send_uncached_mem_request(cc, mem_req)
+    send_uncached_mem_request(cc, mem_req)
 
-    await cc.stop()
-    asyncio.gather(*tasks)
+    cc.stop_sync()
 
 
-@pytest.mark.asyncio
-async def test_cxl_dcoh_cc_cache_req(cxl_dcoh_cache_controller):
+
+def test_cxl_dcoh_cc_cache_req(cxl_dcoh_cache_controller):
     cc: CacheController
     cc = cxl_dcoh_cache_controller
-    tasks = []
-    tasks.append(await cc.run_wait_ready())
+    cc.start_wait_ready()
 
     # SNP_DATA
     req = CacheRequest(CACHE_REQUEST_TYPE.SNP_DATA, 0, 0x40)
-    resp = await send_cache_req(cc, req)
+    resp = send_cache_req(cc, req)
     assert resp.status == CACHE_RESPONSE_STATUS.RSP_MISS
 
-    await cc.stop()
-    asyncio.gather(*tasks)
+    cc.stop_sync()
 
 
-@pytest.mark.asyncio
-async def test_cxl_cache_controller_mem_range(cxl_host_cache_controller):
+
+def test_cxl_cache_controller_mem_range(cxl_host_cache_controller):
     cc: CacheController
     cc = cxl_host_cache_controller
 

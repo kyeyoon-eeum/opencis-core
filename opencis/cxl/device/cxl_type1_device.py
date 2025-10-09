@@ -250,9 +250,9 @@ class CxlType1Device(RunnableComponent):
         self._cxl_cache_dcoh.start_wait_ready()
         self._cache_controller.start_wait_ready()
         self._change_status_to_running()
-        self._cxl_io_manager.join()
-        self._cxl_cache_dcoh.join()
-        self._cache_controller.join()
+        # Allow workers to start, then return (don't block on join)
+        import time
+        time.sleep(0.1)
 
     def _stop(self):
         try:

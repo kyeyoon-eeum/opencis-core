@@ -120,8 +120,9 @@ class CxlIoRouter(RunnableComponent):
         self._config_space_router.start_wait_ready()
         self._mmio_router.start_wait_ready()
         self._change_status_to_running()
-        self._config_space_router.join()
-        self._mmio_router.join()
+        # Allow routers to start
+        import time
+        time.sleep(0.1)
 
     def _stop(self):
         self._config_space_router.stop_sync()
@@ -263,7 +264,9 @@ class MmioRouter(CxlRouter):
             t.start()
             self._t2h_threads.append(t)
         self._change_status_to_running()
-        host_thread.join()
+        # Allow threads to start
+        import time
+        time.sleep(0.1)
 
     def _stop(self):
         self._t2h_stop.set()
@@ -408,7 +411,9 @@ class ConfigSpaceRouter(CxlRouter):
             t.start()
             self._t2h_threads.append(t)
         self._change_status_to_running()
-        host_thread.join()
+        # Allow threads to start
+        import time
+        time.sleep(0.1)
 
     def _stop(self):
         self._t2h_stop.set()
@@ -594,7 +599,9 @@ class CxlMemRouter(CxlRouter):
             t.start()
             self._t2h_threads.append(t)
         self._change_status_to_running()
-        host_thread.join()
+        # Allow threads to start
+        import time
+        time.sleep(0.1)
 
     def _stop(self):
         self._t2h_stop.set()
@@ -751,7 +758,9 @@ class CxlCacheRouter(CxlRouter):
             t.start()
             self._t2h_threads.append(t)
         self._change_status_to_running()
-        host_thread.join()
+        # Allow threads to start
+        import time
+        time.sleep(0.1)
 
     def _stop(self):
         self._t2h_stop.set()

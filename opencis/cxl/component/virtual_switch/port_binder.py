@@ -7,11 +7,12 @@ See LICENSE for details.
 
 from dataclasses import dataclass
 from enum import Enum, auto
+from threading import Event
 from typing import List, Optional
 
 from opencis.cxl.component.bind_processor import VppbPpbBindProcessor
 from opencis.cxl.component.virtual_switch.vppb import Vppb
-from opencis.cxl.device.downstream_port_device import DownstreamPortDevice, SleepLoop
+from opencis.cxl.device.downstream_port_device import DownstreamPortDevice
 from opencis.util.component import RunnableComponent
 
 
@@ -36,15 +37,12 @@ class PortBinder(RunnableComponent):
         self._vppbs = vppbs
         self._bind_slots: List[BindSlot] = []
         self._processors: list[VppbPpbBindProcessor] = []
+        self._stop_event = Event()
         for vppb in self._vppbs:
             bind_slot = BindSlot(
                 vppb=vppb,
             )
             self._bind_slots.append(bind_slot)
-
-        # Create a dummy process to keep the component running
-        # TODO: cleaner method
-        self._dummy_process = SleepLoop()
 
     def _create_message(self, message):
         message = f"[{self.__class__.__name__}:VCS{self._vcs_id}] {message}"
@@ -113,9 +111,8 @@ class PortBinder(RunnableComponent):
         return self._vppbs
 
     def _run(self):
-        self._dummy_process.start_wait_ready()
         self._change_status_to_running()
-        self._dummy_process.join()
+        self._stop_event.wait()
 
     def _stop(self):
         for slot in self._bind_slots:
@@ -124,7 +121,4 @@ class PortBinder(RunnableComponent):
                     slot.processor.stop_sync()
                 except Exception:
                     pass
-        try:
-            self._dummy_process.stop_sync()
-        except Exception:
-            pass
+        self._stop_event.set()

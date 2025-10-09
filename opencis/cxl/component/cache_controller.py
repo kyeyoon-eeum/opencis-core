@@ -605,12 +605,9 @@ class CacheController(RunnableComponent):
             self._threads.append(t_bridge)
 
         self._change_status_to_running()
-        # Keep component alive by joining worker threads
-        for t in self._threads:
-            try:
-                t.join()
-            except Exception:
-                pass
+        # Allow threads to start
+        import time
+        time.sleep(0.1)
 
     def _stop(self):
         # Signal workers to stop and nudge queues with None, matching original semantics

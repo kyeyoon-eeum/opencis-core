@@ -157,20 +157,33 @@ class CxlVirtualSwitch(RunnableComponent):
         self._cxl_cache_router.start_wait_ready()
         self._port_binder.start_wait_ready()
         self._change_status_to_running()
-        self._irq_manager.join()
-        self._cxl_io_router.join()
-        self._cxl_mem_router.join()
-        self._cxl_cache_router.join()
-        self._port_binder.join()
+        # Allow routers to start
+        import time
+        time.sleep(0.1)
 
     def _stop(self):
         try:
+            logger.info(self._create_message("Stopping CxlVirtualSwitch - starting _cxl_io_router.stop_sync()"))
             self._cxl_io_router.stop_sync()
+            logger.info(self._create_message("CxlVirtualSwitch - finished _cxl_io_router.stop_sync()"))
+
+            logger.info(self._create_message("CxlVirtualSwitch - starting _cxl_mem_router.stop_sync()"))
             self._cxl_mem_router.stop_sync()
+            logger.info(self._create_message("CxlVirtualSwitch - finished _cxl_mem_router.stop_sync()"))
+
+            logger.info(self._create_message("CxlVirtualSwitch - starting _cxl_cache_router.stop_sync()"))
             self._cxl_cache_router.stop_sync()
+            logger.info(self._create_message("CxlVirtualSwitch - finished _cxl_cache_router.stop_sync()"))
+
+            logger.info(self._create_message("CxlVirtualSwitch - starting _port_binder.stop_sync()"))
             self._port_binder.stop_sync()
+            logger.info(self._create_message("CxlVirtualSwitch - finished _port_binder.stop_sync()"))
+
+            logger.info(self._create_message("CxlVirtualSwitch - starting _irq_manager.stop_sync()"))
             self._irq_manager.stop_sync()
-        except Exception:
+            logger.info(self._create_message("CxlVirtualSwitch - finished _irq_manager.stop_sync()"))
+        except Exception as e:
+            logger.error(self._create_message(f"CxlVirtualSwitch _stop failed: {e}"))
             pass
 
     def bind_vppb(self, port_index: int, vppb_index: int, ld_id: int):

@@ -5,8 +5,8 @@ This software is licensed under the terms of the Revised BSD License.
 See LICENSE for details.
 """
 
-from asyncio import gather, create_task
-import pytest
+import threading
+import time
 
 from opencis.apps.single_logical_device import SingleLogicalDevice
 from opencis.apps.multi_logical_device import MultiLogicalDevice
@@ -23,8 +23,7 @@ from opencis.util.unaligned_bit_structure import UnalignedBitStructure
 
 # test_single_logical_device_bind_unbind() and test_multi_logical_device_bind_unbind() are similar
 # pylint: disable=duplicate-code
-@pytest.mark.asyncio
-async def test_single_logical_device_bind_unbind():
+def test_single_logical_device_bind_unbind(unique_ports):
     # Connection between switch and device
     transport_connection = CxlConnection()
 
@@ -74,7 +73,7 @@ async def test_single_logical_device_bind_unbind():
         vppb_counts=vppb_counts,
         initial_bounds=initial_bounds,
         physical_ports=physical_ports,
-        irq_port=0,
+        irq_port=unique_ports['fabric'],
         allocated_ld=allocated_ld,
     )
 
@@ -88,53 +87,37 @@ async def test_single_logical_device_bind_unbind():
         cxl_connection=transport_connection,
     )
 
-    async def start_components():
-        tasks = []
-        tasks.append(create_task(device.run()))
-        tasks.append(create_task(vcs.run()))
-        for port in physical_ports:
-            tasks.append(create_task(port.run()))
-        for ppb_bind_processor in ppb_bind_processors:
-            tasks.append(create_task(ppb_bind_processor.run()))
-        for ppb_device in ppb_devices:
-            tasks.append(create_task(ppb_device.run()))
-        await gather(*tasks)
+    # Start all components and wait for ready
+    device.start_wait_ready()
+    vcs.start_wait_ready()
+    for port in physical_ports:
+        port.start_wait_ready()
+    for ppb_bind_processor in ppb_bind_processors:
+        ppb_bind_processor.start_wait_ready()
+    for ppb_device in ppb_devices:
+        ppb_device.start_wait_ready()
 
-    async def stop_components():
-        await vcs.stop()
-        for port in physical_ports:
-            await port.stop()
-        for ppb_bind_processor in ppb_bind_processors:
-            await ppb_bind_processor.stop()
-        for ppb_device in ppb_devices:
-            await ppb_device.stop()
-        await device.stop()
+    # Give components time to fully initialize
+    time.sleep(0.5)
 
-    async def wait_and_stop():
-        await device.wait_for_ready()
-        wait_tasks = []
-        wait_tasks.append(create_task(vcs.wait_for_ready()))
-        for port in physical_ports:
-            wait_tasks.append(create_task(port.wait_for_ready()))
-        for ppb_bind_processor in ppb_bind_processors:
-            wait_tasks.append(create_task(ppb_bind_processor.wait_for_ready()))
-        for ppb_device in ppb_devices:
-            wait_tasks.append(create_task(ppb_device.wait_for_ready()))
-        await gather(*wait_tasks)
+    # Test bind/unbind operations
+    vcs.unbind_vppb(0)
+    vcs.bind_vppb(1, 0, 0)
 
-        await vcs.unbind_vppb(0)
-        await vcs.bind_vppb(1, 0, 0)
-
-        await stop_components()
-
-    tasks = [create_task(start_components()), create_task(wait_and_stop())]
-    await gather(*tasks)
+    # Stop all components
+    vcs.stop_sync()
+    for port in physical_ports:
+        port.stop_sync()
+    for ppb_bind_processor in ppb_bind_processors:
+        ppb_bind_processor.stop_sync()
+    for ppb_device in ppb_devices:
+        ppb_device.stop_sync()
+    device.stop_sync()
 
 
 # test_single_logical_device_bind_unbind() and test_multi_logical_device_bind_unbind() are similar
 # pylint: disable=duplicate-code
-@pytest.mark.asyncio
-async def test_multi_logical_device_bind_unbind():
+def test_multi_logical_device_bind_unbind(unique_ports):
     # Connection between switch and device
     transport_connection = CxlConnection()
 
@@ -185,7 +168,7 @@ async def test_multi_logical_device_bind_unbind():
         vppb_counts=vppb_counts,
         initial_bounds=initial_bounds,
         physical_ports=physical_ports,
-        irq_port=0,
+        irq_port=unique_ports['fabric'],
         allocated_ld=allocated_ld,
     )
 
@@ -210,44 +193,29 @@ async def test_multi_logical_device_bind_unbind():
         port_index=0,
     )
 
-    async def start_components():
-        tasks = []
-        tasks.append(create_task(device.run()))
-        tasks.append(create_task(vcs.run()))
-        for port in physical_ports:
-            tasks.append(create_task(port.run()))
-        for ppb_bind_processor in ppb_bind_processors:
-            tasks.append(create_task(ppb_bind_processor.run()))
-        for ppb_device in ppb_devices:
-            tasks.append(create_task(ppb_device.run()))
-        await gather(*tasks)
+    # Start all components and wait for ready
+    device.start_wait_ready()
+    vcs.start_wait_ready()
+    for port in physical_ports:
+        port.start_wait_ready()
+    for ppb_bind_processor in ppb_bind_processors:
+        ppb_bind_processor.start_wait_ready()
+    for ppb_device in ppb_devices:
+        ppb_device.start_wait_ready()
 
-    async def stop_components():
-        await vcs.stop()
-        for port in physical_ports:
-            await port.stop()
-        for ppb_bind_processor in ppb_bind_processors:
-            await ppb_bind_processor.stop()
-        for ppb_device in ppb_devices:
-            await ppb_device.stop()
-        await device.stop()
+    # Give components time to fully initialize
+    time.sleep(0.5)
 
-    async def wait_and_stop():
-        await device.wait_for_ready()
-        wait_tasks = []
-        wait_tasks.append(create_task(vcs.wait_for_ready()))
-        for port in physical_ports:
-            wait_tasks.append(create_task(port.wait_for_ready()))
-        for ppb_bind_processor in ppb_bind_processors:
-            wait_tasks.append(create_task(ppb_bind_processor.wait_for_ready()))
-        for ppb_device in ppb_devices:
-            wait_tasks.append(create_task(ppb_device.wait_for_ready()))
-        await gather(*wait_tasks)
+    # Test bind/unbind operations
+    vcs.unbind_vppb(0)
+    vcs.bind_vppb(1, 0, 0)
 
-        await vcs.unbind_vppb(0)
-        await vcs.bind_vppb(1, 0, 0)
-
-        await stop_components()
-
-    tasks = [create_task(start_components()), create_task(wait_and_stop())]
-    await gather(*tasks)
+    # Stop all components
+    vcs.stop_sync()
+    for port in physical_ports:
+        port.stop_sync()
+    for ppb_bind_processor in ppb_bind_processors:
+        ppb_bind_processor.stop_sync()
+    for ppb_device in ppb_devices:
+        ppb_device.stop_sync()
+    device.stop_sync()

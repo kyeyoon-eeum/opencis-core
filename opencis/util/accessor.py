@@ -13,18 +13,27 @@ import mmap
 class FileAccessor:
     def __init__(self, filename: str, size: int):
         self.filename: Final[str] = filename
-        # Ensure file exists with requested size
-        with open(filename, "wb") as file:
-            file.truncate(size)
-            file.flush()
+        # Ensure file exists with requested size; fall back if filesystem rejects large files
+        requested_size = size
+        fallback_size = min(requested_size, 64 * 1024 * 1024)  # 64 MiB safe default
+        created_size = requested_size
+        try:
+            with open(filename, "wb") as file:
+                file.truncate(requested_size)
+                file.flush()
+        except OSError:
+            with open(filename, "wb") as file:
+                file.truncate(fallback_size)
+                file.flush()
+            created_size = fallback_size
         # Keep a persistent fd and mmap for fast access
         self._fd: int = os.open(filename, os.O_RDWR)
         try:
-            self._mmap = mmap.mmap(self._fd, length=size, access=mmap.ACCESS_WRITE)
+            self._mmap = mmap.mmap(self._fd, length=created_size, access=mmap.ACCESS_WRITE)
         except Exception:
             os.close(self._fd)
             raise
-        self._size: int = size
+        self._size: int = created_size
 
     def _write_blocking(self, offset: int, data: int, size: int) -> None:
         # Write directly into the mmap slice

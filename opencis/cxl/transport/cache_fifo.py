@@ -5,7 +5,7 @@ This software is licensed under the terms of the Revised BSD License.
 See LICENSE for details.
 """
 
-from queue import SimpleQueue
+from queue import Queue
 from dataclasses import dataclass, field
 from enum import Enum, auto
 
@@ -52,5 +52,5 @@ class CacheResponse:
 
 @dataclass(slots=True)
 class CacheFifoPair:
-    request: SimpleQueue[CacheRequest] = field(default_factory=SimpleQueue)
-    response: SimpleQueue[CacheResponse] = field(default_factory=SimpleQueue)
+    request: Queue[CacheRequest] = field(default_factory=Queue)
+    response: Queue[CacheResponse] = field(default_factory=Queue)

@@ -5,6 +5,7 @@ This software is licensed under the terms of the Revised BSD License.
 See LICENSE for details.
 """
 
+import os
 import threading
 from typing import List
 
@@ -33,7 +34,11 @@ class MultiHeadedSingleLogicalDevice(RunnableComponent):
 
         self._sld_devices = []
         for i in range(num_ports):
-            _memory_file = f"multiheaded_{i}_{memory_file}"
+            # Preserve original directory; only prefix the base filename
+            _dir = os.path.dirname(memory_file)
+            _base = os.path.basename(memory_file)
+            _prefixed = f"multiheaded_{i}_{_base}"
+            _memory_file = os.path.join(_dir, _prefixed) if _dir else _prefixed
             self._sld_devices.append(
                 SingleLogicalDevice(
                     memory_size=memory_size,

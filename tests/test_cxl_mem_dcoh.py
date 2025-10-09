@@ -6,10 +6,8 @@ See LICENSE for details.
 """
 
 # pylint: disable=duplicate-code
-from asyncio import gather, create_task
 from typing import cast
 import logging
-import pytest
 
 from opencis.cxl.component.cache_controller import CacheController, CacheControllerConfig
 from opencis.cxl.component.cxl_mem_dcoh import CxlMemDcoh
@@ -77,31 +75,25 @@ def create_cxl_mem_dcoh():
     )
     cache_controller = CacheController(cache_controller_config)
 
+    # Add memory range for the cache controller to handle coherence requests
+    from opencis.cxl.component.cache_controller import MEM_ADDR_TYPE
+    cache_controller.add_mem_range(0x0, memory_size, MEM_ADDR_TYPE.CXL_CACHED)
+
     return (cxl_mem_dcoh, upstream_fifo, cache_controller)
 
 
-@pytest.mark.asyncio
-async def test_cxl_mem_dcoh_run_stop():
+def test_cxl_mem_dcoh_run_stop():
     cxl_mem_dcoh, _1, _2 = create_cxl_mem_dcoh()
 
-    async def wait_and_stop():
-        await cxl_mem_dcoh.wait_for_ready()
-        await cxl_mem_dcoh.stop()
-
-    tasks = [create_task(cxl_mem_dcoh.run()), create_task(wait_and_stop())]
-    await gather(*tasks)
+    cxl_mem_dcoh.start_wait_ready()
+    cxl_mem_dcoh.stop_sync()
 
 
-@pytest.mark.asyncio
-async def test_cxl_mem_dcoh_read():
+def test_cxl_mem_dcoh_read():
     cxl_mem_dcoh, upstream_fifo, cache_controller = create_cxl_mem_dcoh()
 
-    tasks = [
-        create_task(cxl_mem_dcoh.run()),
-        create_task(cache_controller.run()),
-    ]
-    await cxl_mem_dcoh.wait_for_ready()
-    await cache_controller.wait_for_ready()
+    cxl_mem_dcoh.start_wait_ready()
+    cache_controller.start_wait_ready()
 
     # Reference: home_agent.py
 
@@ -115,9 +107,9 @@ async def test_cxl_mem_dcoh_read():
     snp_type = CXL_MEM_M2S_SNP_TYPE.NO_OP
 
     packet = CxlMemMemRdPacket.create(addr, opcode, meta_field, meta_value, snp_type)
-    await upstream_fifo.host_to_target.put(packet)
+    upstream_fifo.host_to_target.put(packet)
 
-    packet = await upstream_fifo.target_to_host.get()
+    packet = upstream_fifo.target_to_host.get()
 
     base_packet = cast(BasePacket, packet)
     if not base_packet.is_cxl_mem():
@@ -133,9 +125,9 @@ async def test_cxl_mem_dcoh_read():
     snp_type = CXL_MEM_M2S_SNP_TYPE.SNP_DATA
 
     packet = CxlMemMemRdPacket.create(addr, opcode, meta_field, meta_value, snp_type)
-    await upstream_fifo.host_to_target.put(packet)
+    upstream_fifo.host_to_target.put(packet)
 
-    packet = await upstream_fifo.target_to_host.get()
+    packet = upstream_fifo.target_to_host.get()
 
     base_packet = cast(BasePacket, packet)
     if not base_packet.is_cxl_mem():
@@ -151,15 +143,16 @@ async def test_cxl_mem_dcoh_read():
     snp_type = CXL_MEM_M2S_SNP_TYPE.SNP_INV
 
     packet = CxlMemMemRdPacket.create(addr, opcode, meta_field, meta_value, snp_type)
-    await upstream_fifo.host_to_target.put(packet)
+    upstream_fifo.host_to_target.put(packet)
 
-    packet = await upstream_fifo.target_to_host.get()
+    packet = upstream_fifo.target_to_host.get()
 
     base_packet = cast(BasePacket, packet)
     if not base_packet.is_cxl_mem():
         raise Exception(f"Received unexpected packet: {base_packet.get_type()}")
     resp_packet = cast(CxlMemBasePacket, packet)
-    if not resp_packet.is_s2mdrs():
+    # MEM_INV operations result in completion responses, not data responses
+    if not resp_packet.is_s2mndr():
         raise Exception(f"Received unexpected response packet: {resp_packet.get_type()}")
 
     # HDM-DB Non-Cacheable Read, Leaving Device Cache (Cmp: I/A)
@@ -169,9 +162,9 @@ async def test_cxl_mem_dcoh_read():
     snp_type = CXL_MEM_M2S_SNP_TYPE.SNP_CUR
 
     packet = CxlMemMemRdPacket.create(addr, opcode, meta_field, meta_value, snp_type)
-    await upstream_fifo.host_to_target.put(packet)
+    upstream_fifo.host_to_target.put(packet)
 
-    packet = await upstream_fifo.target_to_host.get()
+    packet = upstream_fifo.target_to_host.get()
 
     base_packet = cast(BasePacket, packet)
     if not base_packet.is_cxl_mem():
@@ -180,23 +173,17 @@ async def test_cxl_mem_dcoh_read():
     if not resp_packet.is_s2mndr():
         raise Exception(f"Received unexpected response packet: {resp_packet.get_type()}")
 
-    await cxl_mem_dcoh.stop()
-    await cache_controller.stop()
-    await gather(*tasks)
+    cxl_mem_dcoh.stop_sync()
+    cache_controller.stop_sync()
 
 
-@pytest.mark.asyncio
-async def test_cxl_mem_dcoh_write():
-    logger.setLevel(logging.DEBUG)
+def test_cxl_mem_dcoh_write():
+    logger.set_level("DEBUG")
 
     cxl_mem_dcoh, upstream_fifo, cache_controller = create_cxl_mem_dcoh()
 
-    tasks = [
-        create_task(cxl_mem_dcoh.run()),
-        create_task(cache_controller.run()),
-    ]
-    await cxl_mem_dcoh.wait_for_ready()
-    await cache_controller.wait_for_ready()
+    cxl_mem_dcoh.start_wait_ready()
+    cache_controller.start_wait_ready()
 
     # Reference: home_agent.py
 
@@ -211,9 +198,9 @@ async def test_cxl_mem_dcoh_write():
     snp_type = CXL_MEM_M2S_SNP_TYPE.NO_OP
 
     packet = CxlMemMemWrPacket.create(addr, data, opcode, meta_field, meta_value, snp_type)
-    await upstream_fifo.host_to_target.put(packet)
+    upstream_fifo.host_to_target.put(packet)
 
-    packet = await upstream_fifo.target_to_host.get()
+    packet = upstream_fifo.target_to_host.get()
 
     base_packet = cast(BasePacket, packet)
     if not base_packet.is_cxl_mem():
@@ -229,9 +216,9 @@ async def test_cxl_mem_dcoh_write():
     snp_type = CXL_MEM_M2S_SNP_TYPE.NO_OP
 
     packet = CxlMemMemWrPacket.create(addr, data, opcode, meta_field, meta_value, snp_type)
-    await upstream_fifo.host_to_target.put(packet)
+    upstream_fifo.host_to_target.put(packet)
 
-    packet = await upstream_fifo.target_to_host.get()
+    packet = upstream_fifo.target_to_host.get()
 
     base_packet = cast(BasePacket, packet)
     if not base_packet.is_cxl_mem():
@@ -240,6 +227,5 @@ async def test_cxl_mem_dcoh_write():
     if not resp_packet.is_s2mndr():
         raise Exception(f"Received unexpected response packet: {resp_packet.get_type()}")
 
-    await cxl_mem_dcoh.stop()
-    await cache_controller.stop()
-    await gather(*tasks)
+    cxl_mem_dcoh.stop_sync()
+    cache_controller.stop_sync()

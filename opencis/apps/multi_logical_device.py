@@ -90,15 +90,16 @@ class MultiLogicalDevice(RunnableComponent):
             device.start_wait_ready()
         if not self._test_mode:
             self._sw_conn_client.start_wait_ready()
+        # Allow threads to start, then mark as running
+        import time
+        time.sleep(0.1)
         self._change_status_to_running()
-        # block on joins
-        for device in self._cxl_type3_devices:
-            device.join()
-        if not self._test_mode:
-            self._sw_conn_client.join()
+        # Wait until stopped
+        self._running_event.wait()
 
     def _stop(self):
         for device in self._cxl_type3_devices:
             device.stop_sync()
         if not self._test_mode:
             self._sw_conn_client.stop_sync()
+        self._running_event.set()

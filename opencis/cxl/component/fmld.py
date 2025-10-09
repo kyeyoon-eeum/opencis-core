@@ -185,7 +185,7 @@ class FMLD(RunnableComponent):
         )
         self._f2t_thread.start()
         self._change_status_to_running()
-        threading.Event().wait()
+        self._running_event.wait()
 
     def _stop(self):
         logger.info(self._create_message("Stopping FMLD"))
@@ -205,3 +205,4 @@ class FMLD(RunnableComponent):
                 pass
             if self._t2f_thread is not None:
                 self._t2f_thread.join(timeout=1.0)
+        self._running_event.set()

@@ -74,8 +74,9 @@ class SwitchConnectionClient(RunnableComponent):
         transport = "shm"
         while True:
             try:
+                # Use port as unique namespace - must match server namespace
                 shm_pair = ShmStreamPair(
-                    port_index=self._port_index, is_server=False, namespace="switch"
+                    port_index=self._port_index, is_server=False, namespace=f"sw_{self._port}"
                 )
                 reader = shm_pair.reader
                 writer = shm_pair.writer

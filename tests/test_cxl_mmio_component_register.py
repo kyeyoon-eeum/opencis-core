@@ -23,6 +23,6 @@ def test_cxl_component_register():
     identity.volatile_only_capacity = 256 * 1024 * 1024
     identity.persistent_only_capacity = 0
     identity.partition_alignment = 0
-    cxl_memory_device_component = CxlMemoryDeviceComponent(identity)
+    cxl_memory_device_component = CxlMemoryDeviceComponent(identity, memory_file="")
     options = CxlComponentRegisterOptions(cxl_component=cxl_memory_device_component)
     CxlComponentRegister(options=options)

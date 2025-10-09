@@ -49,14 +49,14 @@ from opencis.pci.component.config_space_manager import PCI_DEVICE_TYPE
 class SleepLoop(RunnableComponent):
     def __init__(self):
         super().__init__()
-        self._running_evt = Event()
+        self._stop_evt = Event()
 
     def _run(self):
         self._change_status_to_running()
-        self._running_evt.wait()
+        self._stop_evt.wait()
 
     def _stop(self):
-        self._running_evt.set()
+        self._stop_evt.set()
 
 
 class DownstreamPortDevice(CxlPortDevice):
@@ -68,6 +68,7 @@ class DownstreamPortDevice(CxlPortDevice):
         super().__init__(transport_connection, port_index)
 
         self._stop_tasks = []
+        self._stop_event = Event()
 
         # Per LD
         self._pci_bridge_component = {}
@@ -84,10 +85,6 @@ class DownstreamPortDevice(CxlPortDevice):
         self._cxl_io_manager = {}
         self._cxl_mem_manager = {}
         self._cxl_cache_manager = {}
-
-        # Create a dummy process to keep the component running
-        # TODO: cleaner method
-        self._dummy_process = SleepLoop()
 
     def _init_device(
         self,
@@ -237,9 +234,7 @@ class DownstreamPortDevice(CxlPortDevice):
     def _run(self):
         logger.info(self._create_message("Starting"))
         self._change_status_to_running()
-        self._dummy_process.start_wait_ready()
-        self._stop_tasks.append(self._dummy_process)
-        self._dummy_process.join()
+        self._stop_event.wait()
         logger.info(self._create_message("Stopped"))
 
     def _stop(self):
@@ -249,8 +244,4 @@ class DownstreamPortDevice(CxlPortDevice):
                 task.stop_sync()
             except Exception:
                 pass
-        # Ensure dummy process is released
-        try:
-            self._dummy_process.stop_sync()
-        except Exception:
-            pass
+        self._stop_event.set()

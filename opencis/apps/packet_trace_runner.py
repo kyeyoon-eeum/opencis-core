@@ -29,9 +29,14 @@ class PacketTraceRunner(LabeledComponent):
         self._trace_switch_port = trace_switch_port
         self._trace_device_port = trace_device_port
 
+    def start_wait_ready(self):
+        """Run the packet trace synchronously"""
+        self.run()
+
     def run(self):
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(5.0)  # Add timeout to prevent hanging
             s.connect((self._switch_host, self._switch_port))
         except Exception as e:
             raise RuntimeError("Failed to connect to switch") from e

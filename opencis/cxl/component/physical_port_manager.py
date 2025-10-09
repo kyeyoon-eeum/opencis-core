@@ -56,6 +56,7 @@ class PhysicalPortManager(RunnableComponent):
 
         self._switch_connection_manager = switch_connection_manager
         self._device_configs = device_configs
+        self._stop_event = threading.Event()
         for port_index, port_config in enumerate(port_configs):
             transport_connection = self._switch_connection_manager.get_cxl_connection(port_index)
             if port_config.type == PORT_TYPE.USP:
@@ -149,27 +150,30 @@ class PhysicalPortManager(RunnableComponent):
         return connected_devices
 
     def _run(self):
-        threads: list[threading.Thread] = []
-        # Start and wait for readiness
+        # Clear the stop event at the start of each run
+        self._stop_event.clear()
+        
+        # Start and wait for readiness of all child components
         for comp in [
             *self._port_devices,
             *self._ppb_devices,
             *[b for b in self._ppb_binds if b is not None],
         ]:
             comp.start_wait_ready()
-            threads.append(comp._thread)  # using internal thread to join later
+        
+        # Mark ready after all children are started
         self._change_status_to_running()
         from opencis.util.logger import logger
 
         logger.info(self._create_message("PhysicalPortManager RUNNING"))
-        for comp in [
-            *self._port_devices,
-            *self._ppb_devices,
-            *[b for b in self._ppb_binds if b is not None],
-        ]:
-            comp.join()
+        # Wait for stop signal
+        self._stop_event.wait()
 
     def _stop(self):
+        # Signal the _run loop to exit
+        self._stop_event.set()
+        # Stop all child components without timeout to prevent deadlock
+        # The PhysicalPortManager's stop_sync() has a timeout at the top level
         for port_device in self._port_devices:
             try:
                 port_device.stop_sync()
